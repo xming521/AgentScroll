@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentscroll"
+version = "0.1.0"
+description = "Let AI agents browse the internet like humans do."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx",
+  "loguru>=0.7.3",
+  "mcp-server-weibo>=1.2.0,<2",
+  "openai==1.87.0",
+  "pydantic==2.10.6",
+  "pyjson5",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+browser = ["playwright"]
+chinese = ["jieba"]
+
+[tool.setuptools.packages.find]
+include = ["agentscroll*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "live: performs real network requests against external platforms",
+  "browser: launches a real Playwright browser against external platforms",
+]

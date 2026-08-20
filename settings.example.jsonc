@@ -1,0 +1,23 @@
+{
+  // 推理后端："api" 使用 OpenAI 兼容接口；"codex_exec" 使用本机 Codex CLI。
+  "provider": "api",
+
+  // API 或 Codex CLI 实际使用的模型名。使用前必须替换该占位值。
+  "model": "replace-with-model-name",
+
+  // 批量请求的最大并发数；保持与共享推理代码的默认值一致。
+  "max_workers": 10,
+
+  "api": {
+    // 从这个环境变量读取 API Key，配置文件本身不保存密钥。
+    "api_key_env": "AGENTSCROLL_LLM_API_KEY",
+
+    // OpenAI 兼容服务的 /v1 根地址。
+    "base_url": "https://api.openai.com/v1"
+  },
+
+  "codex_exec": {
+    // Codex 模型推理强度。
+    "effort": "low"
+  }
+}

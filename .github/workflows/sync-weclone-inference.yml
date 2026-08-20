@@ -1,0 +1,133 @@
+name: Sync WeClone inference
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: WeClone branch, tag, or commit to synchronize
+        required: false
+        default: main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-weclone-inference
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPOSITORY: xming521/WeClone
+      UPSTREAM_PATH: weclone/core/inference
+      TARGET_PATH: agentscroll/inference
+      SYNC_BRANCH: automation/sync-weclone-inference
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+
+    steps:
+      - name: Check out AgentScroll
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out WeClone inference
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: .ci/weclone
+          fetch-depth: 1
+          sparse-checkout: ${{ env.UPSTREAM_PATH }}
+          sparse-checkout-cone-mode: false
+
+      - name: Replace the committed inference snapshot
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          workspace = Path.cwd()
+          checkout = workspace / ".ci" / "weclone"
+          source = checkout / os.environ["UPSTREAM_PATH"]
+          target = workspace / os.environ["TARGET_PATH"]
+
+          if not source.is_dir():
+              raise SystemExit(f"Upstream inference directory does not exist: {source}")
+
+          source_files = {
+              path.relative_to(source): path
+              for path in source.rglob("*")
+              if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+          }
+          if not source_files:
+              raise SystemExit(f"No inference source files found under: {source}")
+          target.mkdir(parents=True, exist_ok=True)
+
+          for existing in sorted(target.rglob("*"), reverse=True):
+              relative = existing.relative_to(target)
+              if existing.is_file() or existing.is_symlink():
+                  if relative not in source_files:
+                      existing.unlink()
+              elif existing.is_dir() and not any(existing.iterdir()):
+                  existing.rmdir()
+
+          hashes = {}
+          for relative, source_file in sorted(source_files.items()):
+              target_file = target / relative
+              target_file.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(source_file, target_file)
+              hashes[str(relative)] = hashlib.sha256(target_file.read_bytes()).hexdigest()
+
+          commit = subprocess.check_output(
+              ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          metadata = {
+              "repository": f"https://github.com/{os.environ['UPSTREAM_REPOSITORY']}.git",
+              "ref": os.environ["UPSTREAM_REF"],
+              "source_path": os.environ["UPSTREAM_PATH"],
+              "commit": commit,
+              "files": hashes,
+          }
+          metadata_path = target.parent / "inference.upstream.json"
+          metadata_path.write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Open or update the synchronization pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ -z "$(git status --porcelain -- "$TARGET_PATH" "agentscroll/inference.upstream.json")" ]; then
+            echo "Inference snapshot is already current."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH"
+          git add "$TARGET_PATH" "agentscroll/inference.upstream.json"
+          git commit -m "sync inference from WeClone"
+          git push --force origin "$SYNC_BRANCH"
+
+          existing_pr="$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')"
+          if [ -z "$existing_pr" ]; then
+            gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$SYNC_BRANCH" \
+              --title "Sync inference from WeClone" \
+              --body "Automated snapshot update from ${UPSTREAM_REPOSITORY}@${UPSTREAM_REF}."
+          fi

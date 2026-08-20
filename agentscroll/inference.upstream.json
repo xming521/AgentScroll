@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/xming521/WeClone.git",
+  "ref": "main",
+  "source_path": "weclone/core/inference",
+  "commit": null,
+  "base_commit": "87679d6687557abc8e4d5be33d19308cb969073d",
+  "note": "Initial snapshot copied from the local WeClone worktree; the sync workflow replaces this with an exact upstream commit."
+}

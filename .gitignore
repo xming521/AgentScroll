@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# 编辑器本地配置。
+.vscode/
+
+# 本地推理配置；仓库只提交 settings.example.jsonc。
+settings.jsonc
+
+# 运行时生成的日志、采集结果与测试证据。
+outputs/
+
+# 本地克隆的上游项目；不作为 AgentScroll 源码提交。
+DailyHotApi/
+mcp-server-weibo/
+newsnow/
+AGENTS.md
