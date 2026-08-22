@@ -19,7 +19,7 @@ NEWSNOW_BASE_URL_ENV = "AGENTSCROLL_NEWSNOW_BASE_URL"
 DEFAULT_NEWSNOW_BASE_URL = "http://127.0.0.1:4444"
 
 # These groups are based on the category column in the NewsNow source table in
-# the project README. "综合" is the default cross-platform group for agents.
+# docs/usage.md. "综合" is the default cross-platform group for agents.
 # Source order determines the order seen by downstream agents.
 NEWSNOW_GROUPS: dict[str, tuple[str, ...]] = {
     "社区/科技": ("v2ex-share",),
@@ -51,7 +51,14 @@ NEWSNOW_GROUPS: dict[str, tuple[str, ...]] = {
     "体育/社区": ("hupu",),
     "体育": ("dongqiudi",),
     "AI": ("aihot",),
-    "社区": ("tieba", "chongbuluo-latest", "chongbuluo-hot"),
+    "社区": (
+        "tieba",
+        "chongbuluo-latest",
+        "chongbuluo-hot",
+        "hupu",
+        "v2ex-share",
+        "coolapk",
+    ),
     "科技": ("ithome", "solidot", "sspai"),
     "国际新闻": ("sputniknewscn", "cankaoxiaoxi"),
     "金融/投资": ("xueqiu-hotstock",),
@@ -260,7 +267,7 @@ def fetch_newsnow_hotlists(
     output_dir: Optional[str | Path] = None,
     save: bool = True,
 ) -> dict[str, Any]:
-    """Fetch NewsNow boards selected by README category and optionally save them.
+    """Fetch NewsNow boards selected by the documented category and optionally save them.
 
     Args:
         groups: One category or an iterable of categories from

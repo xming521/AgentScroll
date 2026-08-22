@@ -64,17 +64,10 @@ def search_toutiao(
     Returns:
         头条文章/视频列表
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
 
     items = _search_public_page(topic, limit)
-
-    if depth != "quick":
-        hot_items = _get_hot_related(topic)
-        existing_titles = {it.get("title", "").lower() for it in items}
-        for hi in hot_items:
-            if hi.get("title", "").lower() not in existing_titles:
-                items.append(hi)
 
     if not items:
         items = _search_via_site_search(topic, limit)
@@ -143,37 +136,6 @@ def _search_public_page(topic: str, limit: int) -> List[Dict[str, Any]]:
                 break
     except Exception as e:
         sys.stderr.write(f"[今日头条] 当前搜索页解析失败: {e}\n")
-    return items
-
-
-def _get_hot_related(topic: str) -> List[Dict[str, Any]]:
-    """从头条热榜中查找相关话题。"""
-    items = []
-    try:
-        url = "https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc"
-        headers = api_headers("https://www.toutiao.com/")
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        topic_lower = topic.lower()
-        for entry in data.get("data", []):
-            title = entry.get("Title", "")
-            if any(kw in title.lower() for kw in topic_lower.split()):
-                items.append({
-                    "title": title,
-                    "abstract": entry.get("Abstract", ""),
-                    "url": entry.get("Url", ""),
-                    "source_name": "今日头条热榜",
-                    "date": None,
-                    "is_hot": True,
-                    "hot_value": entry.get("HotValue", 0),
-                    "engagement": {
-                        "hot_value": entry.get("HotValue", 0),
-                    },
-                })
-    except Exception as e:
-        sys.stderr.write(f"[今日头条] 热榜搜索失败: {e}\n")
     return items
 
 

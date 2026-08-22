@@ -138,7 +138,9 @@ def collect(
             only when ``sources`` is omitted.
         days: Number of calendar days to look back.
         as_of: Optional end date in YYYY-MM-DD format.
-        depth: ``quick``, ``default``, or ``deep``.
+        depth: Per-platform candidate limit: 5 for ``quick``, 10 for
+            ``default``, and 20 for ``deep``. Some sources also expand their
+            search paths at higher depths.
         output_dir: Directory for the compact knowledge file. Defaults to
             ``./outputs/knowledge``.
 

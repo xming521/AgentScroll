@@ -15,13 +15,12 @@ AgentScroll
 
 ## 工作方式
 
-信息源 → 采集 → 标准化与去重 → 补充正文、评论与相关报道 → LLM 分析与汇总 → Briefing / 推送
+AgentScroll 通过主动搜索和热榜学习两条流程发现内容，补充正文、评论与相关报道，再生成可学习的知识和即时分享。
 
 ## 文档
 
-配置、推理、数据采集、NewsNow 接入和真实平台测试见 [技术文档](docs/technical.md)。
-
-采集器的支持平台、输出格式和数据边界见 [Collector 文档](agentscroll/collector/README.md)。
+- [工作流程与技术说明](docs/workflows.md)：业务目标、系统边界、平台采集、热点筛选、知识卡和分享规则。
+- [CLI 使用参考](docs/usage.md)：配置、命令、数据格式、平台支持和测试命令。
 
 ## Acknowledgements
 

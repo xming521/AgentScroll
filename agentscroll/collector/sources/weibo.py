@@ -36,7 +36,7 @@ def search_weibo(
         微博条目列表，每条包含 id, text, url, author_handle, date,
         engagement, images, videos, relevance, why_relevant 等字段
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
     items = asyncio.run(_search_content(topic, limit))
     items = items[:limit]

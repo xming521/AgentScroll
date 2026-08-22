@@ -3,7 +3,7 @@
 Author: Jesse (https://github.com/Jesseovo)
 
 支持两种数据获取方式（按优先级自动切换）：
-1. MediaCrawler 浏览器爬虫（基于 Playwright，无需 API Key）
+1. 本地 Playwright 浏览器搜索（无需 API Key）
 2. 站外搜索发现公开笔记 URL
 """
 
@@ -33,7 +33,7 @@ def search_xiaohongshu(
     Returns:
         小红书笔记列表
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
 
     items: List[Dict[str, Any]] = []
@@ -42,7 +42,7 @@ def search_xiaohongshu(
         try:
             from . import crawler_bridge
             if crawler_bridge.is_playwright_available():
-                sys.stderr.write("[小红书] 尝试 MediaCrawler 爬虫模式...\n")
+                sys.stderr.write("[小红书] 尝试 Playwright 浏览器搜索...\n")
                 items = crawler_bridge.crawl_xiaohongshu(topic, limit)
                 if items:
                     sys.stderr.write(f"[小红书] 爬虫模式获取 {len(items)} 条结果\n")

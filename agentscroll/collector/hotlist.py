@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .knowledge_store import build_knowledge_document, save_knowledge_document
+from .knowledge_store import build_knowledge_document
 from .newsnow import _title_dedupe_key
 from .sources import bilibili, hupu, tieba, zhihu
 from .sources.weibo import collect_hot_topic_posts
@@ -38,29 +38,6 @@ def _normalize_selected_titles(selected_titles: str | Iterable[str]) -> list[str
     if not normalized:
         raise ValueError("至少需要一个模型选中的热榜标题")
     return normalized
-
-
-def list_hotlist_titles(
-    hotlist: Mapping[str, Any] | str | Path,
-) -> list[str]:
-    """Return titles in the exact source/rank order used by the snapshot TXT."""
-    payload = _load_hotlist(hotlist)
-    sources = payload.get("sources")
-    if not isinstance(sources, Mapping):
-        raise ValueError("NewsNow 热榜缺少 sources object")
-    titles: list[str] = []
-    for source in sources.values():
-        if not isinstance(source, Mapping):
-            continue
-        for item in source.get("items") or []:
-            if not isinstance(item, Mapping):
-                continue
-            title = " ".join(str(item.get("title") or "").split())
-            if title:
-                titles.append(title)
-    if not titles:
-        raise ValueError("NewsNow 热榜中没有可筛选标题")
-    return titles
 
 
 def list_hotlist_entries(
@@ -318,92 +295,6 @@ def collect_selected_hotlist_evidence(
         "unsupported_sources": unsupported_sources,
         "topics": topics,
     }
-
-
-def open_selected_hotlists(
-    hotlist: Mapping[str, Any] | str | Path,
-    selected_titles: str | Iterable[str],
-    *,
-    posts_per_topic: int = 1,
-    output_dir: str | Path | None = None,
-) -> dict[str, Any]:
-    """Read selected hot-list entries and save paired knowledge artifacts."""
-    if posts_per_topic <= 0:
-        raise ValueError("posts_per_topic 必须大于 0")
-    payload = _load_hotlist(hotlist)
-    selected = _normalize_selected_titles(selected_titles)
-    sources = payload.get("sources")
-    if not isinstance(sources, Mapping):
-        raise ValueError("NewsNow 热榜缺少 sources object")
-
-    by_title: dict[str, tuple[str, Mapping[str, Any]]] = {}
-    for source_id, source in sources.items():
-        if not isinstance(source, Mapping):
-            continue
-        raw_items = source.get("items")
-        if not isinstance(raw_items, list):
-            continue
-        for item in raw_items:
-            if not isinstance(item, Mapping) or not item.get("title"):
-                continue
-            key = _title_dedupe_key(str(item.get("title") or ""))
-            by_title.setdefault(key, (str(source_id), item))
-
-    matched: list[tuple[str, Mapping[str, Any]]] = []
-    missing_titles: list[str] = []
-    for selected_title in selected:
-        match = by_title.get(_title_dedupe_key(selected_title))
-        if match is None:
-            missing_titles.append(selected_title)
-        else:
-            matched.append(match)
-
-    details, unsupported_sources = _collect_hotlist_details(
-        matched,
-        posts_per_topic=posts_per_topic,
-    )
-
-    opened_items = [
-        {
-            "hotlist_item": dict(item),
-            "detail": details[index],
-        }
-        for index, (_, item) in enumerate(matched)
-    ]
-    readable_count = sum(
-        bool(detail and detail.get("status") == "readable") for detail in details
-    )
-    if not matched:
-        status = "empty"
-    elif readable_count == len(matched) and not missing_titles:
-        status = "success"
-    elif readable_count:
-        status = "partial"
-    else:
-        status = "unavailable"
-    source_results = _knowledge_sources(matched, details)
-    selected_source_ids = list(dict.fromkeys(source_id for source_id, _ in matched))
-    result = {
-        "provider": "agentscroll-hotlist-detail",
-        "topic": "热榜精选",
-        "status": status,
-        "selected_title_count": len(selected),
-        "matched_title_count": len(matched),
-        "readable_title_count": readable_count,
-        "posts_per_topic": posts_per_topic,
-        "missing_titles": missing_titles,
-        "unsupported_sources": sorted(set(unsupported_sources)),
-        "items": opened_items,
-        "routing": {
-            "selection": "model-selected-hotlist",
-            "sources": selected_source_ids,
-        },
-        "sources": source_results,
-    }
-    knowledge_file = save_knowledge_document(result, output_dir=output_dir)
-    result["knowledge_file"] = str(knowledge_file)
-    result["knowledge_metadata_file"] = str(knowledge_file.with_suffix(".json"))
-    return result
 
 
 def open_selected_weibo_hotlists(

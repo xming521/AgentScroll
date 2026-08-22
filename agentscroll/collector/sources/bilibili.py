@@ -4,7 +4,7 @@ Author: Jesse (https://github.com/Jesseovo)
 
 支持两种模式（自动切换）：
 1. B站公开搜索 API（无需 API Key）
-2. MediaCrawler 浏览器爬虫（备用方案）
+2. 本地 Playwright 浏览器搜索（备用方案）
 """
 
 import http.cookiejar
@@ -36,7 +36,7 @@ def search_bilibili(
     Returns:
         B站视频列表
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
     pages = 1 if depth == "quick" else (2 if depth == "default" else 3)
 
@@ -57,7 +57,7 @@ def search_bilibili(
         try:
             from . import crawler_bridge
             if crawler_bridge.is_playwright_available():
-                sys.stderr.write("[B站] API 无结果，尝试 MediaCrawler 爬虫模式...\n")
+                sys.stderr.write("[B站] API 无结果，尝试 Playwright 浏览器搜索...\n")
                 items = crawler_bridge.crawl_bilibili(topic, limit)
                 if items:
                     sys.stderr.write(f"[B站] 爬虫模式获取 {len(items)} 条结果\n")

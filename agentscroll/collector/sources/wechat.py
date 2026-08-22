@@ -35,7 +35,7 @@ def search_wechat(
     Returns:
         微信公众号文章列表
     """
-    limit_map = {"quick": 8, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
 
     items, detail_opener, detail_referer = _search_via_sogou(topic, limit)

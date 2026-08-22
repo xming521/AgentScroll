@@ -1,7 +1,4 @@
-from .hotlist import (
-    HOTLIST_FIRST_PASS_PROMPT,
-    HOTLIST_PROMPT,
-)
+from .hotlist import HOTLIST_FIRST_PASS_PROMPT
 from .knowledge_card import (
     KNOWLEDGE_CARD_PROMPT,
     KNOWLEDGE_CARD_RESEARCH_PROMPT,
@@ -9,7 +6,6 @@ from .knowledge_card import (
 
 __all__ = [
     "HOTLIST_FIRST_PASS_PROMPT",
-    "HOTLIST_PROMPT",
     "KNOWLEDGE_CARD_PROMPT",
     "KNOWLEDGE_CARD_RESEARCH_PROMPT",
 ]

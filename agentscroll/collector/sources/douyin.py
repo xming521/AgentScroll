@@ -3,7 +3,7 @@
 Author: Jesse (https://github.com/Jesseovo)
 
 支持两种模式（按优先级自动切换）：
-1. MediaCrawler 浏览器爬虫（需要 Playwright，无需 API Key）
+1. 本地 Playwright 浏览器搜索（无需 API Key）
 2. 站外搜索发现公开视频 URL
 """
 
@@ -39,7 +39,7 @@ def search_douyin(
     Returns:
         抖音视频列表
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
 
     items: List[Dict[str, Any]] = []
@@ -48,7 +48,7 @@ def search_douyin(
         try:
             from . import crawler_bridge
             if crawler_bridge.is_playwright_available():
-                sys.stderr.write("[抖音] 尝试 MediaCrawler 爬虫模式...\n")
+                sys.stderr.write("[抖音] 尝试 Playwright 浏览器搜索...\n")
                 items = crawler_bridge.crawl_douyin(topic, limit)
                 if items:
                     sys.stderr.write(f"[抖音] 爬虫模式获取 {len(items)} 条结果\n")

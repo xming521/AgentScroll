@@ -40,7 +40,7 @@ def search_zhihu(
     Returns:
         知乎问答/文章列表
     """
-    limit_map = {"quick": 10, "default": 10, "deep": 10}
+    limit_map = {"quick": 5, "default": 10, "deep": 20}
     limit = limit_map.get(depth, 10)
 
     items = _search_via_site_search(topic, limit)

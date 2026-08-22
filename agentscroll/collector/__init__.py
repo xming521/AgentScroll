@@ -27,13 +27,6 @@ def open_selected_weibo_hotlists(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return open_selected(*args, **kwargs)
 
 
-def open_selected_hotlists(*args: Any, **kwargs: Any) -> dict[str, Any]:
-    """Open model-selected Weibo, Hupu, and Tieba hot-list entries."""
-    from .hotlist import open_selected_hotlists as open_selected
-
-    return open_selected(*args, **kwargs)
-
-
 def collect_selected_hotlist_evidence(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Collect compact evidence for first-pass selected hot-list topics."""
     from .hotlist import collect_selected_hotlist_evidence as collect_evidence
@@ -48,7 +41,6 @@ __all__ = [
     "collect_selected_hotlist_evidence",
     "fetch_newsnow_hotlists",
     "list_newsnow_groups",
-    "open_selected_hotlists",
     "open_selected_weibo_hotlists",
     "route_topic",
 ]
