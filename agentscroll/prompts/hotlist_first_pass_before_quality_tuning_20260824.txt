@@ -1,6 +1,3 @@
-"""Prompt for hot-list topic selection."""
-
-HOTLIST_FIRST_PASS_PROMPT = """
 你会收到一份当前中文互联网热榜快照。
 
 这是第一轮粗筛，不是事实核验。不要搜索互联网，不要打开 URL，不要调用工具，也不要依赖输入之外的事实。请从全部条目中选出 5 至 15 个最值得进入下一轮内容调研的话题。
@@ -28,6 +25,3 @@ HOTLIST_FIRST_PASS_PROMPT = """
 - `label`：该话题最主要的筛选类别，只能是 `news`、`fun` 之一；
 
 不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。
-"""
-
-__all__ = ["HOTLIST_FIRST_PASS_PROMPT"]

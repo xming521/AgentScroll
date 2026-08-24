@@ -26,7 +26,7 @@ _LABEL_ALIASES = {
 }
 _REMOVED_LABELS = {"conversation", "discussion"}
 _SHARE_LABELS = {"news", "fun"}
-_STATUSES = {"complete", "needs_research"}
+_STATUSES = {"complete", "needs_research", "rejected"}
 _write_lock = threading.Lock()
 
 
@@ -45,6 +45,10 @@ def _card_schema(topic_ids: list[int]) -> dict[str, Any]:
                         "status": {
                             "type": "string",
                             "enum": sorted(_STATUSES),
+                        },
+                        "rejection_reason": {
+                            "type": "string",
+                            "maxLength": 120,
                         },
                         "knowledge": {"type": "string", "maxLength": 260},
                         "talking_points": {
@@ -88,6 +92,7 @@ def _card_schema(topic_ids: list[int]) -> dict[str, Any]:
                     "required": [
                         "topic_id",
                         "status",
+                        "rejection_reason",
                         "knowledge",
                         "talking_points",
                         "community_context",
@@ -231,8 +236,10 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _knowledge_card_prompt(topics: list[dict[str, Any]]) -> str:
     payload = json.dumps(topics, ensure_ascii=False, separators=(",", ":"))
+    evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     return (
         f"{KNOWLEDGE_CARD_PROMPT.strip()}\n\n"
+        f"当前评估时间：{evaluated_at}\n"
         f"话题总数：{len(topics)}\n"
         f"待生成知识卡的证据（JSON）：\n{payload}"
     )
@@ -240,8 +247,10 @@ def _knowledge_card_prompt(topics: list[dict[str, Any]]) -> str:
 
 def _knowledge_card_research_prompt(topics: list[dict[str, Any]]) -> str:
     payload = json.dumps(topics, ensure_ascii=False, separators=(",", ":"))
+    evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     return (
         f"{KNOWLEDGE_CARD_RESEARCH_PROMPT.strip()}\n\n"
+        f"当前评估时间：{evaluated_at}\n"
         f"待补搜话题总数：{len(topics)}\n"
         f"待补搜材料（JSON）：\n{payload}"
     )
@@ -422,6 +431,7 @@ def _validate_cards(
         if topic_id not in topic_by_id or topic_id in card_by_id:
             raise ValueError(f"模型返回了无效或重复 topic_id：{topic_id!r}")
         status = raw_card.get("status")
+        rejection_reason = str(raw_card.get("rejection_reason") or "").strip()
         knowledge = str(raw_card.get("knowledge") or "").strip()
         talking_points = raw_card.get("talking_points")
         community_context = str(raw_card.get("community_context") or "").strip()
@@ -435,13 +445,30 @@ def _validate_cards(
         ):
             raise ValueError(f"话题 {topic_id} 的数组字段无效")
         if status == "complete":
-            if not knowledge or missing:
+            if not knowledge or missing or rejection_reason:
                 raise ValueError(
-                    f"完整知识卡 {topic_id} 缺少 knowledge 或错误填写 missing"
+                    f"完整知识卡 {topic_id} 的字段状态不一致"
                 )
-        elif knowledge or talking_points or community_context or not missing:
-            raise ValueError(f"待补搜知识卡 {topic_id} 的字段状态不一致")
+        elif status == "needs_research":
+            if (
+                rejection_reason
+                or knowledge
+                or talking_points
+                or community_context
+                or not missing
+            ):
+                raise ValueError(f"待补搜知识卡 {topic_id} 的字段状态不一致")
+        elif (
+            not rejection_reason
+            or knowledge
+            or talking_points
+            or community_context
+            or uncertainties
+            or missing
+        ):
+            raise ValueError(f"已淘汰知识卡 {topic_id} 的字段状态不一致")
         card = dict(raw_card)
+        card["rejection_reason"] = rejection_reason
         card["share"] = _validate_share(
             raw_card.get("share"),
             status=str(status),
@@ -495,6 +522,8 @@ def _render_card_text(card: Mapping[str, Any]) -> str:
     if card.get("missing"):
         lines.append("\n缺少材料:")
         lines.extend(f"- {value}" for value in card["missing"])
+    if card.get("rejection_reason"):
+        lines.extend(("", f"淘汰原因: {card['rejection_reason']}"))
     share = card.get("share") or {}
     if share.get("ready"):
         comment_label = (
@@ -635,6 +664,7 @@ def _save_cards(
             "title": topic["title"],
             "label": _normalize_label(topic.get("label")),
             "status": card["status"],
+            "rejection_reason": card["rejection_reason"],
             "knowledge": card["knowledge"],
             "talking_points": card["talking_points"],
             "community_context": card["community_context"],
@@ -753,6 +783,7 @@ def generate_hotlist_knowledge_cards(
         "needs_research_count": sum(
             card["status"] == "needs_research" for card in cards
         ),
+        "rejected_count": sum(card["status"] == "rejected" for card in cards),
         "cards": cards,
         "inference": inference,
         **files,
@@ -913,6 +944,9 @@ def supplement_hotlist_knowledge_cards(
         "complete_count": sum(card["status"] == "complete" for card in merged_cards),
         "needs_research_count": sum(
             card["status"] == "needs_research" for card in merged_cards
+        ),
+        "rejected_count": sum(
+            card["status"] == "rejected" for card in merged_cards
         ),
         "supplemented_count": len(research_cards),
         "cards": merged_cards,

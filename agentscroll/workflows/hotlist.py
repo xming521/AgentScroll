@@ -10,13 +10,14 @@ from typing import Any
 from agentscroll.prompts.hotlist import HOTLIST_FIRST_PASS_PROMPT
 
 _FIRST_PASS_LABELS = {"news", "fun"}
+_FIRST_PASS_MAX_TOPICS = 15
 
 _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "topics": {
             "type": "array",
-            "maxItems": 20,
+            "maxItems": _FIRST_PASS_MAX_TOPICS,
             "items": {
                 "type": "object",
                 "properties": {
@@ -89,6 +90,7 @@ def select_hotlist_first_pass(
     raw_topics = response.parsed_json.get("topics")
     if not isinstance(raw_topics, list):
         raise ValueError("模型返回值缺少 topics 数组")
+    raw_topics = raw_topics[:_FIRST_PASS_MAX_TOPICS]
 
     selected_ids: set[int] = set()
     topics: list[dict[str, Any]] = []
@@ -144,6 +146,87 @@ def select_hotlist_first_pass(
     }
 
 
+def learn_hotlist_snapshot(
+    hotlist: Mapping[str, Any] | str | Path,
+    *,
+    config_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    share_output_dir: str | Path | None = None,
+    posts_per_entry: int = 1,
+    max_entries_per_topic: int = 3,
+    supplement_failed: bool = True,
+    generation_effort: str = "xhigh",
+    supplement_effort: str = "xhigh",
+) -> dict[str, Any]:
+    """Select topics from one snapshot and complete the learning workflow."""
+    from .knowledge_card import generate_selected_hotlist_knowledge_cards
+
+    selection = select_hotlist_first_pass(hotlist, config_path=config_path)
+    return generate_selected_hotlist_knowledge_cards(
+        hotlist,
+        selection,
+        config_path=config_path,
+        output_dir=output_dir,
+        share_output_dir=share_output_dir,
+        posts_per_entry=posts_per_entry,
+        max_entries_per_topic=max_entries_per_topic,
+        supplement_failed=supplement_failed,
+        generation_effort=generation_effort,
+        supplement_effort=supplement_effort,
+    )
+
+
+def fetch_and_learn_hotlists(
+    groups: str | tuple[str, ...] = "综合",
+    *,
+    base_url: str | None = None,
+    latest: bool = False,
+    per_source_limit: int | None = None,
+    timeout: int = 15,
+    snapshot_output_dir: str | Path | None = None,
+    config_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    share_output_dir: str | Path | None = None,
+    posts_per_entry: int = 1,
+    max_entries_per_topic: int = 3,
+    supplement_failed: bool = True,
+    generation_effort: str = "xhigh",
+    supplement_effort: str = "xhigh",
+) -> dict[str, Any]:
+    """Fetch a snapshot and immediately complete the learning workflow."""
+    from agentscroll.collector import fetch_newsnow_hotlists
+
+    fetched = fetch_newsnow_hotlists(
+        groups,
+        base_url=base_url,
+        latest=latest,
+        per_source_limit=per_source_limit,
+        timeout=timeout,
+        output_dir=snapshot_output_dir,
+        save=True,
+    )
+    if not fetched["total_items"]:
+        raise RuntimeError("NewsNow 没有返回可学习的热榜条目")
+    snapshot = fetched.get("snapshot_file")
+    if not snapshot:
+        raise RuntimeError("NewsNow 热榜快照未保存")
+
+    learned = learn_hotlist_snapshot(
+        snapshot,
+        config_path=config_path,
+        output_dir=output_dir,
+        share_output_dir=share_output_dir,
+        posts_per_entry=posts_per_entry,
+        max_entries_per_topic=max_entries_per_topic,
+        supplement_failed=supplement_failed,
+        generation_effort=generation_effort,
+        supplement_effort=supplement_effort,
+    )
+    return {"fetch": fetched, "learn": learned}
+
+
 __all__ = [
+    "fetch_and_learn_hotlists",
+    "learn_hotlist_snapshot",
     "select_hotlist_first_pass",
 ]

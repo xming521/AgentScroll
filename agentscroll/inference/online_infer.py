@@ -66,7 +66,7 @@ class OnlineLLM:
         self,
         messages,
         temperature: Optional[float] = None,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         stream: bool = False,
         extra_body: Optional[dict[str, Any]] = None,
@@ -77,8 +77,9 @@ class OnlineLLM:
             "model": self.model_name,
             "messages": messages,
             "stream": stream,
-            "max_tokens": max_tokens,
         }
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
         if temperature is not None:
             params["temperature"] = temperature
         if top_p is not None:
@@ -120,7 +121,7 @@ class OnlineLLM:
         self,
         prompt_text: str,
         temperature: Optional[float] = None,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         stream: bool = False,
         extra_body: Optional[dict[str, Any]] = None,
@@ -140,7 +141,7 @@ class OnlineLLM:
         self,
         prompts: List[str],
         temperature: Optional[float] = None,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         stream: bool = False,
         extra_body: Optional[dict[str, Any]] = None,
@@ -152,7 +153,7 @@ class OnlineLLM:
         Args:
             prompts: List of prompt strings
             temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
+            max_tokens: Maximum tokens to generate; omitted uses the provider default
             top_p: Top-p sampling parameter
             stream: Whether to stream the response
             callback: Optional callback function called for each result

@@ -148,22 +148,6 @@ def hotlist_fetch(
         raise click.exceptions.Exit(1)
 
 
-@hotlist.command("select")
-@click.argument("snapshot", type=_INPUT_FILE)
-@click.pass_context
-def hotlist_select(context: click.Context, snapshot: Path) -> None:
-    """用模型完成话题级粗筛，不访问详情页。"""
-    from agentscroll.workflows import select_hotlist_first_pass
-
-    result = _run(
-        lambda: select_hotlist_first_pass(
-            snapshot,
-            config_path=_config_path(context),
-        )
-    )
-    _print_json(result)
-
-
 @hotlist.command("learn")
 @click.argument("snapshot", type=_INPUT_FILE)
 @click.option(
@@ -196,20 +180,77 @@ def hotlist_learn(
     supplement_effort: str,
 ) -> None:
     """粗筛热榜、采集证据并生成知识卡和分享队列。"""
-    from agentscroll.workflows import (
-        generate_selected_hotlist_knowledge_cards,
-        select_hotlist_first_pass,
-    )
+    from agentscroll.workflows import learn_hotlist_snapshot
 
-    config_path = _config_path(context)
-    selection = _run(
-        lambda: select_hotlist_first_pass(snapshot, config_path=config_path)
-    )
     result = _run(
-        lambda: generate_selected_hotlist_knowledge_cards(
+        lambda: learn_hotlist_snapshot(
             snapshot,
-            selection,
-            config_path=config_path,
+            config_path=_config_path(context),
+            output_dir=output_dir,
+            share_output_dir=share_output_dir,
+            posts_per_entry=posts_per_entry,
+            max_entries_per_topic=max_entries_per_topic,
+            supplement_failed=not no_supplement,
+            generation_effort=generation_effort,
+            supplement_effort=supplement_effort,
+        )
+    )
+    _print_json(result)
+
+
+@hotlist.command("run")
+@click.option("--groups", default="综合", show_default=True, help="逗号分隔的类别。")
+@click.option("--base-url", help="NewsNow 部署地址。")
+@click.option("--latest", is_flag=True, help="请求 NewsNow 刷新数据。")
+@click.option("--per-source-limit", type=click.IntRange(min=1))
+@click.option("--timeout", type=click.IntRange(min=1), default=15, show_default=True)
+@click.option("--snapshot-output-dir", type=_PATH, help="热榜快照目录。")
+@click.option(
+    "--posts-per-entry",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+)
+@click.option(
+    "--max-entries-per-topic",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+)
+@click.option("--output-dir", type=_PATH, help="知识卡目录。")
+@click.option("--share-output-dir", type=_PATH, help="分享队列目录。")
+@click.option("--no-supplement", is_flag=True, help="关闭失败话题的自动补搜。")
+@click.option("--generation-effort", default="xhigh", show_default=True)
+@click.option("--supplement-effort", default="xhigh", show_default=True)
+@click.pass_context
+def hotlist_run(
+    context: click.Context,
+    groups: str,
+    base_url: str | None,
+    latest: bool,
+    per_source_limit: int | None,
+    timeout: int,
+    snapshot_output_dir: Path | None,
+    posts_per_entry: int,
+    max_entries_per_topic: int,
+    output_dir: Path | None,
+    share_output_dir: Path | None,
+    no_supplement: bool,
+    generation_effort: str,
+    supplement_effort: str,
+) -> None:
+    """拉取最新热榜并完成知识卡与分享生成。"""
+    from agentscroll.workflows import fetch_and_learn_hotlists
+
+    result = _run(
+        lambda: fetch_and_learn_hotlists(
+            _comma_separated(groups) or (),
+            base_url=base_url,
+            latest=latest,
+            per_source_limit=per_source_limit,
+            timeout=timeout,
+            snapshot_output_dir=snapshot_output_dir,
+            config_path=_config_path(context),
             output_dir=output_dir,
             share_output_dir=share_output_dir,
             posts_per_entry=posts_per_entry,

@@ -7,6 +7,7 @@ and login state vary by environment.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from datetime import datetime
@@ -22,6 +23,9 @@ QUERY_FLAG = "AGENTSCROLL_RUN_LIVE_TESTS"
 BROWSER_FLAG = "AGENTSCROLL_RUN_BROWSER_TESTS"
 QUERY_SOURCES_ENV = "AGENTSCROLL_LIVE_SOURCES"
 BROWSER_SOURCES_ENV = "AGENTSCROLL_LIVE_BROWSER_SOURCES"
+HOTLIST_STAGE_ENV = "AGENTSCROLL_LIVE_HOTLIST_STAGE"
+HOTLIST_GROUPS_ENV = "AGENTSCROLL_LIVE_HOTLIST_GROUPS"
+HOTLIST_TEST_STAGES = {"first-pass", "full"}
 # Xiaohongshu currently requires a non-guest login before its web search emits
 # note results. Keep it available as an explicit live target, but do not make a
 # default informal run fail solely because this machine has no valid login.
@@ -118,6 +122,15 @@ def _selected_sources(
             f"可用值：{', '.join(sorted(allowed))}"
         )
     return selected
+
+
+def _hotlist_test_stage() -> str:
+    stage = os.environ.get(HOTLIST_STAGE_ENV, "first-pass").strip().lower()
+    if stage not in HOTLIST_TEST_STAGES:
+        raise ValueError(
+            f"{HOTLIST_STAGE_ENV} 必须是 first-pass 或 full，当前值：{stage!r}"
+        )
+    return stage
 
 
 def _assert_real_item(source: str, item: Any) -> None:
@@ -279,6 +292,60 @@ def test_live_platform_search_and_detail_and_comments(
             )
 
     assert not failures, "\n".join(("真实平台验证失败：", *failures))
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not _enabled(QUERY_FLAG),
+    reason=f"设置 {QUERY_FLAG}=1 才会执行真实热榜与模型测试",
+)
+def test_live_hotlist_learning_by_stage() -> None:
+    """Stop after title classification or continue through the full workflow."""
+    from agentscroll.collector import fetch_newsnow_hotlists
+    from agentscroll.workflows import (
+        learn_hotlist_snapshot,
+        select_hotlist_first_pass,
+    )
+
+    _ensure_artifact_run_dir()
+    stage = _hotlist_test_stage()
+    groups = os.environ.get(HOTLIST_GROUPS_ENV, "综合").strip() or "综合"
+    hotlist = fetch_newsnow_hotlists(
+        tuple(part.strip() for part in groups.split(",") if part.strip()),
+        save=True,
+    )
+    assert hotlist["total_items"], "NewsNow 没有返回可供测试的热榜标题"
+
+    if stage == "first-pass":
+        result = select_hotlist_first_pass(hotlist)
+        classified_titles = [
+            {
+                "label": topic["label"],
+                "title": topic["representative"]["title"],
+                "related_titles": [item["title"] for item in topic["related"]],
+            }
+            for topic in result["topics"]
+        ]
+        assert classified_titles, "第一轮模型没有分类出任何标题"
+        assert result["topic_count"] == len(classified_titles) <= 20
+        assert all(item["label"] in {"news", "fun"} for item in classified_titles)
+        artifact_items = classified_titles
+    else:
+        result = learn_hotlist_snapshot(hotlist)
+        artifact_items = result["cards"]
+        assert artifact_items, "完整热榜学习没有生成知识卡"
+
+    artifact = live_artifacts.save_test_result(
+        "newsnow",
+        f"hotlist_{stage.replace('-', '_')}",
+        groups,
+        status="passed",
+        items=artifact_items,
+    )
+    print(f"[hotlist-stage] {stage}")
+    print(json.dumps(artifact_items, ensure_ascii=False, indent=2))
+    if artifact is not None:
+        print(f"[hotlist-artifact] {artifact}")
 
 
 @pytest.mark.live

@@ -1,6 +1,6 @@
 # AgentScroll CLI 使用参考
 
-本文集中说明 AgentScroll 的配置、CLI、数据格式、平台支持和测试命令。内容处理规则、系统结构、平台采集实现和技术原则见[工作流程与技术说明](workflows.md)。
+本文集中说明 AgentScroll 的配置、CLI、数据格式、平台支持和测试命令。内容处理规则、系统结构、平台采集实现和技术原则见[系统设计与内容规则](design.md)。
 
 ## 环境与推理配置
 
@@ -57,9 +57,9 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 | `default` | 10 条 | 中等 |
 | `deep` | 20 条 | 最高 |
 
-`quick` 不会跳过小红书或其他平台。平台实际返回数量可能低于对应上限；候选越多，后续详情与评论请求也越多。各档使用的采集路径见[搜索规模](workflows.md#搜索规模)。
+`quick` 不会跳过小红书或其他平台。平台实际返回数量可能低于对应上限；候选越多，后续详情与评论请求也越多。各档使用的采集路径见[搜索规模](design.md#搜索规模)。
 
-各场景的选择规则见[主动搜索流程](workflows.md#主动搜索)。
+各场景的选择规则见[主动搜索](design.md#主动搜索)。
 
 ### 返回值与知识文件
 
@@ -72,7 +72,7 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 返回值中的 `knowledge_metadata_file` 和 `knowledge_file` 分别给出两份文件的路径。默认写入 `outputs/knowledge/`；显式 `output_dir` 不覆盖输入文件。
 
-知识文件的排序、截断和过滤规则见[知识沉淀](workflows.md#知识沉淀)。
+知识文件的排序、截断和过滤规则见[知识沉淀](design.md#知识沉淀)。
 
 ## 正文与评论字段
 
@@ -181,7 +181,7 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 - `outputs/hotlists/*.json`：完整榜单快照。
 - `outputs/hotlists/*.txt`：每行一个标题。
 
-榜单合并和去重规则见[拉取与去重](workflows.md#拉取与去重)。
+榜单合并和去重规则见[拉取与去重](design.md#拉取与去重)。
 
 ### 快照字段
 
@@ -197,7 +197,19 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 - `snapshot_file`：JSON 快照绝对路径；`--no-save` 时不存在。
 - `snapshot_text_file`：标题 TXT 的绝对路径，只存在于调用返回结果中。
 
-### 生成知识卡与补搜
+### 拉取并学习
+
+`run` 会依次拉取热榜快照并完成知识卡与分享生成：
+
+```bash
+.venv/bin/agentscroll hotlist run \
+  --groups '综合' \
+  --snapshot-output-dir outputs/hotlists \
+  --output-dir outputs/knowledge \
+  --share-output-dir outputs/shares
+```
+
+已有热榜快照需要重新学习时，直接使用 `learn`：
 
 ```bash
 .venv/bin/agentscroll hotlist learn \
@@ -206,12 +218,7 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
   --share-output-dir outputs/shares
 ```
 
-该命令先做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。只查看粗筛结果而不访问详情页时使用：
-
-```bash
-.venv/bin/agentscroll hotlist select \
-  outputs/hotlists/example_newsnow_综合.json
-```
+两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。
 
 常用参数与产物：
 
@@ -220,9 +227,10 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享目录。
 - 一次运行保存一份批次 JSON、一份批次 TXT 和一份最终分享队列。
-- 批次 JSON 记录全部知识卡、模型、耗时、实际 Token 使用量、公共搜索请求数和原生 Web Search 次数。
+- 批次 JSON 记录全部话题的 `complete`、`needs_research`、`rejected` 状态；`rejected` 话题通过 `rejection_reason` 保留淘汰原因，但没有知识内容，也不会进入分享队列。
+- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、耗时、实际 Token 使用量、公共搜索请求数和原生 Web Search 次数。
 
-内部筛选、证据补充和评论回填规则见[热榜学习](workflows.md#热榜学习)。
+内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。
 
 ## 可选依赖与运行限制
 
@@ -276,18 +284,6 @@ AGENTSCROLL_LIVE_TOPIC='codex' \
 AGENTSCROLL_RUN_LIVE_TESTS=1 \
 AGENTSCROLL_LIVE_TOPIC='大模型 Agent' \
 AGENTSCROLL_LIVE_SOURCES=weibo,xiaohongshu,bilibili,douyin,toutiao \
-.venv/bin/python -m pytest \
-  -m live \
-  -k platform_search_and_detail_and_comments \
-  -v
-```
-
-只测试单个平台：
-
-```bash
-AGENTSCROLL_RUN_LIVE_TESTS=1 \
-AGENTSCROLL_LIVE_TOPIC='机器人' \
-AGENTSCROLL_LIVE_SOURCES=xiaohongshu \
 .venv/bin/python -m pytest \
   -m live \
   -k platform_search_and_detail_and_comments \

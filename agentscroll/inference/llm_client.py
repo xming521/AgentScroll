@@ -8,10 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable, Literal, Protocol
+from urllib.parse import urlparse
 
 import httpx
 import pyjson5
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 from ._common import (
     API_TIMEOUT_SECONDS,
@@ -38,7 +39,7 @@ class LLMRequest:
     provider: ProviderName | str | None = None
     temperature: float | None = None
     top_p: float | None = None
-    max_tokens: int = 1024
+    max_tokens: int | None = None
     timeout: int | None = None
     stream: bool = False
     json_mode: bool = False
@@ -205,6 +206,14 @@ def _classify_error(text: str) -> str:
     return "other"
 
 
+def _response_format_type_unavailable(exc: BadRequestError) -> bool:
+    return "response_format type is unavailable" in str(exc).lower()
+
+
+def _is_deepseek_api(base_url: str | None) -> bool:
+    return (urlparse(base_url or "").hostname or "").lower() == "api.deepseek.com"
+
+
 class BaseBatchMixin:
     max_workers: int
 
@@ -261,6 +270,7 @@ class OpenAICompatibleClient(BaseBatchMixin):
         self.model = model
         self.max_workers = max_workers
         self.timeout = timeout
+        self.is_deepseek_api = _is_deepseek_api(base_url)
         proxy_url = openrouter_proxy_url(base_url or "")
         self.http_client = (
             httpx.Client(proxy=proxy_url, timeout=timeout) if proxy_url else None
@@ -283,38 +293,55 @@ class OpenAICompatibleClient(BaseBatchMixin):
             "model": model,
             "messages": request.messages,
             "stream": request.stream,
-            "max_tokens": request.max_tokens,
         }
+        if request.max_tokens is not None:
+            params["max_tokens"] = request.max_tokens
         if request.temperature is not None:
             params["temperature"] = request.temperature
         if request.top_p is not None:
             params["top_p"] = request.top_p
-        if request.extra_body:
-            params["extra_body"] = request.extra_body
+        extra_body = dict(request.extra_body or {})
+        if extra_body:
+            params["extra_body"] = extra_body
         if request.timeout is not None:
             params["timeout"] = request.timeout
         if request.json_schema:
-            params["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "llm_response",
-                    "schema": request.json_schema,
-                    "strict": True,
-                },
-            }
+            if self.is_deepseek_api:
+                params["response_format"] = {"type": "json_object"}
+            else:
+                params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "llm_response",
+                        "schema": request.json_schema,
+                        "strict": True,
+                    },
+                }
         elif request.json_mode:
             params["response_format"] = {"type": "json_object"}
 
         t0 = time.time()
+        empty_json_retries = 0
         for attempt in range(OPENAI_API_MAX_RETRIES + 1):
             try:
                 raw = self.client.chat.completions.create(**params)
                 elapsed = round(time.time() - t0, 3)
                 choice = raw.choices[0]
                 text = choice.message.content
-                if text is None:
+                if not (text or "").strip():
+                    if (
+                        (request.json_schema or request.json_mode)
+                        and empty_json_retries < 1
+                    ):
+                        empty_json_retries += 1
+                        logger.warning(
+                            "OpenAI-compatible API returned empty JSON content; "
+                            "retrying once"
+                        )
+                        continue
                     return LLMResponse(
                         ok=False,
+                        text=text,
                         error="empty response",
                         raw=raw,
                         provider=self.provider,
@@ -344,6 +371,28 @@ class OpenAICompatibleClient(BaseBatchMixin):
                     model=model,
                     elapsed_s=elapsed,
                     finish_reason=choice.finish_reason,
+                )
+            except BadRequestError as exc:
+                response_format = params.get("response_format")
+                if (
+                    request.json_schema
+                    and isinstance(response_format, dict)
+                    and response_format.get("type") == "json_schema"
+                    and _response_format_type_unavailable(exc)
+                ):
+                    params["response_format"] = {"type": "json_object"}
+                    logger.warning(
+                        "OpenAI-compatible API does not support response_format "
+                        "type json_schema; falling back to json_object"
+                    )
+                    continue
+                elapsed = round(time.time() - t0, 3)
+                return LLMResponse(
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    provider=self.provider,
+                    model=model,
+                    elapsed_s=elapsed,
                 )
             except Exception as exc:
                 if attempt < OPENAI_API_MAX_RETRIES:
