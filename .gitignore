@@ -10,6 +10,7 @@ __pycache__/
 
 # 本地推理配置；仓库只提交 settings.example.jsonc。
 settings.jsonc
+.env
 
 # 运行时生成的日志、采集结果与测试证据。
 outputs/
@@ -19,3 +20,4 @@ DailyHotApi/
 mcp-server-weibo/
 newsnow/
 AGENTS.md
+nohup.out

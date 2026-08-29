@@ -25,7 +25,9 @@ QUERY_SOURCES_ENV = "AGENTSCROLL_LIVE_SOURCES"
 BROWSER_SOURCES_ENV = "AGENTSCROLL_LIVE_BROWSER_SOURCES"
 HOTLIST_STAGE_ENV = "AGENTSCROLL_LIVE_HOTLIST_STAGE"
 HOTLIST_GROUPS_ENV = "AGENTSCROLL_LIVE_HOTLIST_GROUPS"
-HOTLIST_TEST_STAGES = {"first-pass", "full"}
+HOTLIST_SELECTION_FILE_ENV = "AGENTSCROLL_LIVE_HOTLIST_SELECTION_FILE"
+HOTLIST_SNAPSHOT_FILE_ENV = "AGENTSCROLL_LIVE_HOTLIST_SNAPSHOT_FILE"
+HOTLIST_TEST_STAGES = {"first-pass", "cards", "full"}
 # Xiaohongshu currently requires a non-guest login before its web search emits
 # note results. Keep it available as an explicit live target, but do not make a
 # default informal run fail solely because this machine has no valid login.
@@ -128,9 +130,101 @@ def _hotlist_test_stage() -> str:
     stage = os.environ.get(HOTLIST_STAGE_ENV, "first-pass").strip().lower()
     if stage not in HOTLIST_TEST_STAGES:
         raise ValueError(
-            f"{HOTLIST_STAGE_ENV} 必须是 first-pass 或 full，当前值：{stage!r}"
+            f"{HOTLIST_STAGE_ENV} 必须是 "
+            f"{', '.join(sorted(HOTLIST_TEST_STAGES))}，当前值：{stage!r}"
         )
     return stage
+
+
+def _hotlist_selection_artifact() -> Path:
+    configured = os.environ.get(HOTLIST_SELECTION_FILE_ENV, "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"筛选结果不存在：{path}")
+        return path
+
+    pattern = "*/04_test_result/hotlist_first_pass_newsnow.json"
+    candidates = sorted(
+        (Path.cwd() / "outputs" / "test_artifacts" / "live_collectors").glob(
+            pattern
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"没有找到已有标题筛选结果；请先运行 first-pass，或设置 "
+            f"{HOTLIST_SELECTION_FILE_ENV}"
+        )
+    return candidates[0].resolve()
+
+
+def _selection_from_artifact(
+    hotlist: dict[str, Any],
+    artifact_path: Path,
+) -> dict[str, Any]:
+    from agentscroll.collector.hotlist import list_hotlist_entries
+
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    raw_topics = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(raw_topics, list) or not raw_topics:
+        raise ValueError(f"标题筛选结果没有非空 items：{artifact_path}")
+
+    entries = list_hotlist_entries(hotlist)
+    entry_id_by_title = {
+        str(entry.get("title") or ""): index
+        for index, entry in enumerate(entries, start=1)
+    }
+    selected_ids: set[int] = set()
+    topics = []
+    for raw_topic in raw_topics:
+        if not isinstance(raw_topic, dict):
+            raise ValueError(f"标题筛选结果包含无效话题：{raw_topic!r}")
+        title = str(raw_topic.get("title") or "").strip()
+        label = str(raw_topic.get("label") or "")
+        related_titles = raw_topic.get("related_titles")
+        if label not in {"news", "fun"} or not title:
+            raise ValueError(f"标题筛选结果包含无效类别或标题：{raw_topic!r}")
+        if not isinstance(related_titles, list) or any(
+            not isinstance(value, str) for value in related_titles
+        ):
+            raise ValueError(f"话题 {title!r} 的 related_titles 无效")
+
+        topic_titles = [title, *related_titles]
+        missing_titles = [
+            value for value in topic_titles if value not in entry_id_by_title
+        ]
+        if missing_titles:
+            raise ValueError(
+                f"已有筛选标题不在当前 NewsNow 快照中：{missing_titles}"
+            )
+        topic_ids = [entry_id_by_title[value] for value in topic_titles]
+        if len(topic_ids) != len(set(topic_ids)) or selected_ids.intersection(
+            topic_ids
+        ):
+            raise ValueError(f"标题筛选结果重复使用热榜条目：{topic_titles}")
+        selected_ids.update(topic_ids)
+        representative_id, *related_ids = topic_ids
+        topics.append(
+            {
+                "representative_id": representative_id,
+                "representative": dict(entries[representative_id - 1]),
+                "related_ids": related_ids,
+                "related": [dict(entries[value - 1]) for value in related_ids],
+                "label": label,
+            }
+        )
+
+    return {
+        "input_count": len(entries),
+        "topic_count": len(topics),
+        "topics": topics,
+        "inference": {
+            "source": "saved-first-pass-artifact",
+            "artifact": str(artifact_path),
+        },
+    }
 
 
 def _assert_real_item(source: str, item: Any) -> None:
@@ -300,20 +394,29 @@ def test_live_platform_search_and_detail_and_comments(
     reason=f"设置 {QUERY_FLAG}=1 才会执行真实热榜与模型测试",
 )
 def test_live_hotlist_learning_by_stage() -> None:
-    """Stop after title classification or continue through the full workflow."""
+    """Run title selection, cards from saved selection, or the full workflow."""
     from agentscroll.collector import fetch_newsnow_hotlists
     from agentscroll.workflows import (
+        generate_selected_hotlist_knowledge_cards,
         learn_hotlist_snapshot,
         select_hotlist_first_pass,
     )
 
-    _ensure_artifact_run_dir()
+    run_dir = _ensure_artifact_run_dir()
     stage = _hotlist_test_stage()
     groups = os.environ.get(HOTLIST_GROUPS_ENV, "综合").strip() or "综合"
-    hotlist = fetch_newsnow_hotlists(
-        tuple(part.strip() for part in groups.split(",") if part.strip()),
-        save=True,
-    )
+    saved_snapshot = os.environ.get(HOTLIST_SNAPSHOT_FILE_ENV, "").strip()
+    if stage == "cards" and saved_snapshot:
+        snapshot_path = Path(saved_snapshot).expanduser().resolve()
+        if not snapshot_path.is_file():
+            raise FileNotFoundError(f"热榜快照不存在：{snapshot_path}")
+        hotlist = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        print(f"[hotlist-snapshot] {snapshot_path}")
+    else:
+        hotlist = fetch_newsnow_hotlists(
+            tuple(part.strip() for part in groups.split(",") if part.strip()),
+            save=True,
+        )
     assert hotlist["total_items"], "NewsNow 没有返回可供测试的热榜标题"
 
     if stage == "first-pass":
@@ -330,6 +433,18 @@ def test_live_hotlist_learning_by_stage() -> None:
         assert result["topic_count"] == len(classified_titles) <= 20
         assert all(item["label"] in {"news", "fun"} for item in classified_titles)
         artifact_items = classified_titles
+    elif stage == "cards":
+        selection_artifact = _hotlist_selection_artifact()
+        selection = _selection_from_artifact(hotlist, selection_artifact)
+        result = generate_selected_hotlist_knowledge_cards(
+            hotlist,
+            selection,
+            output_dir=run_dir / "knowledge",
+            share_output_dir=run_dir / "shares",
+        )
+        artifact_items = result["cards"]
+        assert artifact_items, "已有标题筛选结果没有生成知识卡"
+        print(f"[hotlist-selection-artifact] {selection_artifact}")
     else:
         result = learn_hotlist_snapshot(hotlist)
         artifact_items = result["cards"]

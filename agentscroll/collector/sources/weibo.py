@@ -57,6 +57,9 @@ def collect_hot_topic_posts(
     topics: Iterable[str],
     *,
     posts_per_topic: int = 1,
+    from_date: str = "",
+    to_date: str = "",
+    require_known_date: bool = False,
 ) -> List[Dict[str, Any]]:
     """Resolve hot-list titles to readable Weibo posts and public comments.
 
@@ -71,6 +74,9 @@ def collect_hot_topic_posts(
         _collect_hot_topic_posts(
             normalized_topics,
             posts_per_topic=posts_per_topic,
+            from_date=from_date,
+            to_date=to_date,
+            require_known_date=require_known_date,
         )
     )
 
@@ -79,6 +85,9 @@ async def _collect_hot_topic_posts(
     topics: List[str],
     *,
     posts_per_topic: int,
+    from_date: str,
+    to_date: str,
+    require_known_date: bool,
 ) -> List[Dict[str, Any]]:
     crawler = WeiboCrawler()
     results: List[Dict[str, Any]] = []
@@ -102,12 +111,18 @@ async def _collect_hot_topic_posts(
             items = [_normalize_feed(feed) for feed in feeds]
             search_count = len(items)
             await _enrich_post_contents(items, crawler=crawler)
-            await _enrich_post_comments(items, crawler=crawler)
+            items = _retain_date_range(
+                items,
+                from_date=from_date,
+                to_date=to_date,
+                require_known_date=require_known_date,
+            )
             items = page_content.retain_readable_details(
                 items,
                 allowed_sources={_CONTENT_SOURCE},
             )
             posts = _rank_items(topic, items, posts_per_topic)
+            await _enrich_post_comments(posts, crawler=crawler)
             results.append({
                 "query": topic,
                 "status": (
@@ -130,6 +145,31 @@ async def _collect_hot_topic_posts(
                 "error": f"{type(exc).__name__}: {exc}",
             })
     return results
+
+
+def _retain_date_range(
+    items: List[Dict[str, Any]],
+    *,
+    from_date: str,
+    to_date: str,
+    require_known_date: bool,
+) -> List[Dict[str, Any]]:
+    if not from_date and not to_date:
+        return items
+    start = dates.parse_date(from_date)
+    end = dates.parse_date(to_date)
+    if start is None or end is None:
+        raise ValueError(f"无效的微博日期范围：{from_date!r} 至 {to_date!r}")
+    retained = []
+    for item in items:
+        published_at = dates.parse_date(str(item.get("date") or ""))
+        if published_at is None:
+            if not require_known_date:
+                retained.append(item)
+            continue
+        if start.date() <= published_at.date() <= end.date():
+            retained.append(item)
+    return retained
 
 
 def _rank_items(

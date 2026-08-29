@@ -52,6 +52,8 @@ SYNONYMS = {
     '深度学习': {'ai', '人工智能', '机器学习'},
 }
 
+MIN_POST_RELEVANCE = 0.3
+
 # Generic query words that should not carry relevance on their own.
 LOW_SIGNAL_QUERY_TOKENS = frozenset({
     'advice', 'animation', 'animations', 'best', 'chance', 'chances',
@@ -111,7 +113,7 @@ def token_overlap_relevance(
     - a small precision term to penalize extra noise
     - an exact phrase bonus
 
-    Generic tokens alone are capped below the post-retrieval 0.3 threshold.
+    Generic tokens alone are capped below ``MIN_POST_RELEVANCE``.
 
     Args:
         query: Search query

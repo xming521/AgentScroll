@@ -17,6 +17,25 @@ AgentScroll
 
 AgentScroll 通过主动搜索和热榜学习两条流程发现内容，补充正文、评论与相关报道，再生成可学习的知识和即时分享。
 
+完成[推理配置](docs/usage.md#环境与推理配置)后，可以执行一次热榜学习，也可以按配置的时间定时运行：
+
+```bash
+agentscroll hotlist run
+agentscroll hotlist run --scheduled
+```
+
+需要后台运行时，可以使用内置 NewsNow 服务的 Docker Compose 部署：
+
+```bash
+cp settings.example.jsonc settings.jsonc
+cp .env.example .env
+mkdir -p outputs
+# 填写模型配置和 API Key 后启动
+docker compose up -d --build
+```
+
+完整配置和日志命令见[Docker 后台运行](docs/usage.md#docker-后台运行)。
+
 ## 文档
 
 - [系统设计与内容规则](docs/design.md)：业务目标、系统边界、平台采集、热点筛选、知识卡和分享规则。

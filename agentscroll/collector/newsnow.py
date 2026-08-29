@@ -24,11 +24,11 @@ DEFAULT_NEWSNOW_BASE_URL = "http://127.0.0.1:4444"
 NEWSNOW_GROUPS: dict[str, tuple[str, ...]] = {
     "社区/科技": ("v2ex-share",),
     "综合": (
-        "zhihu",
         "weibo",
         "hupu",
         "tieba",
         "bilibili-hot-search",
+        "zhihu",
     ),
     "社媒": ("weibo",),
     "新闻": ("zaobao", "toutiao", "thepaper", "ifeng", "tencent-hot"),

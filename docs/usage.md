@@ -17,7 +17,7 @@ uv pip install --python .venv/bin/python -e .
 cp settings.example.jsonc settings.jsonc
 ```
 
-`settings.example.jsonc` 是分发模板，`settings.jsonc` 是被 Git 忽略的本地真实配置。配置包含推理后端、模型、并发数、API 连接和推理强度。API Key 只从 `api_key_env` 指定的环境变量读取，例如：
+`settings.example.jsonc` 是分发模板，`settings.jsonc` 是被 Git 忽略的本地真实配置。配置包含推理参数和热榜定时规则。`max_workers` 控制逐话题知识卡请求和补搜请求的最大并发数。API Key 只从 `api_key_env` 指定的环境变量读取，例如：
 
 ```bash
 export AGENTSCROLL_LLM_API_KEY='your-api-key'
@@ -159,7 +159,7 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 
 ### 拉取榜单
 
-不传 `--groups` 时默认使用“综合”组，包括知乎（`zhihu`）、微博（`weibo`）、虎扑（`hupu`）、百度贴吧（`tieba`）和 Bilibili 热搜（`bilibili-hot-search`）。
+不传 `--groups` 时默认使用“综合”组，依次包括微博（`weibo`）、虎扑（`hupu`）、百度贴吧（`tieba`）、Bilibili 热搜（`bilibili-hot-search`）和知乎（`zhihu`）。
 
 ```bash
 # 查看全部类别及其 Source ID
@@ -209,6 +209,60 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
   --share-output-dir outputs/shares
 ```
 
+使用 `--scheduled` 后，命令会读取 `settings.jsonc` 的 `schedule` 配置并在前台等待定时执行，按 `Ctrl+C` 停止：
+
+```bash
+.venv/bin/agentscroll hotlist run --groups '综合' --scheduled
+```
+
+默认配置使用运行机器的当地时间，每天从 `08:00` 到次日 `00:00` 每 4 小时执行一次，即 `08:00、12:00、16:00、20:00、00:00`。可在配置文件中修改：
+
+```jsonc
+"schedule": {
+  "every": "4h",
+  "start_time": "08:00",
+  "end_time": "00:00"
+}
+```
+
+`every` 由正整数和单位组成，支持分钟 `m`、小时 `h` 和天 `d`，配置的每日规则最长为 `1d`。结束时间早于或等于开始时间时按跨越午夜处理；只有按间隔恰好落在结束时间上的任务才会在该时刻执行。若需要不受每日时间范围限制、并在启动后立即执行，可继续使用 `--every 4h`。
+
+同一进程最多同时执行一轮。某轮执行时间超过间隔时不会并发启动下一轮；程序停止期间错过的任务不会在重启后回放。服务部署时直接以前台方式运行该命令，由 Docker、systemd 等运行环境负责进程保活。
+
+### Docker 后台运行
+
+仓库根目录的 `compose.yaml` 会同时启动 AgentScroll 和必需的 NewsNow。AgentScroll 只连接 Compose 内的 `http://newsnow:4444`，并等待 NewsNow 健康检查通过后才启动；NewsNow 数据保存在 `newsnow_data` volume，热榜快照、知识卡和分享队列仍写入仓库的 `outputs/`。
+
+首次启动前准备本地配置：
+
+```bash
+cp settings.example.jsonc settings.jsonc
+cp .env.example .env
+mkdir -p outputs
+```
+
+在 `settings.jsonc` 中填写实际模型名，在 `.env` 中填写 `AGENTSCROLL_LLM_API_KEY`。Docker 部署使用 API 推理后端，不在容器内提供本机 Codex CLI。然后启动服务：
+
+```bash
+docker compose up -d --build
+```
+
+默认按 `settings.jsonc` 的 `schedule` 定时学习“综合”组；类别可通过 `.env` 的 `AGENTSCROLL_HOTLIST_GROUPS` 修改。容器时区由 `.env` 的 `TZ` 指定，示例默认为 `Asia/Shanghai`。NewsNow 默认固定到 `v0.0.41`；升级前先核对上游变更，再修改 `NEWSNOW_VERSION`。
+
+查看状态和日志：
+
+```bash
+docker compose ps
+docker compose logs -f agentscroll
+docker compose logs -f newsnow
+```
+
+停止服务但保留 NewsNow 数据和本地输出：
+
+```bash
+docker compose down
+```
+
 已有热榜快照需要重新学习时，直接使用 `learn`：
 
 ```bash
@@ -218,17 +272,19 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
   --share-output-dir outputs/shares
 ```
 
-两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。
+两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。同一话题存在其他平台标题时以非知乎标题为代表并直接采集；只有整组标题都来自知乎时，才批量生成微博和 Bilibili 检索词。知识卡证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子。
 
 常用参数与产物：
 
-- 一次最多处理 20 个话题。
+- 第一轮最多选择 15 个话题。
+- 第一轮实际发送给模型的标题会追加到热榜快照所在目录的 `hotlist_title_cache.txt`；后续筛选会按 Unicode 兼容字符、大小写和连续空白规范化后跳过命中标题。没有新标题时不调用筛选模型。
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享目录。
-- 一次运行保存一份批次 JSON、一份批次 TXT 和一份最终分享队列。
+- 一次运行先保存一份标题筛选 JSON，再保存一份批次 JSON、一份批次 TXT 和一份最终分享队列。标题筛选文件中的 `items` 仅保留代表标题 `title`、代表平台 `source`、类别 `label` 和同话题标题 `related_titles`，并记录输入标题数、缓存命中数、实际发送数、缓存文件、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
 - 批次 JSON 记录全部话题的 `complete`、`needs_research`、`rejected` 状态；`rejected` 话题通过 `rejection_reason` 保留淘汰原因，但没有知识内容，也不会进入分享队列。
-- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、耗时、实际 Token 使用量、公共搜索请求数和原生 Web Search 次数。
+- 每张卡片用顶层 `share_score` 记录 0 至 10 的分享评分；低于 7 分时 `share` 为 `null`，达到 7 分时 `share` 才包含分享文字、来源和评论选择。
+- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因、公共搜索请求数和原生 Web Search 次数。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。
 
@@ -306,6 +362,22 @@ AGENTSCROLL_LIVE_BROWSER_SOURCES=xiaohongshu,bilibili,douyin \
 - `AGENTSCROLL_LIVE_DEPTH=quick|default|deep`：搜索规模与 `--depth` 相同，默认 `default`。
 - `AGENTSCROLL_LIVE_DAYS=30`：搜索时间范围。
 - `AGENTSCROLL_ALLOW_DETAIL_BROWSER=1`：允许正文详情使用浏览器；严格 live 测试会设置该变量。
+- `AGENTSCROLL_LIVE_HOTLIST_STAGE=first-pass|cards|full`：热榜测试阶段，默认 `first-pass`。`cards` 读取已有标题筛选结果，跳过标题筛选模型，直接采集材料并生成知识卡。
+- `AGENTSCROLL_LIVE_HOTLIST_SELECTION_FILE=<path>`：`cards` 阶段使用的 `hotlist_first_pass_newsnow.json`；未设置时使用最近一次产物。
+- `AGENTSCROLL_LIVE_HOTLIST_SNAPSHOT_FILE=<path>`：`cards` 阶段使用的原始 NewsNow 快照；未设置时重新拉取当前快照，并按标题匹配筛选结果。
+- `AGENTSCROLL_LIVE_HOTLIST_GROUPS=综合`：热榜测试使用的 NewsNow 分组。
+
+跳过标题筛选，使用已有结果生成知识卡：
+
+```bash
+AGENTSCROLL_RUN_LIVE_TESTS=1 \
+AGENTSCROLL_LIVE_HOTLIST_STAGE=cards \
+AGENTSCROLL_LIVE_HOTLIST_SELECTION_FILE=/path/to/hotlist_first_pass_newsnow.json \
+AGENTSCROLL_LIVE_HOTLIST_SNAPSHOT_FILE=/path/to/newsnow_snapshot.json \
+.venv/bin/python -m pytest \
+  -k test_live_hotlist_learning_by_stage \
+  -v
+```
 
 每次真实测试保存到 `outputs/test_artifacts/live_collectors/<timestamp>/`：
 

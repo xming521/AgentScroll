@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,8 @@ from agentscroll.prompts.hotlist import HOTLIST_FIRST_PASS_PROMPT
 
 _FIRST_PASS_LABELS = {"news", "fun"}
 _FIRST_PASS_MAX_TOPICS = 15
+_TITLE_CACHE_FILENAME = "hotlist_title_cache.txt"
+_title_cache_lock = threading.Lock()
 
 _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -47,6 +51,57 @@ def _first_pass_prompt(candidates: list[dict[str, Any]]) -> str:
     )
 
 
+def _title_cache_path(hotlist: Mapping[str, Any] | str | Path) -> Path:
+    snapshot_file: str | Path | None = None
+    if isinstance(hotlist, (str, Path)):
+        snapshot_file = hotlist
+    elif isinstance(hotlist.get("snapshot_file"), (str, Path)):
+        snapshot_file = hotlist["snapshot_file"]
+    if snapshot_file:
+        return Path(snapshot_file).expanduser().resolve().parent / _TITLE_CACHE_FILENAME
+    return (Path.cwd() / "outputs" / "hotlists" / _TITLE_CACHE_FILENAME).resolve()
+
+
+def _cached_title_keys(path: Path) -> set[str]:
+    from agentscroll.collector.newsnow import _title_dedupe_key
+
+    if not path.is_file():
+        return set()
+    return {
+        _title_dedupe_key(title)
+        for title in path.read_text(encoding="utf-8").splitlines()
+        if title.strip()
+    }
+
+
+def _cache_titles(path: Path, titles: list[str]) -> None:
+    from agentscroll.collector.newsnow import _title_dedupe_key
+
+    normalized_titles = [" ".join(title.split()) for title in titles if title.strip()]
+    with _title_cache_lock:
+        existing_titles = (
+            [
+                title
+                for title in path.read_text(encoding="utf-8").splitlines()
+                if title.strip()
+            ]
+            if path.is_file()
+            else []
+        )
+        cached_keys = {_title_dedupe_key(title) for title in existing_titles}
+        for title in normalized_titles:
+            key = _title_dedupe_key(title)
+            if key in cached_keys:
+                continue
+            cached_keys.add(key)
+            existing_titles.append(title)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f"{path.suffix}.tmp")
+        temporary.write_text("\n".join(existing_titles) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+
 def select_hotlist_first_pass(
     hotlist: Mapping[str, Any] | str | Path,
     *,
@@ -54,6 +109,7 @@ def select_hotlist_first_pass(
 ) -> dict[str, Any]:
     """Select topic-level candidates without opening URLs or collecting details."""
     from agentscroll.collector.hotlist import list_hotlist_entries
+    from agentscroll.collector.newsnow import _title_dedupe_key
     from agentscroll.inference_config import (
         build_configured_client,
         load_inference_settings,
@@ -61,14 +117,34 @@ def select_hotlist_first_pass(
     )
 
     entries = list_hotlist_entries(hotlist)
+    cache_path = _title_cache_path(hotlist)
+    cached_title_keys = _cached_title_keys(cache_path)
     candidates: list[dict[str, Any]] = []
     for index, item in enumerate(entries, start=1):
+        title = str(item.get("title") or "")
+        if _title_dedupe_key(title) in cached_title_keys:
+            continue
         candidate: dict[str, Any] = {
             "id": index,
             "source": str(item.get("source_id") or ""),
-            "title": str(item.get("title") or ""),
+            "title": title,
         }
         candidates.append(candidate)
+
+    cached_count = len(entries) - len(candidates)
+    if not candidates:
+        return {
+            "input_count": len(entries),
+            "cached_count": cached_count,
+            "candidate_count": 0,
+            "topic_count": 0,
+            "topics": [],
+            "cache_file": str(cache_path),
+            "inference": {
+                "skipped": True,
+                "reason": "no_new_titles",
+            },
+        }
 
     settings = load_inference_settings(config_path)
     request = make_configured_request(
@@ -83,6 +159,8 @@ def select_hotlist_first_pass(
     finally:
         client.close()
 
+    _cache_titles(cache_path, [candidate["title"] for candidate in candidates])
+
     if not response.ok:
         raise RuntimeError(f"热榜第一轮粗筛失败：{response.error or 'unknown error'}")
     if not isinstance(response.parsed_json, dict):
@@ -92,6 +170,7 @@ def select_hotlist_first_pass(
         raise ValueError("模型返回值缺少 topics 数组")
     raw_topics = raw_topics[:_FIRST_PASS_MAX_TOPICS]
 
+    candidate_ids = {candidate["id"] for candidate in candidates}
     selected_ids: set[int] = set()
     topics: list[dict[str, Any]] = []
     for raw_topic in raw_topics:
@@ -103,15 +182,13 @@ def select_hotlist_first_pass(
         if (
             isinstance(representative_id, bool)
             or not isinstance(representative_id, int)
-            or representative_id < 1
-            or representative_id > len(entries)
+            or representative_id not in candidate_ids
         ):
             raise ValueError(f"模型返回了不存在的代表 ID：{representative_id!r}")
         if not isinstance(related_ids, list) or any(
             isinstance(value, bool)
             or not isinstance(value, int)
-            or value < 1
-            or value > len(entries)
+            or value not in candidate_ids
             for value in related_ids
         ):
             raise ValueError(f"模型返回了无效的 related_ids：{related_ids!r}")
@@ -122,6 +199,23 @@ def select_hotlist_first_pass(
             raise ValueError(f"模型重复使用了热榜 ID：{topic_ids!r}")
         if not isinstance(label, str) or label not in _FIRST_PASS_LABELS:
             raise ValueError(f"模型返回了无效的 label：{label!r}")
+
+        if entries[representative_id - 1]["source_id"] == "zhihu":
+            non_zhihu_representative = next(
+                (
+                    entry_id
+                    for entry_id in related_ids
+                    if entries[entry_id - 1]["source_id"] != "zhihu"
+                ),
+                None,
+            )
+            if non_zhihu_representative is not None:
+                representative_id = non_zhihu_representative
+                related_ids = [
+                    entry_id
+                    for entry_id in topic_ids
+                    if entry_id != representative_id
+                ]
 
         selected_ids.update(topic_ids)
         topics.append(
@@ -136,14 +230,77 @@ def select_hotlist_first_pass(
 
     return {
         "input_count": len(entries),
+        "cached_count": cached_count,
+        "candidate_count": len(candidates),
         "topic_count": len(topics),
         "topics": topics,
+        "cache_file": str(cache_path),
         "inference": {
             "provider": response.provider,
             "model": response.model,
             "elapsed_s": response.elapsed_s,
         },
     }
+
+
+def _save_first_pass_selection(
+    hotlist: Mapping[str, Any] | str | Path,
+    selection: Mapping[str, Any],
+    *,
+    output_dir: str | Path | None,
+) -> Path:
+    destination = (
+        Path(output_dir).expanduser().resolve()
+        if output_dir is not None
+        else (Path.cwd() / "outputs" / "knowledge").resolve()
+    )
+    generated_at = datetime.now().astimezone()
+    timestamp = generated_at.strftime("%Y%m%d-%H%M%S-%f%z")
+    raw_topics = selection.get("topics") or []
+    items = []
+    for topic in raw_topics:
+        if not isinstance(topic, Mapping):
+            continue
+        representative = topic.get("representative")
+        related = topic.get("related") or []
+        if not isinstance(representative, Mapping):
+            continue
+        items.append(
+            {
+                "title": str(representative.get("title") or ""),
+                "source": str(representative.get("source_id") or ""),
+                "label": str(topic.get("label") or ""),
+                "related_titles": [
+                    str(item.get("title") or "")
+                    for item in related
+                    if isinstance(item, Mapping)
+                ],
+            }
+        )
+
+    snapshot_file = None
+    if isinstance(hotlist, (str, Path)):
+        snapshot_file = str(Path(hotlist).expanduser().resolve())
+    document = {
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "snapshot_file": snapshot_file,
+        "input_count": selection.get("input_count"),
+        "cached_count": selection.get("cached_count"),
+        "candidate_count": selection.get("candidate_count"),
+        "topic_count": len(items),
+        "cache_file": selection.get("cache_file"),
+        "inference": dict(selection.get("inference") or {}),
+        "items": items,
+    }
+    path = destination / f"{timestamp}_热榜标题筛选结果.json"
+    temporary = path.with_suffix(".json.tmp")
+    destination.mkdir(parents=True, exist_ok=True)
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return path
 
 
 def learn_hotlist_snapshot(
@@ -162,7 +319,12 @@ def learn_hotlist_snapshot(
     from .knowledge_card import generate_selected_hotlist_knowledge_cards
 
     selection = select_hotlist_first_pass(hotlist, config_path=config_path)
-    return generate_selected_hotlist_knowledge_cards(
+    selection_file = _save_first_pass_selection(
+        hotlist,
+        selection,
+        output_dir=output_dir,
+    )
+    result = generate_selected_hotlist_knowledge_cards(
         hotlist,
         selection,
         config_path=config_path,
@@ -174,6 +336,8 @@ def learn_hotlist_snapshot(
         generation_effort=generation_effort,
         supplement_effort=supplement_effort,
     )
+    result["selection_file"] = str(selection_file)
+    return result
 
 
 def fetch_and_learn_hotlists(

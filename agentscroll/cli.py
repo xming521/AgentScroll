@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -10,6 +11,8 @@ from typing import Any, TypeVar
 import click
 
 _Result = TypeVar("_Result")
+_INTERVAL_PATTERN = re.compile(r"^([1-9]\d*)([mhd])$", re.IGNORECASE)
+_INTERVAL_MULTIPLIERS = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60}
 _PATH = click.Path(file_okay=False, path_type=Path)
 _INPUT_FILE = click.Path(
     exists=True,
@@ -34,6 +37,27 @@ def _comma_separated(value: str | None) -> tuple[str, ...] | None:
     if value is None:
         return None
     return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _interval_seconds(
+    _context: click.Context,
+    _parameter: click.Parameter,
+    value: str | None,
+) -> int | None:
+    if value is None:
+        return None
+    try:
+        return _parse_interval_seconds(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
+def _parse_interval_seconds(value: str) -> int:
+    match = _INTERVAL_PATTERN.fullmatch(value.strip())
+    if match is None:
+        raise ValueError("使用正整数加 m、h 或 d，例如 30m、4h、1d")
+    amount, unit = match.groups()
+    return int(amount) * _INTERVAL_MULTIPLIERS[unit.lower()]
 
 
 def _config_path(context: click.Context) -> Path | None:
@@ -161,6 +185,7 @@ def hotlist_fetch(
     type=click.IntRange(min=1),
     default=3,
     show_default=True,
+    help="每个话题期望保留的可读采集入口数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
 @click.option("--share-output-dir", type=_PATH, help="分享队列目录。")
@@ -216,12 +241,24 @@ def hotlist_learn(
     type=click.IntRange(min=1),
     default=3,
     show_default=True,
+    help="每个话题期望保留的可读采集入口数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
 @click.option("--share-output-dir", type=_PATH, help="分享队列目录。")
 @click.option("--no-supplement", is_flag=True, help="关闭失败话题的自动补搜。")
 @click.option("--generation-effort", default="xhigh", show_default=True)
 @click.option("--supplement-effort", default="xhigh", show_default=True)
+@click.option(
+    "--every",
+    metavar="INTERVAL",
+    callback=_interval_seconds,
+    help="按间隔持续运行，例如 30m、4h、1d；不设置时只运行一次。",
+)
+@click.option(
+    "--scheduled",
+    is_flag=True,
+    help="按 settings.jsonc 的 schedule 规则定时运行。",
+)
 @click.pass_context
 def hotlist_run(
     context: click.Context,
@@ -238,12 +275,14 @@ def hotlist_run(
     no_supplement: bool,
     generation_effort: str,
     supplement_effort: str,
+    every: int | None,
+    scheduled: bool,
 ) -> None:
-    """拉取最新热榜并完成知识卡与分享生成。"""
+    """拉取最新热榜并完成知识卡与分享生成，可按间隔持续运行。"""
     from agentscroll.workflows import fetch_and_learn_hotlists
 
-    result = _run(
-        lambda: fetch_and_learn_hotlists(
+    def run_once() -> dict[str, Any]:
+        return fetch_and_learn_hotlists(
             _comma_separated(groups) or (),
             base_url=base_url,
             latest=latest,
@@ -259,8 +298,40 @@ def hotlist_run(
             generation_effort=generation_effort,
             supplement_effort=supplement_effort,
         )
+
+    if scheduled and every is not None:
+        raise click.UsageError("--scheduled 和 --every 不能同时使用")
+
+    if not scheduled and every is None:
+        _print_json(_run(run_once))
+        return
+
+    from agentscroll.scheduler import run_at_interval
+
+    def scheduled_run() -> None:
+        _print_json(run_once())
+
+    if every is not None:
+        _run(lambda: run_at_interval(scheduled_run, interval_seconds=every))
+        return
+
+    from agentscroll.inference_config import load_inference_settings
+
+    schedule = _run(lambda: load_inference_settings(_config_path(context)).schedule)
+    interval_seconds = _run(lambda: _parse_interval_seconds(schedule.every))
+    click.echo(
+        f"定时运行：本地时间 {schedule.start_time} 至 {schedule.end_time}，"
+        f"间隔 {schedule.every}",
+        err=True,
     )
-    _print_json(result)
+    _run(
+        lambda: run_at_interval(
+            scheduled_run,
+            interval_seconds=interval_seconds,
+            start_time=schedule.start_time,
+            end_time=schedule.end_time,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,55 @@
+services:
+  newsnow:
+    image: ghcr.io/ourongxing/newsnow:${NEWSNOW_VERSION:-v0.0.41}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${NEWSNOW_PORT:-4444}:4444"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4444
+      NODE_ENV: production
+      INIT_TABLE: "true"
+      ENABLE_CACHE: "true"
+      PRODUCTHUNT_API_TOKEN: ${PRODUCTHUNT_API_TOKEN:-}
+    volumes:
+      - newsnow_data:/usr/app/.data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4444/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  agentscroll:
+    build:
+      context: .
+    init: true
+    restart: unless-stopped
+    depends_on:
+      newsnow:
+        condition: service_healthy
+    environment:
+      AGENTSCROLL_LLM_API_KEY: ${AGENTSCROLL_LLM_API_KEY:?请先在 .env 中设置 AGENTSCROLL_LLM_API_KEY}
+      AGENTSCROLL_NEWSNOW_BASE_URL: http://newsnow:4444
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./settings.jsonc:/config/settings.jsonc:ro
+      - ./outputs:/app/outputs
+    command:
+      - --config-path
+      - /config/settings.jsonc
+      - hotlist
+      - run
+      - --groups
+      - ${AGENTSCROLL_HOTLIST_GROUPS:-综合}
+      - --latest
+      - --scheduled
+      - --snapshot-output-dir
+      - /app/outputs/hotlists
+      - --output-dir
+      - /app/outputs/knowledge
+      - --share-output-dir
+      - /app/outputs/shares
+
+volumes:
+  newsnow_data:

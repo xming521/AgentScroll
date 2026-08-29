@@ -24,6 +24,8 @@ def search_bilibili(
     from_date: str,
     to_date: str,
     depth: str = "default",
+    *,
+    require_known_date: bool = False,
 ) -> List[Dict[str, Any]]:
     """搜索B站视频。
 
@@ -67,21 +69,37 @@ def search_bilibili(
     if not items:
         items = _search_via_site_search(topic, limit)
 
-    items = items[:limit]
+    items = _rank_items(topic, items[:limit])
     live_artifacts.save_stage("bilibili", "01_search", topic, items)
+    items = _retain_relevant(items)
     _enrich_video_contents(items, opener)
-    live_artifacts.save_stage("bilibili", "02_content", topic, items)
-    _enrich_video_comments(items, opener)
-    live_artifacts.save_stage("bilibili", "03_comments", topic, items)
     items = page_content.retain_readable_details(
         items,
         allowed_sources={"bilibili-view-api"},
     )
+    items = _rank_items(topic, items)
+    live_artifacts.save_stage("bilibili", "02_content", topic, items)
+    items = _retain_relevant(items)
+    items = _retain_date_range(
+        items,
+        from_date=from_date,
+        to_date=to_date,
+        require_known_date=require_known_date,
+    )
+    _enrich_video_comments(items, opener)
+    live_artifacts.save_stage("bilibili", "03_comments", topic, items)
+    return items[:limit]
 
+
+def _rank_items(topic: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     scored = []
     for i, item in enumerate(items):
         title = _clean_html(item.get("title", ""))
-        rel = relevance.token_overlap_relevance(topic, title)
+        text = " ".join(
+            str(value or "")
+            for value in (title, item.get("description"), item.get("content"))
+        )
+        rel = relevance.token_overlap_relevance(topic, text)
         item["id"] = f"BL{i+1}"
         item["title"] = title
         item["relevance"] = rel
@@ -89,13 +107,24 @@ def search_bilibili(
         scored.append(item)
 
     scored.sort(key=lambda x: x.get("relevance", 0), reverse=True)
-    return scored[:limit]
+    return scored
+
+
+def _retain_relevant(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        item
+        for item in items
+        if item.get("relevance", 0) >= relevance.MIN_POST_RELEVANCE
+    ]
 
 
 def collect_hot_topic_posts(
     topics: Iterable[str],
     *,
     posts_per_topic: int = 1,
+    from_date: str = "",
+    to_date: str = "",
+    require_known_date: bool = False,
 ) -> List[Dict[str, Any]]:
     """Resolve selected Bilibili hot-search titles to videos and comments."""
     if posts_per_topic <= 0:
@@ -104,7 +133,13 @@ def collect_hot_topic_posts(
     for value in topics:
         topic = str(value).strip()
         try:
-            posts = search_bilibili(topic, "", "", depth="quick")
+            posts = search_bilibili(
+                topic,
+                from_date,
+                to_date,
+                depth="quick",
+                require_known_date=require_known_date,
+            )
             search_count = len(posts)
             posts = posts[:posts_per_topic]
             results.append({
@@ -125,6 +160,31 @@ def collect_hot_topic_posts(
                 "error": f"{type(exc).__name__}: {exc}",
             })
     return results
+
+
+def _retain_date_range(
+    items: List[Dict[str, Any]],
+    *,
+    from_date: str,
+    to_date: str,
+    require_known_date: bool,
+) -> List[Dict[str, Any]]:
+    if not from_date and not to_date:
+        return items
+    start = dates.parse_date(from_date)
+    end = dates.parse_date(to_date)
+    if start is None or end is None:
+        raise ValueError(f"无效的 B站日期范围：{from_date!r} 至 {to_date!r}")
+    retained = []
+    for item in items:
+        published_at = dates.parse_date(str(item.get("date") or ""))
+        if published_at is None:
+            if not require_known_date:
+                retained.append(item)
+            continue
+        if start.date() <= published_at.date() <= end.date():
+            retained.append(item)
+    return retained
 
 
 def _search_via_site_search(topic: str, limit: int) -> List[Dict[str, Any]]:

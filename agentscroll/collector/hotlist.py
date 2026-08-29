@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .knowledge_store import build_knowledge_document
 from .newsnow import _title_dedupe_key
-from .sources import bilibili, hupu, tieba, zhihu
+from .sources import bilibili, dates, hupu, tieba
 from .sources.weibo import collect_hot_topic_posts
+
+_RECENT_POST_DAYS = 7
+_QUERY_SEARCH_SOURCES = ("weibo", "bilibili-hot-search")
 
 
 def _load_hotlist(
@@ -97,20 +102,31 @@ def _collect_hotlist_details(
     matched: list[tuple[str, Mapping[str, Any]]],
     *,
     posts_per_topic: int,
+    from_date: str,
+    to_date: str,
 ) -> tuple[list[dict[str, Any] | None], list[str]]:
-    """Collect details for normalized hot-list entries in input order."""
+    """Collect platform groups concurrently and preserve input order."""
     details: list[dict[str, Any] | None] = [None] * len(matched)
     grouped: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
     for index, (source_id, item) in enumerate(matched):
         grouped.setdefault(source_id, []).append((index, item))
 
     unsupported_sources: list[str] = []
-    for source_id, indexed_items in grouped.items():
+    if not grouped:
+        return details, unsupported_sources
+
+    def collect_source(
+        source_id: str,
+        indexed_items: list[tuple[int, Mapping[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], bool]:
         source_items = [item for _, item in indexed_items]
         if source_id == "weibo":
             source_details = collect_hot_topic_posts(
                 [str(item.get("title") or "") for item in source_items],
                 posts_per_topic=posts_per_topic,
+                from_date=from_date,
+                to_date=to_date,
+                require_known_date=True,
             )
         elif source_id == "hupu":
             source_details = hupu.collect_hotlist_threads(source_items)
@@ -119,15 +135,15 @@ def _collect_hotlist_details(
                 source_items,
                 posts_per_topic=posts_per_topic,
             )
-        elif source_id == "zhihu":
-            source_details = zhihu.collect_hotlist_threads(source_items)
         elif source_id == "bilibili-hot-search":
             source_details = bilibili.collect_hot_topic_posts(
                 [str(item.get("title") or "") for item in source_items],
                 posts_per_topic=posts_per_topic,
+                from_date=from_date,
+                to_date=to_date,
+                require_known_date=True,
             )
         else:
-            unsupported_sources.append(source_id)
             source_details = [
                 {
                     "query": str(item.get("title") or ""),
@@ -138,16 +154,46 @@ def _collect_hotlist_details(
                 }
                 for item in source_items
             ]
-        for (index, _), detail in zip(indexed_items, source_details):
-            details[index] = detail
+            return source_details, False
+        return source_details, True
+
+    with ThreadPoolExecutor(max_workers=min(len(grouped), 5)) as executor:
+        futures = {
+            executor.submit(collect_source, source_id, indexed_items): (
+                source_id,
+                indexed_items,
+            )
+            for source_id, indexed_items in grouped.items()
+        }
+        for future in as_completed(futures):
+            source_id, indexed_items = futures[future]
+            source_details, supported = future.result()
+            if not supported:
+                unsupported_sources.append(source_id)
+            for (index, _), detail in zip(indexed_items, source_details):
+                details[index] = detail
     return details, sorted(set(unsupported_sources))
 
 
-def _topic_entry_ids(
+def _platform_diverse_entry_ids(
+    candidate_ids: list[int],
+    entries: list[dict[str, Any]],
+) -> list[int]:
+    picked: list[int] = []
+    seen_sources: set[str] = set()
+    for entry_id in candidate_ids:
+        source_id = entries[entry_id - 1]["source_id"]
+        if source_id in seen_sources:
+            continue
+        picked.append(entry_id)
+        seen_sources.add(source_id)
+    picked.extend(entry_id for entry_id in candidate_ids if entry_id not in picked)
+    return picked
+
+
+def _topic_entry_candidates(
     topic: Mapping[str, Any],
     entries: list[dict[str, Any]],
-    *,
-    max_entries: int,
 ) -> list[int]:
     representative_id = topic.get("representative_id")
     related_ids = topic.get("related_ids")
@@ -167,28 +213,130 @@ def _topic_entry_ids(
     ):
         raise ValueError(f"无效的 related_ids：{related_ids!r}")
 
-    candidates = list(dict.fromkeys([representative_id, *related_ids]))
-    picked = [representative_id]
-    seen_sources = {entries[representative_id - 1]["source_id"]}
+    candidates = [
+        entry_id
+        for entry_id in dict.fromkeys([representative_id, *related_ids])
+        if entries[entry_id - 1]["source_id"] != "zhihu"
+    ]
+    return _platform_diverse_entry_ids(candidates, entries)
 
-    # Prefer a different platform before taking another wording from the same
-    # platform. This retains cross-platform context without hard-coding the
-    # current snapshot's titles or sources.
-    for entry_id in candidates[1:]:
-        source_id = entries[entry_id - 1]["source_id"]
-        if source_id in seen_sources:
+
+def _snapshot_date_range(payload: Mapping[str, Any]) -> tuple[str, str]:
+    collected_at = dates.parse_date(str(payload.get("collected_at") or ""))
+    end_date = (
+        collected_at.date() if collected_at is not None else datetime.now(dates.CST).date()
+    )
+    start_date = end_date - timedelta(days=_RECENT_POST_DAYS - 1)
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _post_dedupe_key(post: Mapping[str, Any]) -> str:
+    for field in ("url", "content_url"):
+        value = str(post.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _filter_recent_unique_detail(
+    detail: Mapping[str, Any] | None,
+    *,
+    from_date: str,
+    to_date: str,
+    seen_post_keys: set[str],
+) -> Mapping[str, Any] | None:
+    if not isinstance(detail, Mapping):
+        return None
+    filtered = dict(detail)
+    raw_posts = detail.get("posts")
+    if not isinstance(raw_posts, list):
+        return filtered
+
+    start = dates.parse_date(from_date)
+    end = dates.parse_date(to_date)
+    if start is None or end is None:
+        raise ValueError(f"无效的帖子日期范围：{from_date!r} 至 {to_date!r}")
+    retained: list[dict[str, Any]] = []
+    for raw_post in raw_posts:
+        if not isinstance(raw_post, Mapping):
             continue
-        picked.append(entry_id)
-        seen_sources.add(source_id)
-        if len(picked) >= max_entries:
-            return picked
-    for entry_id in candidates[1:]:
-        if entry_id in picked:
+        published_at = dates.parse_date(str(raw_post.get("date") or ""))
+        if (
+            published_at is None
+            or published_at.date() < start.date()
+            or published_at.date() > end.date()
+        ):
             continue
-        picked.append(entry_id)
-        if len(picked) >= max_entries:
-            break
-    return picked
+        key = _post_dedupe_key(raw_post)
+        if key and key in seen_post_keys:
+            continue
+        if key:
+            seen_post_keys.add(key)
+        retained.append(dict(raw_post))
+
+    filtered["posts"] = retained
+    filtered["post_count"] = len(retained)
+    if retained:
+        filtered["status"] = "readable"
+    elif raw_posts:
+        filtered["status"] = "filtered"
+        filtered["error"] = (
+            f"没有发布时间可确认且位于 {from_date} 至 {to_date} 的帖子"
+        )
+    return filtered
+
+
+def _topic_search_queries(
+    topic: Mapping[str, Any],
+    entries: list[dict[str, Any]],
+) -> list[str]:
+    entry_ids = [topic.get("representative_id"), *(topic.get("related_ids") or [])]
+    only_zhihu = all(
+        isinstance(entry_id, int)
+        and not isinstance(entry_id, bool)
+        and 1 <= entry_id <= len(entries)
+        and entries[entry_id - 1]["source_id"] == "zhihu"
+        for entry_id in entry_ids
+    )
+    if not only_zhihu:
+        queries: list[str] = []
+        for entry_id in entry_ids:
+            if (
+                isinstance(entry_id, int)
+                and not isinstance(entry_id, bool)
+                and 1 <= entry_id <= len(entries)
+                and entries[entry_id - 1]["source_id"] != "zhihu"
+            ):
+                query = " ".join(str(entries[entry_id - 1].get("title") or "").split())
+                if query and query not in queries:
+                    queries.append(query)
+        return queries
+    raw_queries = topic.get("search_queries")
+    if not isinstance(raw_queries, list):
+        raise ValueError("仅含知乎线索的话题缺少 LLM 生成的 search_queries")
+    queries: list[str] = []
+    for value in raw_queries:
+        query = " ".join(str(value).split())
+        if query and query not in queries:
+            queries.append(query)
+    if not 2 <= len(queries) <= 3:
+        raise ValueError("仅含知乎线索的话题必须提供 2 至 3 个不同检索词")
+    return queries
+
+
+def _detail_is_readable(
+    source_id: str,
+    item: Mapping[str, Any],
+    detail: Mapping[str, Any] | None,
+) -> bool:
+    source_results = _knowledge_sources(
+        [(source_id, item)],
+        [dict(detail) if isinstance(detail, Mapping) else None],
+    )
+    compact = build_knowledge_document(
+        {"topic": item.get("title"), "sources": source_results}
+    )
+    return bool(compact["items"])
 
 
 def collect_selected_hotlist_evidence(
@@ -198,12 +346,12 @@ def collect_selected_hotlist_evidence(
     posts_per_entry: int = 1,
     max_entries_per_topic: int = 3,
 ) -> dict[str, Any]:
-    """Collect compact model-facing evidence for first-pass selected topics.
+    """Collect compact evidence and diagnostics for first-pass selected topics.
 
-    Every topic keeps its representative entry. Related entries are selected
-    with platform diversity first, then original order, up to the configured
-    cap. Collector failures remain in ``attempts`` so the card model can decide
-    whether the remaining evidence is sufficient.
+    The representative entry names the topic but does not have to be collected
+    first. The configured cap is the target number of readable entries; failed
+    candidates are replaced from the remaining related entries when possible.
+    Collector failures remain in ``attempts`` for saved diagnostics.
     """
     if posts_per_entry <= 0:
         raise ValueError("posts_per_entry 必须大于 0")
@@ -223,65 +371,161 @@ def collect_selected_hotlist_evidence(
     if not raw_topics:
         raise ValueError("selection 中没有 news 或 fun 话题")
 
-    entries = list_hotlist_entries(hotlist)
-    selected_ids: list[list[int]] = []
-    flat_entries: list[tuple[str, Mapping[str, Any]]] = []
+    hotlist_payload = _load_hotlist(hotlist)
+    entries = list_hotlist_entries(hotlist_payload)
+    from_date, to_date = _snapshot_date_range(hotlist_payload)
+    candidate_specs: list[
+        list[tuple[int | None, str, Mapping[str, Any]]]
+    ] = []
     for raw_topic in raw_topics:
-        entry_ids = _topic_entry_ids(
-            raw_topic,
-            entries,
-            max_entries=max_entries_per_topic,
-        )
-        selected_ids.append(entry_ids)
-        flat_entries.extend(
-            (str(entries[entry_id - 1]["source_id"]), entries[entry_id - 1])
-            for entry_id in entry_ids
-        )
+        topic_candidates = [
+            (
+                entry_id,
+                str(entries[entry_id - 1]["source_id"]),
+                entries[entry_id - 1],
+            )
+            for entry_id in _topic_entry_candidates(raw_topic, entries)
+        ]
+        direct_query_keys = {
+            (source_id, _title_dedupe_key(str(item.get("title") or "")))
+            for _, source_id, item in topic_candidates
+        }
+        for query in _topic_search_queries(raw_topic, entries):
+            topic_candidates.extend(
+                (None, source_id, {"title": query, "generated_search": True})
+                for source_id in _QUERY_SEARCH_SOURCES
+                if (source_id, _title_dedupe_key(query)) not in direct_query_keys
+            )
+        candidate_specs.append(topic_candidates)
 
-    flat_details, unsupported_sources = _collect_hotlist_details(
-        flat_entries,
-        posts_per_topic=posts_per_entry,
-    )
+    attempted: list[
+        list[
+            tuple[
+                int | None,
+                str,
+                Mapping[str, Any],
+                Mapping[str, Any] | None,
+                bool,
+            ]
+        ]
+    ] = [[] for _ in raw_topics]
+    unsupported_sources: set[str] = set()
+    next_candidate = [0 for _ in raw_topics]
+    readable_counts = [0 for _ in raw_topics]
+    seen_post_keys = [set() for _ in raw_topics]
+
+    while True:
+        batch_candidates: list[
+            list[tuple[int | None, str, Mapping[str, Any]]]
+        ] = []
+        flat_entries: list[tuple[str, Mapping[str, Any]]] = []
+        for topic_index, topic_candidates in enumerate(candidate_specs):
+            missing = max_entries_per_topic - readable_counts[topic_index]
+            start = next_candidate[topic_index]
+            selected = topic_candidates[start : start + missing]
+            next_candidate[topic_index] += len(selected)
+            batch_candidates.append(selected)
+            flat_entries.extend((source_id, item) for _, source_id, item in selected)
+        if not flat_entries:
+            break
+
+        flat_details, batch_unsupported = _collect_hotlist_details(
+            flat_entries,
+            posts_per_topic=posts_per_entry,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        unsupported_sources.update(batch_unsupported)
+        offset = 0
+        for topic_index, selected_candidates in enumerate(batch_candidates):
+            for entry_id, source_id, item in selected_candidates:
+                raw_detail = flat_details[offset]
+                offset += 1
+                detail = _filter_recent_unique_detail(
+                    raw_detail if isinstance(raw_detail, Mapping) else None,
+                    from_date=from_date,
+                    to_date=to_date,
+                    seen_post_keys=seen_post_keys[topic_index],
+                )
+                readable = _detail_is_readable(source_id, item, detail)
+                attempted[topic_index].append(
+                    (entry_id, source_id, item, detail, readable)
+                )
+                if readable:
+                    readable_counts[topic_index] += 1
+
     topics: list[dict[str, Any]] = []
-    offset = 0
-    for raw_topic, entry_ids in zip(raw_topics, selected_ids):
-        count = len(entry_ids)
-        matched = flat_entries[offset : offset + count]
-        details = flat_details[offset : offset + count]
-        offset += count
-        representative_id = entry_ids[0]
+    for raw_topic, topic_attempts in zip(raw_topics, attempted):
+        representative_id = int(raw_topic["representative_id"])
         representative = entries[representative_id - 1]
+        retained = [attempt for attempt in topic_attempts if attempt[4]][
+            :max_entries_per_topic
+        ]
+        matched = [(attempt[1], attempt[2]) for attempt in retained]
+        details = [attempt[3] for attempt in retained]
         source_results = _knowledge_sources(matched, details)
         compact = build_knowledge_document(
             {
-                "topic": representative["title"],
+                "topic": "",
+                "from_date": from_date,
+                "to_date": to_date,
                 "routing": {"selection": "first-pass-topic"},
                 "sources": source_results,
             }
         )
+        retained_direct_titles = [
+            str(attempt[2].get("title") or "").strip()
+            for attempt in retained
+            if attempt[0] is not None and str(attempt[2].get("title") or "").strip()
+        ]
+        evidence_titles = [
+            str(item.get("title") or "").strip()
+            for item in compact["items"]
+            if str(item.get("title") or "").strip()
+        ]
+        representative_is_zhihu = representative.get("source_id") == "zhihu"
+        display_title = next(
+            (
+                title
+                for title in [
+                    *retained_direct_titles,
+                    *reversed(evidence_titles),
+                    *_topic_search_queries(raw_topic, entries),
+                    (
+                        ""
+                        if representative_is_zhihu
+                        else str(representative.get("title") or "").strip()
+                    ),
+                ]
+                if title
+            ),
+            "",
+        )
         attempts: list[dict[str, Any]] = []
-        for entry_id, (source_id, item), detail in zip(entry_ids, matched, details):
+        for entry_id, source_id, item, detail, _ in topic_attempts:
             detail = detail if isinstance(detail, Mapping) else {}
-            attempts.append(
-                {
-                    "entry_id": entry_id,
-                    "source": source_id,
-                    "query": str(item.get("title") or ""),
-                    "status": str(detail.get("status") or "unavailable"),
-                    "post_count": len(detail.get("posts") or []),
-                    "error": str(detail.get("error") or "").strip(),
-                }
-            )
+            attempt = {
+                "source": source_id,
+                "query": str(item.get("title") or ""),
+                "status": str(detail.get("status") or "unavailable"),
+                "post_count": len(detail.get("posts") or []),
+                "error": str(detail.get("error") or "").strip(),
+            }
+            if entry_id is not None:
+                attempt["entry_id"] = entry_id
+            else:
+                attempt["generated_search"] = True
+            attempts.append(attempt)
         topics.append(
             {
                 "topic_id": representative_id,
-                "title": str(representative.get("title") or ""),
+                "title": display_title,
                 "label": str(raw_topic.get("label") or ""),
                 "related_titles": [
                     str(entries[entry_id - 1].get("title") or "")
                     for entry_id in raw_topic.get("related_ids") or []
+                    if entries[entry_id - 1].get("source_id") != "zhihu"
                 ],
-                "collection_status": "readable" if compact["items"] else "unavailable",
                 "attempts": attempts,
                 "evidence": compact["items"],
             }
@@ -292,7 +536,8 @@ def collect_selected_hotlist_evidence(
         "topic_count": len(topics),
         "posts_per_entry": posts_per_entry,
         "max_entries_per_topic": max_entries_per_topic,
-        "unsupported_sources": unsupported_sources,
+        "date_range": {"from": from_date, "to": to_date},
+        "unsupported_sources": sorted(unsupported_sources),
         "topics": topics,
     }
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pyjson5
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .inference import CodexExecClient, LLMClient, LLMRequest, build_llm_client
 
@@ -28,6 +28,40 @@ class CodexExecSettings(BaseModel):
     effort: str = "low"
 
 
+class ScheduleSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    every: str = "4h"
+    start_time: str = "08:00"
+    end_time: str = "00:00"
+
+    @field_validator("every")
+    @classmethod
+    def validate_every(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized[:-1].isdigit() or normalized[:1] == "0" or normalized[-1:] not in {
+            "m",
+            "h",
+            "d",
+        }:
+            raise ValueError("schedule.every 必须是正整数加 m、h 或 d，例如 30m、4h、1d")
+        unit_seconds = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60}
+        if int(normalized[:-1]) * unit_seconds[normalized[-1]] > 24 * 60 * 60:
+            raise ValueError("schedule.every 不能超过 1d")
+        return normalized
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_local_time(cls, value: str) -> str:
+        parts = value.strip().split(":")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ValueError("定时时间必须使用 HH:MM 格式")
+        hour, minute = (int(part) for part in parts)
+        if hour > 23 or minute > 59:
+            raise ValueError("定时时间必须使用 00:00 到 23:59")
+        return f"{hour:02d}:{minute:02d}"
+
+
 class InferenceSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -36,6 +70,7 @@ class InferenceSettings(BaseModel):
     max_workers: int = Field(default=10, gt=0)
     api: APISettings
     codex_exec: CodexExecSettings = Field(default_factory=CodexExecSettings)
+    schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
 
 
 def resolve_inference_config_path(config_path: str | Path | None = None) -> Path:
@@ -112,6 +147,7 @@ __all__ = [
     "DEFAULT_INFERENCE_CONFIG_PATH",
     "INFERENCE_CONFIG_ENV",
     "InferenceSettings",
+    "ScheduleSettings",
     "build_configured_client",
     "load_inference_settings",
     "make_configured_request",
