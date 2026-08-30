@@ -7,12 +7,19 @@ from typing import Any, Literal
 import pyjson5
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .inference import CodexExecClient, LLMClient, LLMRequest, build_llm_client
+from .inference import (
+    CodexExecClient,
+    LLMAuditLogger,
+    LLMClient,
+    LLMRequest,
+    build_llm_client,
+)
 
 
 INFERENCE_CONFIG_ENV = "AGENTSCROLL_INFERENCE_CONFIG"
 DEFAULT_INFERENCE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "settings.jsonc"
 MODEL_PLACEHOLDER = "replace-with-model-name"
+INFERENCE_AUDIT_DIR = Path.cwd() / "outputs" / "logs" / "llm_audit"
 
 
 class APISettings(BaseModel):
@@ -102,6 +109,7 @@ def build_configured_client(
     enable_web_search: bool = False,
 ) -> LLMClient:
     model = _validated_model(settings)
+    audit_logger = LLMAuditLogger(INFERENCE_AUDIT_DIR)
 
     if settings.provider == "codex_exec":
         return CodexExecClient(
@@ -109,6 +117,7 @@ def build_configured_client(
             effort=settings.codex_exec.effort,
             max_workers=settings.max_workers,
             enable_web_search=enable_web_search,
+            audit_logger=audit_logger,
         )
 
     if enable_web_search:
@@ -125,6 +134,7 @@ def build_configured_client(
         base_url=settings.api.base_url,
         model=model,
         max_workers=settings.max_workers,
+        audit_logger=audit_logger,
     )
 
 

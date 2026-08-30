@@ -1,3 +1,4 @@
+from .audit import LLMAuditLogger
 from .llm_client import (
     CodexExecClient,
     LLMClient,
@@ -6,14 +7,13 @@ from .llm_client import (
     OpenAICompatibleClient,
     build_llm_client,
 )
-from .online_infer import OnlineLLM
 
 __all__ = [
     "CodexExecClient",
+    "LLMAuditLogger",
     "LLMClient",
     "LLMRequest",
     "LLMResponse",
-    "OnlineLLM",
     "OpenAICompatibleClient",
     "build_llm_client",
 ]

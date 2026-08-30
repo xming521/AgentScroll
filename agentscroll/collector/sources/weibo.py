@@ -23,6 +23,8 @@ def search_weibo(
     from_date: str,
     to_date: str,
     depth: str = "default",
+    *,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """通过 ``mcp-server-weibo`` 搜索微博内容。
 
@@ -31,13 +33,20 @@ def search_weibo(
         from_date: 起始日期 YYYY-MM-DD
         to_date: 结束日期 YYYY-MM-DD
         depth: 搜索深度 quick/default/deep
+        limit: 不超过当前深度上限的候选条目数
 
     Returns:
         微博条目列表，每条包含 id, text, url, author_handle, date,
         engagement, images, videos, relevance, why_relevant 等字段
     """
     limit_map = {"quick": 5, "default": 10, "deep": 20}
-    limit = limit_map.get(depth, 10)
+    depth_limit = limit_map.get(depth, 10)
+    if limit is None:
+        limit = depth_limit
+    elif limit <= 0:
+        raise ValueError("limit 必须大于 0")
+    else:
+        limit = min(limit, depth_limit)
     items = asyncio.run(_search_content(topic, limit))
     items = items[:limit]
     live_artifacts.save_stage("weibo", "01_search", topic, items)

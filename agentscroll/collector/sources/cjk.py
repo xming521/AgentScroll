@@ -1,6 +1,6 @@
-"""CJK-aware tokenization helpers with optional jieba support.
+"""CJK-aware tokenization helpers with Jieba support.
 
-The skill keeps jieba optional. When jieba is unavailable, Chinese text falls
+Jieba is a project dependency. If importing it fails, Chinese text falls
 back to character bigrams for scoring/deduplication, while outgoing search
 query cleanup can preserve whole CJK runs via segment_runs().
 """
@@ -28,10 +28,12 @@ CHINESE_STOPWORDS = frozenset({
 
 try:
     import jieba as _jieba  # type: ignore
+    import jieba.posseg as _jieba_posseg  # type: ignore
 
     _jieba.setLogLevel(60)
 except Exception:
     _jieba = None
+    _jieba_posseg = None
 
 
 def has_cjk(text: str) -> bool:
@@ -65,6 +67,19 @@ def segment(text: str) -> List[str]:
     if pos < len(text):
         out.extend(_LATIN_RE.findall(text[pos:]))
     return out
+
+
+def segment_with_pos(text: str) -> List[tuple[str, str]]:
+    """Tokenize text and retain Jieba part-of-speech tags when available."""
+    if not text:
+        return []
+    if _jieba_posseg is None:
+        return [(token, "") for token in segment(text)]
+    return [
+        (item.word, item.flag)
+        for item in _jieba_posseg.cut(text.lower())
+        if item.word.strip()
+    ]
 
 
 def segment_runs(text: str) -> List[str]:

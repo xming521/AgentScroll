@@ -52,6 +52,8 @@ def search_toutiao(
     from_date: str,
     to_date: str,
     depth: str = "default",
+    *,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """搜索今日头条内容。
 
@@ -60,12 +62,19 @@ def search_toutiao(
         from_date: 起始日期
         to_date: 结束日期
         depth: 搜索深度
+        limit: 不超过当前深度上限的候选条目数
 
     Returns:
         头条文章/视频列表
     """
     limit_map = {"quick": 5, "default": 10, "deep": 20}
-    limit = limit_map.get(depth, 10)
+    depth_limit = limit_map.get(depth, 10)
+    if limit is None:
+        limit = depth_limit
+    elif limit <= 0:
+        raise ValueError("limit 必须大于 0")
+    else:
+        limit = min(limit, depth_limit)
 
     items = _search_public_page(topic, limit)
 

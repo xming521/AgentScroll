@@ -33,6 +33,7 @@ ALL_SOURCES = (
 )
 
 _ALIASES = {"xhs": "xiaohongshu"}
+_PRE_DETAIL_LIMIT_SOURCES = {"weibo", "wechat", "toutiao", "xiaohongshu"}
 
 
 def _normalize_sources(sources: Optional[Iterable[str]]) -> tuple[str, ...]:
@@ -61,6 +62,7 @@ def _collect_one(
     from_date: str,
     to_date: str,
     depth: str,
+    item_limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     if source == "weibo":
         return weibo.search_weibo(
@@ -68,6 +70,7 @@ def _collect_one(
             from_date,
             to_date,
             depth=depth,
+            limit=item_limit,
         )
     if source == "xiaohongshu":
         return xiaohongshu.search_xiaohongshu(
@@ -75,6 +78,7 @@ def _collect_one(
             from_date,
             to_date,
             depth=depth,
+            limit=item_limit,
         )
     if source == "bilibili":
         return bilibili.search_bilibili(topic, from_date, to_date, depth=depth)
@@ -98,9 +102,16 @@ def _collect_one(
             from_date,
             to_date,
             depth=depth,
+            limit=item_limit,
         )
     if source == "toutiao":
-        return toutiao.search_toutiao(topic, from_date, to_date, depth=depth)
+        return toutiao.search_toutiao(
+            topic,
+            from_date,
+            to_date,
+            depth=depth,
+            limit=item_limit,
+        )
     raise ValueError(f"不支持的数据源：{source}")
 
 
@@ -127,6 +138,8 @@ def collect(
     as_of: Optional[str] = None,
     depth: str = "default",
     output_dir: Optional[str | Path] = None,
+    max_items: Optional[int] = None,
+    save: bool = True,
 ) -> Dict[str, Any]:
     """Collect platform data and persist one compact knowledge document.
 
@@ -143,6 +156,9 @@ def collect(
             search paths at higher depths.
         output_dir: Directory for the compact knowledge file. Defaults to
             ``./outputs/knowledge``.
+        max_items: Optional total result cap distributed as evenly as possible
+            across the selected platforms before detail and comment requests.
+        save: Persist the compact JSON/TXT knowledge files when true.
 
     Returns:
         A JSON-serializable dictionary containing per-source items and errors.
@@ -154,6 +170,10 @@ def collect(
         raise ValueError("days 必须大于 0")
     if depth not in {"quick", "default", "deep"}:
         raise ValueError("depth 必须是 quick、default 或 deep")
+    if max_items is not None and (
+        isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0
+    ):
+        raise ValueError("max_items 必须大于 0")
 
     requested_scene = normalize_scene(scene)
     routing = route_topic(topic, requested_scene)
@@ -163,9 +183,26 @@ def collect(
     else:
         active_sources = _normalize_sources(sources)
         routing["selection"] = "explicit-sources"
+    if max_items is not None:
+        unsupported = [
+            source
+            for source in active_sources
+            if source not in _PRE_DETAIL_LIMIT_SOURCES
+        ]
+        if unsupported:
+            raise ValueError(
+                "max_items 仅支持微博、微信公众号、今日头条和小红书"
+            )
     routing["sources"] = list(active_sources)
 
     from_date, to_date = dates.get_date_range(days, as_of=as_of)
+    source_item_limits: Dict[str, int] = {}
+    if max_items is not None:
+        per_source, remainder = divmod(max_items, len(active_sources))
+        source_item_limits = {
+            source: per_source + (index < remainder)
+            for index, source in enumerate(active_sources)
+        }
     source_results: Dict[str, Dict[str, Any]] = {
         source: {"items": [], "error": None} for source in active_sources
     }
@@ -179,8 +216,10 @@ def collect(
                 from_date,
                 to_date,
                 depth,
+                source_item_limits.get(source),
             ): source
             for source in active_sources
+            if source_item_limits.get(source, 1) > 0
         }
         for future in as_completed(futures):
             source = futures[future]
@@ -197,12 +236,14 @@ def collect(
         "from_date": from_date,
         "to_date": to_date,
         "depth": depth,
+        "max_items": max_items,
         "routing": routing,
         "sources": source_results,
     }
-    knowledge_file = save_knowledge_document(result, output_dir=output_dir)
-    result["knowledge_file"] = str(knowledge_file)
-    result["knowledge_metadata_file"] = str(knowledge_file.with_suffix(".json"))
+    if save:
+        knowledge_file = save_knowledge_document(result, output_dir=output_dir)
+        result["knowledge_file"] = str(knowledge_file)
+        result["knowledge_metadata_file"] = str(knowledge_file.with_suffix(".json"))
     return result
 
 

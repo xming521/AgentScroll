@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -29,9 +29,15 @@ _LABEL_ALIASES = {
 }
 _REMOVED_LABELS = {"conversation", "discussion"}
 _SHARE_LABELS = {"news", "fun"}
-_SHARE_SCORE_THRESHOLD = 7
+_SHARE_SCORE_THRESHOLD = 3
 _STATUSES = {"complete", "needs_research", "rejected"}
+_RESEARCH_SOURCES = {
+    "news": ("weibo", "wechat", "toutiao"),
+    "fun": ("weibo", "xiaohongshu"),
+}
+_RESEARCH_ITEM_LIMIT = 3
 _write_lock = threading.Lock()
+_COMMENT_REPLY_PREFIX_RE = re.compile(r"^回复\s*@[^:：]+[:：]\s*")
 
 _ZHIHU_SEARCH_QUERY_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -81,10 +87,22 @@ def _card_schema() -> dict[str, Any]:
                         },
                         "knowledge": {"type": "string", "maxLength": 260},
                         "chat_context": {"type": "string", "maxLength": 180},
+                        "latest_update": {
+                            "anyOf": [
+                                {"type": "string", "maxLength": 260},
+                                {"type": "null"},
+                            ]
+                        },
                         "share_score": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 10,
+                            "anyOf": [
+                                {"type": "number", "const": 0},
+                                {
+                                    "type": "number",
+                                    "minimum": 1,
+                                    "maximum": 4,
+                                    "multipleOf": 0.1,
+                                },
+                            ],
                         },
                         "share": {
                             "anyOf": [
@@ -125,6 +143,7 @@ def _card_schema() -> dict[str, Any]:
                         "rejection_reason",
                         "knowledge",
                         "chat_context",
+                        "latest_update",
                         "share_score",
                         "share",
                     ],
@@ -158,6 +177,11 @@ def _http_url(value: Any) -> str:
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return url
     return ""
+
+
+def _comment_body(value: Any) -> str:
+    text = str(value or "").strip()
+    return _COMMENT_REPLY_PREFIX_RE.sub("", text, count=1).strip()
 
 
 def _normalize_label(value: Any) -> str:
@@ -215,11 +239,6 @@ def _selection_with_zhihu_search_queries(
             for entry_id in topic_ids
             if entries[entry_id - 1]["source_id"] != "zhihu"
         ]
-        if entries[representative_id - 1]["source_id"] == "zhihu" and non_zhihu_ids:
-            representative_id = non_zhihu_ids[0]
-            related_ids = [
-                entry_id for entry_id in topic_ids if entry_id != representative_id
-            ]
 
         topic = dict(raw_topic)
         topic["representative_id"] = representative_id
@@ -341,6 +360,9 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"重复的 topic_id：{topic_id}")
         seen_ids.add(topic_id)
         label = _normalize_label(raw_topic.get("label"))
+        event_relation = str(raw_topic.get("event_relation") or "new")
+        if event_relation not in {"new", "update"}:
+            raise ValueError(f"话题 {topic_id} 的事件关系无效：{event_relation!r}")
 
         compact_evidence: list[dict[str, Any]] = []
         for evidence_index, raw_item in enumerate(
@@ -355,7 +377,7 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
             ):
                 if not isinstance(comment, Mapping):
                     continue
-                text = str(comment.get("text") or "").strip()
+                text = _comment_body(comment.get("text"))
                 if not text:
                     continue
                 comments.append(
@@ -380,6 +402,15 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "topic_id": topic_id,
                 "title": str(raw_topic.get("title") or ""),
                 "label": label,
+                "event_relation": event_relation,
+                "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
+                "current_card_file": str(raw_topic.get("current_card_file") or ""),
+                "current_topic_id": raw_topic.get("current_topic_id"),
+                "previous_card": (
+                    dict(raw_topic["previous_card"])
+                    if isinstance(raw_topic.get("previous_card"), Mapping)
+                    else None
+                ),
                 "evidence": compact_evidence,
             }
         )
@@ -388,49 +419,158 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
     return topics
 
 
-def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[str, Any]:
-    topic_title = str(topic.get("title") or "")
-    evidence = []
-    for item in topic.get("evidence") or []:
-        if not isinstance(item, Mapping):
+def _selection_with_update_contexts(
+    evidence: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach only the current card fields needed to evaluate an update."""
+    from .hotlist_history import load_history
+
+    selected_by_id = {
+        topic.get("representative_id"): topic
+        for topic in selection.get("topics") or []
+        if isinstance(topic, Mapping)
+    }
+    update_topics = [
+        topic
+        for topic in selected_by_id.values()
+        if topic.get("event_relation") == "update"
+    ]
+    history: Mapping[str, Any] = {"events": []}
+    if update_topics:
+        history_file = str(selection.get("history_file") or "").strip()
+        if not history_file:
+            raise ValueError("update 话题缺少 history_file")
+        history = load_history(history_file)
+    events_by_id = {
+        str(event.get("event_id") or ""): event
+        for event in history.get("events") or []
+        if isinstance(event, Mapping)
+    }
+    batch_cache: dict[Path, Mapping[str, Any]] = {}
+    enriched_topics = []
+    for raw_topic in evidence.get("topics") or []:
+        if not isinstance(raw_topic, Mapping):
             continue
-        url = _http_url(item.get("url"))
-        model_item: dict[str, Any] = {
-            "platform": str(item.get("platform") or ""),
-            "published_at": item.get("published_at"),
-            "content": str(item.get("content") or ""),
-            "comments": [],
-        }
-        if url:
-            model_item["source_id"] = str(item.get("source_id") or "")
-        for comment in item.get("comments") or []:
-            if not isinstance(comment, Mapping):
-                continue
-            model_comment = {
-                "comment_id": str(comment.get("comment_id") or ""),
-                "text": str(comment.get("text") or ""),
+        topic = dict(raw_topic)
+        selected = selected_by_id.get(topic.get("topic_id"))
+        if not isinstance(selected, Mapping):
+            raise ValueError(f"找不到话题 {topic.get('topic_id')!r} 的筛选结果")
+        relation = str(selected.get("event_relation") or "new")
+        if relation not in {"new", "update"}:
+            raise ValueError(f"无效的事件关系：{relation!r}")
+        topic["event_relation"] = relation
+        if relation == "new":
+            enriched_topics.append(topic)
+            continue
+
+        event_id = str(selected.get("matched_event_id") or "")
+        event = events_by_id.get(event_id)
+        if not isinstance(event, Mapping):
+            raise ValueError(f"找不到 update 对应的历史事件：{event_id!r}")
+        card_file = Path(str(event.get("current_card_file") or "")).expanduser()
+        current_topic_id = event.get("current_topic_id")
+        if not card_file.is_file() or current_topic_id is None:
+            raise ValueError(f"历史事件 {event_id} 没有可更新的当前知识卡")
+        card_file = card_file.resolve()
+        batch = batch_cache.get(card_file)
+        if batch is None:
+            loaded = json.loads(card_file.read_text(encoding="utf-8"))
+            if not isinstance(loaded, Mapping) or not isinstance(
+                loaded.get("cards"), list
+            ):
+                raise ValueError(f"历史知识卡批次结构无效：{card_file}")
+            batch = loaded
+            batch_cache[card_file] = batch
+        current_card = next(
+            (
+                card
+                for card in batch["cards"]
+                if isinstance(card, Mapping)
+                and card.get("topic_id") == current_topic_id
+            ),
+            None,
+        )
+        if not isinstance(current_card, Mapping):
+            raise ValueError(
+                f"历史知识卡 {card_file} 中找不到 topic_id={current_topic_id!r}"
+            )
+        raw_latest_update = current_card.get("latest_update")
+        if isinstance(raw_latest_update, Mapping):
+            previous_latest_update: Any = {
+                "updated_at": str(raw_latest_update.get("updated_at") or ""),
+                "title": str(raw_latest_update.get("title") or ""),
+                "summary": str(raw_latest_update.get("summary") or ""),
             }
-            model_item["comments"].append(model_comment)
-        evidence.append(model_item)
+        elif str(raw_latest_update or "").strip():
+            previous_latest_update = {
+                "updated_at": "",
+                "title": "",
+                "summary": str(raw_latest_update).strip(),
+            }
+        else:
+            previous_latest_update = None
+        topic.update(
+            {
+                "matched_event_id": event_id,
+                "current_card_file": str(card_file),
+                "current_topic_id": current_topic_id,
+                "previous_card": {
+                    "title": str(current_card.get("title") or ""),
+                    "status": str(current_card.get("status") or ""),
+                    "knowledge": str(current_card.get("knowledge") or ""),
+                    "chat_context": str(current_card.get("chat_context") or ""),
+                    "latest_update": previous_latest_update,
+                },
+            }
+        )
+        enriched_topics.append(topic)
+
+    enriched = dict(evidence)
+    enriched["topics"] = enriched_topics
+    return enriched
+
+
+def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[str, Any]:
+    def compact_items(raw_items: Any) -> list[dict[str, Any]]:
+        compacted = []
+        for item in raw_items or []:
+            if not isinstance(item, Mapping):
+                continue
+            url = _http_url(item.get("url"))
+            model_item: dict[str, Any] = {
+                "platform": str(item.get("platform") or ""),
+                "source_title": str(item.get("source_title") or ""),
+                "published_at": item.get("published_at"),
+                "content": str(item.get("content") or ""),
+                "comments": [],
+            }
+            if url:
+                model_item["source_id"] = str(item.get("source_id") or "")
+            for comment in item.get("comments") or []:
+                if not isinstance(comment, Mapping):
+                    continue
+                model_item["comments"].append(
+                    {
+                        "comment_id": str(comment.get("comment_id") or ""),
+                        "text": str(comment.get("text") or ""),
+                    }
+                )
+            compacted.append(model_item)
+        return compacted
 
     payload: dict[str, Any] = {
-        "title": topic_title,
+        "title": str(topic.get("title") or ""),
         "label": str(topic.get("label") or ""),
-        "evidence": evidence,
+        "relation": str(topic.get("event_relation") or "new"),
+        "evidence": compact_items(topic.get("evidence")),
     }
+    if payload["relation"] == "update":
+        payload["previous_card"] = dict(topic.get("previous_card") or {})
     if research:
-        search_results = []
-        for result in topic.get("public_search_results") or []:
-            if not isinstance(result, Mapping):
-                continue
-            model_result = {
-                "title": str(result.get("title") or ""),
-                "snippet": str(result.get("snippet") or ""),
-            }
-            if _http_url(result.get("url")):
-                model_result["source_id"] = str(result.get("source_id") or "")
-            search_results.append(model_result)
-        payload["public_search_results"] = search_results
+        payload["research_evidence"] = compact_items(
+            topic.get("research_evidence")
+        )
     return payload
 
 
@@ -489,6 +629,7 @@ def _needs_research_card(
         "rejection_reason": "",
         "knowledge": "",
         "chat_context": "",
+        "latest_update": None,
         "share_score": 0,
         "share": None,
     }
@@ -606,71 +747,116 @@ def _generate_topic_cards(
     return [cards_by_id[topic["topic_id"]] for topic in topics], inference
 
 
-def _research_search_queries(topic: Mapping[str, Any]) -> list[str]:
-    title = str(topic.get("title") or "").strip()
-    queries = [title]
-    if str(topic.get("label") or "") == "fun":
-        latin = re.findall(
-            r"(?i)(?<![a-z0-9])[a-z][a-z0-9._+-]*(?![a-z0-9])",
-            title,
-        )
-        numbers = re.findall(r"(?<!\d)\d+(?:\.\d+)?%?(?!\d)", title)
-        if latin and numbers:
-            query = f"{latin[0]} {numbers[0]} 是什么梗"
-            if query not in queries:
-                queries.append(query)
-    return queries
+def _research_date_window(evidence: Mapping[str, Any]) -> tuple[int, str | None]:
+    raw_range = evidence.get("date_range")
+    if not isinstance(raw_range, Mapping):
+        return 7, None
+    raw_from = str(raw_range.get("from") or "").strip()
+    raw_to = str(raw_range.get("to") or "").strip()
+    try:
+        from_date = date.fromisoformat(raw_from)
+        to_date = date.fromisoformat(raw_to)
+    except ValueError as exc:
+        raise ValueError("evidence.date_range 必须使用 YYYY-MM-DD 日期") from exc
+    if from_date > to_date:
+        raise ValueError("evidence.date_range.from 不能晚于 to")
+    # collector.get_date_range() subtracts ``days`` from the end date.
+    return max(1, (to_date - from_date).days), raw_to
 
 
-def _collect_public_search_results(
+def _collect_active_search_evidence(
     topics: list[dict[str, Any]],
     *,
     max_workers: int,
-    limit: int = 3,
-) -> tuple[dict[int, list[dict[str, str]]], int]:
-    from agentscroll.collector.sources import web_search
+    days: int,
+    as_of: str | None,
+) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any]]:
+    from agentscroll.collector import collect
+    from agentscroll.collector.knowledge_store import build_knowledge_document
 
-    def search_topic(topic: dict[str, Any]) -> tuple[int, list[dict[str, str]], int]:
-        results: list[dict[str, str]] = []
-        seen_urls: set[str] = set()
-        request_count = 0
-        for query in _research_search_queries(topic):
-            request_count += 1
-            try:
-                candidates = web_search.search_bing(query, limit=limit)
-            except Exception:
-                request_count += 1
-                try:
-                    candidates = web_search.search_duckduckgo(query, limit=limit)
-                except Exception:
-                    candidates = []
-            for candidate in candidates:
-                url = str(candidate.get("url") or "").strip()
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                results.append(
+    def search_topic(
+        topic: dict[str, Any],
+    ) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+        label = _normalize_label(topic.get("label"))
+        sources = _RESEARCH_SOURCES[label]
+        try:
+            result = collect(
+                str(topic.get("title") or ""),
+                sources=sources,
+                days=days,
+                as_of=as_of,
+                depth="default",
+                max_items=_RESEARCH_ITEM_LIMIT,
+                save=False,
+            )
+        except Exception as exc:
+            return topic["topic_id"], [], [
+                {
+                    "topic_id": topic["topic_id"],
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            ]
+
+        source_errors = []
+        for source, payload in (result.get("sources") or {}).items():
+            if isinstance(payload, Mapping) and payload.get("error"):
+                source_errors.append(
                     {
-                        "source_id": f"s{len(results) + 1}",
-                        "query": query,
-                        "title": str(candidate.get("title") or "")[:160],
-                        "snippet": str(candidate.get("snippet") or "")[:300],
-                        "url": url,
+                        "topic_id": topic["topic_id"],
+                        "source": str(source),
+                        "error": str(payload["error"]),
                     }
                 )
-                if len(results) >= limit:
-                    return topic["topic_id"], results, request_count
-        return topic["topic_id"], results, request_count
 
-    by_id: dict[int, list[dict[str, str]]] = {}
-    total_requests = 0
+        items = build_knowledge_document(result)["items"][:_RESEARCH_ITEM_LIMIT]
+        compact_evidence = []
+        for item_index, item in enumerate(items, start=1):
+            comments = []
+            for comment_index, comment in enumerate(
+                item.get("comments") or [], start=1
+            ):
+                if not isinstance(comment, Mapping):
+                    continue
+                text = _comment_body(comment.get("text"))
+                if text:
+                    comments.append(
+                        {
+                            "comment_id": f"r{item_index}c{comment_index}",
+                            "text": text,
+                        }
+                    )
+            compact_evidence.append(
+                {
+                    "source_id": f"r{item_index}",
+                    "platform": str(item.get("platform") or ""),
+                    "source_title": str(item.get("title") or ""),
+                    "published_at": item.get("published_at"),
+                    "url": _http_url(item.get("url")),
+                    "content": str(item.get("content") or ""),
+                    "comments": comments,
+                }
+            )
+        return topic["topic_id"], compact_evidence, source_errors
+
+    by_id: dict[int, list[dict[str, Any]]] = {}
+    errors: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(max_workers, len(topics))) as executor:
         futures = [executor.submit(search_topic, topic) for topic in topics]
         for future in as_completed(futures):
-            topic_id, results, request_count = future.result()
+            topic_id, results, topic_errors = future.result()
             by_id[topic_id] = results
-            total_requests += request_count
-    return by_id, total_requests
+            errors.extend(topic_errors)
+    diagnostics = {
+        "active_search_topic_count": len(topics),
+        "active_search_source_requests": sum(
+            len(_RESEARCH_SOURCES[_normalize_label(topic.get("label"))])
+            for topic in topics
+        ),
+        "active_search_item_count": sum(len(items) for items in by_id.values()),
+        "active_search_failure_count": len(errors),
+        "active_search_failures": errors,
+    }
+    return by_id, diagnostics
 
 
 def _validate_share(
@@ -681,17 +867,22 @@ def _validate_share(
     topic: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     topic_id = topic["topic_id"]
-    if (
-        isinstance(score, bool)
-        or not isinstance(score, int)
-        or not 0 <= score <= 10
-    ):
-        raise ValueError(f"话题 {topic_id} 的 share_score 不是 0 至 10 的整数")
+    valid_range = isinstance(score, (int, float)) and (
+        score == 0 or 1 <= score <= 4
+    )
+    has_at_most_one_decimal = valid_range and abs(
+        score * 10 - round(score * 10)
+    ) < 1e-9
+    if isinstance(score, bool) or not has_at_most_one_decimal:
+        raise ValueError(
+            f"话题 {topic_id} 的 share_score 必须为 0 或 1 至 4 "
+            "且最多保留一位小数"
+        )
     ready = score >= _SHARE_SCORE_THRESHOLD
 
     sources = [
         *list(topic.get("evidence") or []),
-        *list(topic.get("public_search_results") or []),
+        *list(topic.get("research_evidence") or []),
     ]
     has_share_source = any(
         isinstance(item, Mapping)
@@ -747,7 +938,7 @@ def _validate_share(
     if comment_id:
         comments = {
             str(comment.get("comment_id") or ""): str(comment.get("text") or "").strip()
-            for item in topic.get("evidence") or []
+            for item in sources
             if isinstance(item, Mapping)
             for comment in item.get("comments") or []
             if isinstance(comment, Mapping) and comment.get("comment_id")
@@ -792,6 +983,13 @@ def _validate_cards(
         rejection_reason = str(raw_card.get("rejection_reason") or "").strip()
         knowledge = str(raw_card.get("knowledge") or "").strip()
         chat_context = str(raw_card.get("chat_context") or "").strip()
+        raw_latest_update = raw_card.get("latest_update")
+        latest_update = (
+            str(raw_latest_update).strip()
+            if raw_latest_update is not None
+            else None
+        )
+        relation = str(topic_by_id[topic_id].get("event_relation") or "new")
         if status not in _STATUSES:
             raise ValueError(f"模型返回了无效 status：{status!r}")
         if status == "complete":
@@ -799,15 +997,31 @@ def _validate_cards(
                 raise ValueError(
                     f"完整知识卡 {topic_id} 的字段状态不一致"
                 )
+            if relation == "update" and not latest_update:
+                raise ValueError(f"更新知识卡 {topic_id} 缺少 latest_update")
+            if relation == "new" and latest_update is not None:
+                raise ValueError(f"新知识卡 {topic_id} 的 latest_update 必须为 null")
         elif status == "needs_research":
-            if rejection_reason or knowledge or chat_context:
+            if (
+                rejection_reason
+                or knowledge
+                or chat_context
+                or latest_update is not None
+            ):
                 raise ValueError(f"待补搜知识卡 {topic_id} 的字段状态不一致")
-        elif not rejection_reason or knowledge or chat_context:
+        elif (
+            not rejection_reason
+            or knowledge
+            or chat_context
+            or latest_update is not None
+        ):
             raise ValueError(f"已淘汰知识卡 {topic_id} 的字段状态不一致")
         card = dict(raw_card)
         card["topic_id"] = topic_id
         card["rejection_reason"] = rejection_reason
+        card["knowledge"] = knowledge
         card["chat_context"] = chat_context
+        card["latest_update"] = latest_update
         card["share_score"] = raw_card.get("share_score")
         card["share"] = _validate_share(
             raw_card.get("share"),
@@ -838,7 +1052,7 @@ def _validate_research_cards(
             str(source.get("source_id") or ""): source
             for source in [
                 *list(topic.get("evidence") or []),
-                *list(topic.get("public_search_results") or []),
+                *list(topic.get("research_evidence") or []),
             ]
             if isinstance(source, Mapping) and source.get("source_id")
         }
@@ -867,16 +1081,21 @@ def _validate_research_cards(
 
 def _render_card_text(card: Mapping[str, Any]) -> str:
     share = card.get("share")
+    latest_update = card.get("latest_update")
     lines = [
         f"话题: {card['title']}",
         f"类别: {card['label']}",
         f"状态: {card['status']}",
-        f"分享评分: {card.get('share_score', 0)}/10",
+        f"分享评分: {card.get('share_score', 0)}/4",
     ]
     if card.get("knowledge"):
         lines.extend(("", str(card["knowledge"])))
     if card.get("chat_context"):
         lines.extend(("", f"聊天语境: {card['chat_context']}"))
+    if isinstance(latest_update, Mapping) and latest_update.get("summary"):
+        lines.extend(("", f"最新进展: {latest_update['summary']}"))
+    elif isinstance(latest_update, str) and latest_update.strip():
+        lines.extend(("", f"最新进展: {latest_update.strip()}"))
     if card.get("rejection_reason"):
         lines.extend(("", f"淘汰原因: {card['rejection_reason']}"))
     if isinstance(share, Mapping):
@@ -924,6 +1143,7 @@ def _share_documents(
                 "comment_id": share["comment_id"],
             }
         )
+    shares.sort(key=lambda item: item["score"], reverse=True)
     return shares
 
 
@@ -1022,10 +1242,12 @@ def _save_cards(
             "rejection_reason": card["rejection_reason"],
             "knowledge": card["knowledge"],
             "chat_context": card["chat_context"],
+            "latest_update": card.get("latest_update"),
             "share_score": card["share_score"],
             "share": card["share"],
             "research_sources": card.get("research_sources") or [],
             "evidence": topic.get("evidence") or [],
+            "research_evidence": topic.get("research_evidence") or [],
             "collection_attempts": topic.get("attempts") or [],
         }
         documents.append(document)
@@ -1074,6 +1296,158 @@ def _save_cards(
             )
         )
     return files
+
+
+def _save_selected_cards(
+    cards: list[dict[str, Any]],
+    *,
+    evidence: Mapping[str, Any],
+    inference: Mapping[str, Any],
+    output_dir: str | Path | None,
+    share_output_dir: str | Path | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Save new cards and replace the latest section of existing update cards."""
+    topics_by_id = {
+        topic["topic_id"]: topic
+        for topic in evidence.get("topics") or []
+        if isinstance(topic, Mapping)
+    }
+    new_cards = [
+        card
+        for card in cards
+        if topics_by_id[card["topic_id"]].get("event_relation") != "update"
+    ]
+    files: dict[str, Any] = {}
+    new_batch_path: Path | None = None
+    if new_cards:
+        new_topic_ids = {card["topic_id"] for card in new_cards}
+        new_evidence = dict(evidence)
+        new_evidence["topics"] = [
+            dict(topic)
+            for topic_id, topic in topics_by_id.items()
+            if topic_id in new_topic_ids
+        ]
+        files.update(
+            _save_cards(
+                new_cards,
+                evidence=new_evidence,
+                inference=inference,
+                output_dir=output_dir,
+                save_share_queue=False,
+            )
+        )
+        new_batch_path = Path(files["batch_json_file"]).resolve()
+
+    updated_at = datetime.now().astimezone()
+    updated_at_text = updated_at.isoformat(timespec="seconds")
+    patches_by_file: dict[Path, list[tuple[dict[str, Any], Mapping[str, Any]]]] = {}
+    event_results: list[dict[str, Any]] = []
+    for card in cards:
+        topic = topics_by_id[card["topic_id"]]
+        relation = str(topic.get("event_relation") or "new")
+        if relation == "new":
+            if new_batch_path is None:
+                raise RuntimeError("新事件缺少知识卡批次")
+            card_file = new_batch_path
+            card_topic_id = card["topic_id"]
+        elif relation == "update":
+            card_file = Path(str(topic.get("current_card_file") or "")).resolve()
+            card_topic_id = topic.get("current_topic_id")
+            if card["status"] == "complete":
+                patches_by_file.setdefault(card_file, []).append((card, topic))
+        else:
+            raise ValueError(f"无效的事件关系：{relation!r}")
+        event_results.append(
+            {
+                "topic_id": card["topic_id"],
+                "status": card["status"],
+                "card_file": str(card_file),
+                "card_topic_id": card_topic_id,
+                "title": str(topic.get("title") or ""),
+                "evidence": list(topic.get("evidence") or []),
+                "research_evidence": list(topic.get("research_evidence") or []),
+            }
+        )
+
+    for batch_path, patches in patches_by_file.items():
+        raw_batch = json.loads(batch_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_batch, Mapping) or not isinstance(
+            raw_batch.get("cards"), list
+        ):
+            raise ValueError(f"历史知识卡批次结构无效：{batch_path}")
+        batch = dict(raw_batch)
+        documents = [
+            dict(document)
+            for document in raw_batch["cards"]
+            if isinstance(document, Mapping)
+        ]
+        documents_by_id = {
+            document.get("topic_id"): document for document in documents
+        }
+        for card, topic in patches:
+            current_topic_id = topic.get("current_topic_id")
+            document = documents_by_id.get(current_topic_id)
+            if document is None:
+                raise ValueError(
+                    f"历史知识卡 {batch_path} 中找不到 topic_id={current_topic_id!r}"
+                )
+            document.update(
+                {
+                    "updated_at": updated_at_text,
+                    "status": "complete",
+                    "rejection_reason": "",
+                    "knowledge": card["knowledge"],
+                    "chat_context": card["chat_context"],
+                    "latest_update": {
+                        "updated_at": updated_at_text,
+                        "title": str(topic.get("title") or ""),
+                        "summary": str(card.get("latest_update") or ""),
+                        "evidence": list(topic.get("evidence") or []),
+                        "research_evidence": list(
+                            topic.get("research_evidence") or []
+                        ),
+                        "collection_attempts": list(topic.get("attempts") or []),
+                    },
+                    "share_score": card["share_score"],
+                    "share": card["share"],
+                    "research_sources": card.get("research_sources") or [],
+                }
+            )
+        batch["updated_at"] = updated_at_text
+        batch["status_counts"] = {
+            status: sum(document.get("status") == status for document in documents)
+            for status in sorted(_STATUSES)
+        }
+        batch["cards"] = documents
+        text_path = batch_path.with_suffix(".txt")
+        json_tmp = batch_path.with_suffix(".json.tmp")
+        text_tmp = text_path.with_suffix(".txt.tmp")
+        batch_text = "\n\n=====\n\n".join(
+            _render_card_text(document).rstrip() for document in documents
+        ) + "\n"
+        with _write_lock:
+            json_tmp.write_text(
+                json.dumps(batch, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            text_tmp.write_text(batch_text, encoding="utf-8")
+            json_tmp.replace(batch_path)
+            text_tmp.replace(text_path)
+
+    files.update(
+        _save_share_batch(
+            cards,
+            evidence=evidence,
+            inference=inference,
+            output_dir=share_output_dir,
+            generated_at=updated_at,
+        )
+    )
+    files["updated_card_count"] = sum(
+        len(items) for items in patches_by_file.values()
+    )
+    files["new_card_count"] = len(new_cards)
+    return files, event_results
 
 
 def _generate_hotlist_knowledge_cards(
@@ -1152,6 +1526,7 @@ def generate_selected_hotlist_knowledge_cards(
     supplement_failed: bool = True,
     generation_effort: str = "xhigh",
     supplement_effort: str = "xhigh",
+    record_history: bool = False,
 ) -> dict[str, Any]:
     """Collect evidence, generate cards, then batch-search only failed topics."""
     raw_topics = selection.get("topics")
@@ -1188,33 +1563,45 @@ def generate_selected_hotlist_knowledge_cards(
         posts_per_entry=posts_per_entry,
         max_entries_per_topic=max_entries_per_topic,
     )
+    evidence = _selection_with_update_contexts(evidence, enriched_selection)
     initial_result = _generate_hotlist_knowledge_cards(
         evidence,
         config_path=config_path,
         effort=generation_effort,
     )
-    if not supplement_failed or not initial_result["needs_research_count"]:
-        initial_result.update(
-            _save_cards(
-                initial_result["cards"],
-                evidence=evidence,
-                inference=initial_result["inference"],
-                output_dir=output_dir,
-                share_output_dir=share_output_dir,
-            )
+    saving_evidence = evidence
+    if supplement_failed and initial_result["needs_research_count"]:
+        final_result = supplement_hotlist_knowledge_cards(
+            evidence,
+            initial_result,
+            config_path=config_path,
+            output_dir=output_dir,
+            share_output_dir=share_output_dir,
+            effort=supplement_effort,
+            _save_result=False,
         )
-        initial_result["search_query_inference"] = search_query_inference
-        return initial_result
-    supplemented = supplement_hotlist_knowledge_cards(
-        evidence,
-        initial_result,
-        config_path=config_path,
+        saving_evidence = final_result.pop("_saving_evidence", evidence)
+    else:
+        final_result = initial_result
+    files, event_results = _save_selected_cards(
+        final_result["cards"],
+        evidence=saving_evidence,
+        inference=final_result["inference"],
         output_dir=output_dir,
         share_output_dir=share_output_dir,
-        effort=supplement_effort,
     )
-    supplemented["search_query_inference"] = search_query_inference
-    return supplemented
+    final_result.update(files)
+    final_result["search_query_inference"] = search_query_inference
+    if record_history:
+        from .hotlist_history import record_final_batch, reference_time
+
+        record_final_batch(
+            str(selection.get("history_file") or ""),
+            enriched_selection,
+            event_results,
+            at=reference_time(hotlist),
+        )
+    return final_result
 
 
 def supplement_hotlist_knowledge_cards(
@@ -1225,8 +1612,9 @@ def supplement_hotlist_knowledge_cards(
     output_dir: str | Path | None = None,
     share_output_dir: str | Path | None = None,
     effort: str = "xhigh",
+    _save_result: bool = True,
 ) -> dict[str, Any]:
-    """Discover snippets for failed topics and save a new merged card batch."""
+    """Actively collect platform evidence for failed topics and save one batch."""
     from agentscroll.inference_config import load_inference_settings
 
     topics = _prompt_payload(evidence)
@@ -1242,6 +1630,11 @@ def supplement_hotlist_knowledge_cards(
                 "topic_id": topic["topic_id"],
                 "title": topic["title"],
                 "label": topic["label"],
+                "event_relation": topic["event_relation"],
+                "matched_event_id": topic["matched_event_id"],
+                "current_card_file": topic["current_card_file"],
+                "current_topic_id": topic["current_topic_id"],
+                "previous_card": topic["previous_card"],
                 "evidence": topic["evidence"],
             }
         )
@@ -1252,12 +1645,15 @@ def supplement_hotlist_knowledge_cards(
         return result
 
     settings = load_inference_settings(config_path)
-    search_results, public_search_requests = _collect_public_search_results(
+    days, as_of = _research_date_window(evidence)
+    search_results, active_search_diagnostics = _collect_active_search_evidence(
         research_topics,
         max_workers=settings.max_workers,
+        days=days,
+        as_of=as_of,
     )
     for topic in research_topics:
-        topic["public_search_results"] = search_results.get(topic["topic_id"], [])
+        topic["research_evidence"] = search_results.get(topic["topic_id"], [])
 
     research_cards, supplement_inference = _generate_topic_cards(
         research_topics,
@@ -1272,18 +1668,36 @@ def supplement_hotlist_knowledge_cards(
         research_by_id.get(card["topic_id"], card) for card in initial_cards
     ]
     supplement_inference["web_search_calls"] = 0
-    supplement_inference["public_search_requests"] = public_search_requests
+    supplement_inference.update(active_search_diagnostics)
     inference = {
         "initial": dict(initial_result.get("inference") or {}),
         "supplement": supplement_inference,
     }
-    files = _save_cards(
-        merged_cards,
-        evidence=evidence,
-        inference=inference,
-        output_dir=output_dir,
-        share_output_dir=share_output_dir,
-        batch_name="补搜后热榜知识卡批次",
+    research_evidence_by_id = {
+        topic["topic_id"]: topic.get("research_evidence") or []
+        for topic in research_topics
+    }
+    saving_evidence = dict(evidence)
+    saving_evidence["topics"] = [
+        {
+            **dict(topic),
+            "research_evidence": research_evidence_by_id.get(
+                topic.get("topic_id"), []
+            ),
+        }
+        for topic in evidence.get("topics") or []
+        if isinstance(topic, Mapping)
+    ]
+    files = (
+        _save_cards(
+            merged_cards,
+            evidence=saving_evidence,
+            inference=inference,
+            output_dir=output_dir,
+            share_output_dir=share_output_dir,
+        )
+        if _save_result
+        else {"_saving_evidence": saving_evidence}
     )
     return {
         "topic_count": len(merged_cards),

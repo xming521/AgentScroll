@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -13,8 +12,6 @@ from agentscroll.prompts.hotlist import HOTLIST_FIRST_PASS_PROMPT
 
 _FIRST_PASS_LABELS = {"news", "fun"}
 _FIRST_PASS_MAX_TOPICS = 15
-_TITLE_CACHE_FILENAME = "hotlist_title_cache.txt"
-_title_cache_lock = threading.Lock()
 
 _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -31,75 +28,60 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "integer"},
                     },
                     "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
+                    "relation": {"type": "string", "enum": ["new", "update"]},
+                    "history_id": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}]
+                    },
                 },
-                "required": ["representative_id", "related_ids", "label"],
+                "required": [
+                    "representative_id",
+                    "related_ids",
+                    "label",
+                    "relation",
+                    "history_id",
+                ],
                 "additionalProperties": False,
             },
-        }
+        },
+        "seen": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "representative_id": {"type": "integer"},
+                    "related_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                    "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
+                    "history_id": {"type": "integer"},
+                },
+                "required": [
+                    "representative_id",
+                    "related_ids",
+                    "label",
+                    "history_id",
+                ],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["topics"],
+    "required": ["topics", "seen"],
     "additionalProperties": False,
 }
 
 
 def _first_pass_prompt(candidates: list[dict[str, Any]]) -> str:
-    payload = json.dumps(candidates, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(
+        {"candidates": candidates},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return (
         f"{HOTLIST_FIRST_PASS_PROMPT.strip()}\n\n"
         f"热榜条目总数：{len(candidates)}\n"
-        f"待筛选条目（JSON）：\n{payload}"
+        f"待筛选条目及本地召回的历史标题（JSON）：\n{payload}"
     )
-
-
-def _title_cache_path(hotlist: Mapping[str, Any] | str | Path) -> Path:
-    snapshot_file: str | Path | None = None
-    if isinstance(hotlist, (str, Path)):
-        snapshot_file = hotlist
-    elif isinstance(hotlist.get("snapshot_file"), (str, Path)):
-        snapshot_file = hotlist["snapshot_file"]
-    if snapshot_file:
-        return Path(snapshot_file).expanduser().resolve().parent / _TITLE_CACHE_FILENAME
-    return (Path.cwd() / "outputs" / "hotlists" / _TITLE_CACHE_FILENAME).resolve()
-
-
-def _cached_title_keys(path: Path) -> set[str]:
-    from agentscroll.collector.newsnow import _title_dedupe_key
-
-    if not path.is_file():
-        return set()
-    return {
-        _title_dedupe_key(title)
-        for title in path.read_text(encoding="utf-8").splitlines()
-        if title.strip()
-    }
-
-
-def _cache_titles(path: Path, titles: list[str]) -> None:
-    from agentscroll.collector.newsnow import _title_dedupe_key
-
-    normalized_titles = [" ".join(title.split()) for title in titles if title.strip()]
-    with _title_cache_lock:
-        existing_titles = (
-            [
-                title
-                for title in path.read_text(encoding="utf-8").splitlines()
-                if title.strip()
-            ]
-            if path.is_file()
-            else []
-        )
-        cached_keys = {_title_dedupe_key(title) for title in existing_titles}
-        for title in normalized_titles:
-            key = _title_dedupe_key(title)
-            if key in cached_keys:
-                continue
-            cached_keys.add(key)
-            existing_titles.append(title)
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(f"{path.suffix}.tmp")
-        temporary.write_text("\n".join(existing_titles) + "\n", encoding="utf-8")
-        temporary.replace(path)
 
 
 def select_hotlist_first_pass(
@@ -115,14 +97,27 @@ def select_hotlist_first_pass(
         load_inference_settings,
         make_configured_request,
     )
+    from .hotlist_history import (
+        active_exact_title_keys,
+        attach_history_matches,
+        history_path,
+        load_history,
+        order_candidates_by_similarity,
+        record_first_pass,
+        reference_time,
+    )
 
     entries = list_hotlist_entries(hotlist)
-    cache_path = _title_cache_path(hotlist)
-    cached_title_keys = _cached_title_keys(cache_path)
+    state_path = history_path(hotlist)
+    evaluated_at = reference_time(hotlist)
+    history_state = load_history(state_path)
+    cached_title_keys = active_exact_title_keys(history_state, at=evaluated_at)
     candidates: list[dict[str, Any]] = []
+    exact_titles: list[str] = []
     for index, item in enumerate(entries, start=1):
         title = str(item.get("title") or "")
         if _title_dedupe_key(title) in cached_title_keys:
+            exact_titles.append(title)
             continue
         candidate: dict[str, Any] = {
             "id": index,
@@ -133,22 +128,43 @@ def select_hotlist_first_pass(
 
     cached_count = len(entries) - len(candidates)
     if not candidates:
+        record_first_pass(
+            state_path,
+            history_state,
+            exact_titles=exact_titles,
+            ignored_titles=[],
+            seen_topics=[],
+            at=evaluated_at,
+        )
         return {
             "input_count": len(entries),
             "cached_count": cached_count,
             "candidate_count": 0,
             "topic_count": 0,
+            "seen_count": 0,
             "topics": [],
-            "cache_file": str(cache_path),
+            "seen_topics": [],
+            "history_file": str(state_path),
+            "history_event_count": len(history_state.get("events") or []),
+            "history_match_count": 0,
+            "history_prompt_chars": 0,
             "inference": {
                 "skipped": True,
                 "reason": "no_new_titles",
             },
         }
 
+    candidate_payloads, history_lookup, history_stats = (
+        attach_history_matches(
+            candidates,
+            history_state,
+            at=evaluated_at,
+        )
+    )
+    candidate_payloads = order_candidates_by_similarity(candidate_payloads)
     settings = load_inference_settings(config_path)
     request = make_configured_request(
-        _first_pass_prompt(candidates),
+        _first_pass_prompt(candidate_payloads),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
         timeout=300,
@@ -159,8 +175,6 @@ def select_hotlist_first_pass(
     finally:
         client.close()
 
-    _cache_titles(cache_path, [candidate["title"] for candidate in candidates])
-
     if not response.ok:
         raise RuntimeError(f"热榜第一轮粗筛失败：{response.error or 'unknown error'}")
     if not isinstance(response.parsed_json, dict):
@@ -168,12 +182,21 @@ def select_hotlist_first_pass(
     raw_topics = response.parsed_json.get("topics")
     if not isinstance(raw_topics, list):
         raise ValueError("模型返回值缺少 topics 数组")
+    raw_seen_topics = response.parsed_json.get("seen")
+    if not isinstance(raw_seen_topics, list):
+        raise ValueError("模型返回值缺少 seen 数组")
     raw_topics = raw_topics[:_FIRST_PASS_MAX_TOPICS]
 
     candidate_ids = {candidate["id"] for candidate in candidates}
+    candidates_by_id = {candidate["id"]: candidate for candidate in candidate_payloads}
     selected_ids: set[int] = set()
+    matched_event_ids: set[str] = set()
     topics: list[dict[str, Any]] = []
-    for raw_topic in raw_topics:
+    seen_topics: list[dict[str, Any]] = []
+
+    def validated_identity(
+        raw_topic: Any,
+    ) -> tuple[int, list[int], str, list[int]]:
         if not isinstance(raw_topic, Mapping):
             raise ValueError("模型返回了无效的话题对象")
         representative_id = raw_topic.get("representative_id")
@@ -199,42 +222,135 @@ def select_hotlist_first_pass(
             raise ValueError(f"模型重复使用了热榜 ID：{topic_ids!r}")
         if not isinstance(label, str) or label not in _FIRST_PASS_LABELS:
             raise ValueError(f"模型返回了无效的 label：{label!r}")
-
-        if entries[representative_id - 1]["source_id"] == "zhihu":
-            non_zhihu_representative = next(
-                (
-                    entry_id
-                    for entry_id in related_ids
-                    if entries[entry_id - 1]["source_id"] != "zhihu"
-                ),
-                None,
-            )
-            if non_zhihu_representative is not None:
-                representative_id = non_zhihu_representative
-                related_ids = [
-                    entry_id
-                    for entry_id in topic_ids
-                    if entry_id != representative_id
-                ]
-
         selected_ids.update(topic_ids)
-        topics.append(
-            {
-                "representative_id": representative_id,
-                "representative": dict(entries[representative_id - 1]),
-                "related_ids": related_ids,
-                "related": [dict(entries[value - 1]) for value in related_ids],
-                "label": label,
-            }
+        return representative_id, list(related_ids), label, topic_ids
+
+    def validated_history(
+        raw_history_id: Any,
+        *,
+        topic_ids: list[int],
+    ) -> dict[str, Any]:
+        if isinstance(raw_history_id, bool) or not isinstance(raw_history_id, int):
+            raise ValueError(f"模型返回了无效的 history_id：{raw_history_id!r}")
+        history_entries = [
+            history_entry
+            for entry_id in topic_ids
+            for history_entry in candidates_by_id[entry_id].get("history") or []
+            if isinstance(history_entry, Mapping)
+        ]
+        allowed_history_ids = {
+            history_entry.get("history_id") for history_entry in history_entries
+        }
+        if raw_history_id not in allowed_history_ids:
+            raise ValueError(
+                f"history_id {raw_history_id!r} 不属于当前话题的本地召回结果"
+            )
+        matched = history_lookup.get(raw_history_id)
+        if matched is None:
+            raise ValueError(f"history_id {raw_history_id!r} 不存在")
+        matched_title = next(
+            str(history_entry.get("title") or "")
+            for history_entry in history_entries
+            if history_entry.get("history_id") == raw_history_id
         )
+        return {**matched, "title": matched_title}
+
+    def claim_matched_event(matched: Mapping[str, Any]) -> None:
+        event_id = str(matched["event_id"])
+        if event_id in matched_event_ids:
+            raise ValueError(f"模型把同一历史事件拆成了多个话题：{event_id}")
+        matched_event_ids.add(event_id)
+
+    def mapped_topic(
+        representative_id: int,
+        related_ids: list[int],
+        label: str,
+        *,
+        relation: str,
+        matched: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        topic = {
+            "representative_id": representative_id,
+            "representative": dict(entries[representative_id - 1]),
+            "related_ids": related_ids,
+            "related": [dict(entries[value - 1]) for value in related_ids],
+            "label": label,
+            "event_relation": relation,
+        }
+        if matched is not None:
+            topic["matched_event_id"] = matched["event_id"]
+            topic["matched_history_title"] = matched["title"]
+        return topic
+
+    for raw_topic in raw_topics:
+        representative_id, related_ids, label, topic_ids = validated_identity(raw_topic)
+        relation = raw_topic.get("relation")
+        raw_history_id = raw_topic.get("history_id")
+        if relation == "new":
+            if raw_history_id is not None:
+                raise ValueError("new 话题的 history_id 必须为 null")
+            matched = None
+        elif relation == "update":
+            matched = validated_history(
+                raw_history_id,
+                topic_ids=topic_ids,
+            )
+            claim_matched_event(matched)
+        else:
+            raise ValueError(f"模型返回了无效的 relation：{relation!r}")
+        topics.append(
+            mapped_topic(
+                representative_id,
+                related_ids,
+                label,
+                relation=relation,
+                matched=matched,
+            )
+        )
+
+    for raw_topic in raw_seen_topics:
+        representative_id, related_ids, label, topic_ids = validated_identity(raw_topic)
+        matched = validated_history(
+            raw_topic.get("history_id"),
+            topic_ids=topic_ids,
+        )
+        claim_matched_event(matched)
+        seen_topics.append(
+            mapped_topic(
+                representative_id,
+                related_ids,
+                label,
+                relation="seen",
+                matched=matched,
+            )
+        )
+
+    ignored_titles = [
+        candidate["title"]
+        for candidate in candidates
+        if candidate["id"] not in selected_ids
+    ]
+    record_first_pass(
+        state_path,
+        history_state,
+        exact_titles=exact_titles,
+        ignored_titles=ignored_titles,
+        seen_topics=seen_topics,
+        at=evaluated_at,
+    )
 
     return {
         "input_count": len(entries),
         "cached_count": cached_count,
         "candidate_count": len(candidates),
         "topic_count": len(topics),
+        "seen_count": len(seen_topics),
         "topics": topics,
-        "cache_file": str(cache_path),
+        "seen_topics": seen_topics,
+        "history_file": str(state_path),
+        "history_event_count": history_stats["active_event_count"],
+        "history_match_count": history_stats["history_match_count"],
+        "history_prompt_chars": history_stats["history_prompt_chars"],
         "inference": {
             "provider": response.provider,
             "model": response.model,
@@ -270,9 +386,36 @@ def _save_first_pass_selection(
                 "title": str(representative.get("title") or ""),
                 "source": str(representative.get("source_id") or ""),
                 "label": str(topic.get("label") or ""),
+                "relation": str(topic.get("event_relation") or "new"),
+                "matched_history_title": str(
+                    topic.get("matched_history_title") or ""
+                ),
                 "related_titles": [
                     str(item.get("title") or "")
                     for item in related
+                    if isinstance(item, Mapping)
+                ],
+            }
+        )
+
+    seen_items = []
+    for topic in selection.get("seen_topics") or []:
+        if not isinstance(topic, Mapping):
+            continue
+        representative = topic.get("representative")
+        if not isinstance(representative, Mapping):
+            continue
+        seen_items.append(
+            {
+                "title": str(representative.get("title") or ""),
+                "source": str(representative.get("source_id") or ""),
+                "label": str(topic.get("label") or ""),
+                "matched_history_title": str(
+                    topic.get("matched_history_title") or ""
+                ),
+                "related_titles": [
+                    str(item.get("title") or "")
+                    for item in topic.get("related") or []
                     if isinstance(item, Mapping)
                 ],
             }
@@ -288,9 +431,14 @@ def _save_first_pass_selection(
         "cached_count": selection.get("cached_count"),
         "candidate_count": selection.get("candidate_count"),
         "topic_count": len(items),
-        "cache_file": selection.get("cache_file"),
+        "seen_count": len(seen_items),
+        "history_file": selection.get("history_file"),
+        "history_event_count": selection.get("history_event_count"),
+        "history_match_count": selection.get("history_match_count"),
+        "history_prompt_chars": selection.get("history_prompt_chars"),
         "inference": dict(selection.get("inference") or {}),
         "items": items,
+        "seen_items": seen_items,
     }
     path = destination / f"{timestamp}_热榜标题筛选结果.json"
     temporary = path.with_suffix(".json.tmp")
@@ -335,8 +483,11 @@ def learn_hotlist_snapshot(
         supplement_failed=supplement_failed,
         generation_effort=generation_effort,
         supplement_effort=supplement_effort,
+        record_history=True,
     )
     result["selection_file"] = str(selection_file)
+    result["history_file"] = str(selection["history_file"])
+    result["seen_count"] = int(selection.get("seen_count") or 0)
     return result
 
 

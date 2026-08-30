@@ -14,7 +14,7 @@ from .sources import bilibili, dates, hupu, tieba
 from .sources.weibo import collect_hot_topic_posts
 
 _RECENT_POST_DAYS = 7
-_QUERY_SEARCH_SOURCES = ("weibo", "bilibili-hot-search")
+_QUERY_SEARCH_SOURCES = ("weibo",)
 
 
 def _load_hotlist(
@@ -473,34 +473,7 @@ def collect_selected_hotlist_evidence(
                 "sources": source_results,
             }
         )
-        retained_direct_titles = [
-            str(attempt[2].get("title") or "").strip()
-            for attempt in retained
-            if attempt[0] is not None and str(attempt[2].get("title") or "").strip()
-        ]
-        evidence_titles = [
-            str(item.get("title") or "").strip()
-            for item in compact["items"]
-            if str(item.get("title") or "").strip()
-        ]
-        representative_is_zhihu = representative.get("source_id") == "zhihu"
-        display_title = next(
-            (
-                title
-                for title in [
-                    *retained_direct_titles,
-                    *reversed(evidence_titles),
-                    *_topic_search_queries(raw_topic, entries),
-                    (
-                        ""
-                        if representative_is_zhihu
-                        else str(representative.get("title") or "").strip()
-                    ),
-                ]
-                if title
-            ),
-            "",
-        )
+        display_title = str(representative.get("title") or "").strip()
         attempts: list[dict[str, Any]] = []
         for entry_id, source_id, item, detail, _ in topic_attempts:
             detail = detail if isinstance(detail, Mapping) else {}
@@ -521,6 +494,8 @@ def collect_selected_hotlist_evidence(
                 "topic_id": representative_id,
                 "title": display_title,
                 "label": str(raw_topic.get("label") or ""),
+                "event_relation": str(raw_topic.get("event_relation") or "new"),
+                "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
                 "related_titles": [
                     str(entries[entry_id - 1].get("title") or "")
                     for entry_id in raw_topic.get("related_ids") or []

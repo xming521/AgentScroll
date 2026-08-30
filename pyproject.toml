@@ -12,6 +12,7 @@ dependencies = [
   "APScheduler>=3.11.3,<4",
   "click>=8.0.0",
   "httpx",
+  "jieba",
   "loguru>=0.7.3",
   "mcp-server-weibo>=1.2.0,<2",
   "openai==1.87.0",

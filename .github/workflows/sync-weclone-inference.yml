@@ -63,10 +63,20 @@ jobs:
           if not source.is_dir():
               raise SystemExit(f"Upstream inference directory does not exist: {source}")
 
+          local_overrides = {
+              Path("__init__.py"),
+              Path("audit.py"),
+              Path("llm_client.py"),
+          }
+          excluded_upstream_files = {Path("online_infer.py")}
           source_files = {
               path.relative_to(source): path
               for path in source.rglob("*")
-              if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+              if path.is_file()
+              and "__pycache__" not in path.parts
+              and path.suffix != ".pyc"
+              and path.relative_to(source) not in local_overrides
+              and path.relative_to(source) not in excluded_upstream_files
           }
           if not source_files:
               raise SystemExit(f"No inference source files found under: {source}")
@@ -75,7 +85,7 @@ jobs:
           for existing in sorted(target.rglob("*"), reverse=True):
               relative = existing.relative_to(target)
               if existing.is_file() or existing.is_symlink():
-                  if relative not in source_files:
+                  if relative not in source_files and relative not in local_overrides:
                       existing.unlink()
               elif existing.is_dir() and not any(existing.iterdir()):
                   existing.rmdir()
@@ -97,6 +107,10 @@ jobs:
               "source_path": os.environ["UPSTREAM_PATH"],
               "commit": commit,
               "files": hashes,
+              "local_overrides": sorted(str(path) for path in local_overrides),
+              "excluded_upstream_files": sorted(
+                  str(path) for path in excluded_upstream_files
+              ),
           }
           metadata_path = target.parent / "inference.upstream.json"
           metadata_path.write_text(

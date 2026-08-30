@@ -22,6 +22,8 @@ def search_xiaohongshu(
     from_date: str,
     to_date: str,
     depth: str = "default",
+    *,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """搜索小红书笔记。
 
@@ -30,11 +32,18 @@ def search_xiaohongshu(
         from_date: 起始日期 YYYY-MM-DD
         to_date: 结束日期 YYYY-MM-DD
         depth: 搜索深度 quick/default/deep
+        limit: 不超过当前深度上限的候选条目数
     Returns:
         小红书笔记列表
     """
     limit_map = {"quick": 5, "default": 10, "deep": 20}
-    limit = limit_map.get(depth, 10)
+    depth_limit = limit_map.get(depth, 10)
+    if limit is None:
+        limit = depth_limit
+    elif limit <= 0:
+        raise ValueError("limit 必须大于 0")
+    else:
+        limit = min(limit, depth_limit)
 
     items: List[Dict[str, Any]] = []
 

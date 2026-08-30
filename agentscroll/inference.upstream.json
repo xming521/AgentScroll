@@ -4,5 +4,13 @@
   "source_path": "weclone/core/inference",
   "commit": null,
   "base_commit": "87679d6687557abc8e4d5be33d19308cb969073d",
-  "note": "Initial snapshot copied from the local WeClone worktree; the sync workflow replaces this with an exact upstream commit."
+  "local_overrides": [
+    "__init__.py",
+    "audit.py",
+    "llm_client.py"
+  ],
+  "excluded_upstream_files": [
+    "online_infer.py"
+  ],
+  "note": "Initial snapshot copied from the local WeClone worktree; synchronization preserves the listed local overrides and exclusions."
 }

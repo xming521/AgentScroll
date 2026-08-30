@@ -27,7 +27,6 @@ NEWSNOW_GROUPS: dict[str, tuple[str, ...]] = {
         "weibo",
         "hupu",
         "tieba",
-        "bilibili-hot-search",
         "zhihu",
     ),
     "社媒": ("weibo",),

@@ -3,10 +3,8 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from threading import Lock
 from typing import Any, Iterable, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -22,14 +20,13 @@ from ._common import (
     openrouter_proxy_url,
     project_root,
 )
+from .audit import LLMAuditCall, LLMAuditLogger
 
 ProviderName = Literal["codex_exec", "api"]
 Message = dict[str, str]
 ParsedJson = dict[str, Any] | list[Any]
 RUNTIME_ROOT = project_root()
-LLM_REQUEST_LOG_DIR = RUNTIME_ROOT / "outputs" / "logs" / "llm_requests"
 CODEX_EXEC_RUN_DIR = RUNTIME_ROOT / "outputs" / "logs" / "codex_exec"
-_LLM_REQUEST_LOG_LOCK = Lock()
 
 
 @dataclass
@@ -99,27 +96,42 @@ def messages_to_prompt(messages: list[Message]) -> str:
     return "\n\n".join(rendered)
 
 
-def _log_llm_request(request: LLMRequest, *, provider: str, model: str) -> None:
-    now = datetime.now().astimezone()
-    log_path = LLM_REQUEST_LOG_DIR / f"{now:%Y-%m-%d}.log"
-    payload = {
-        "timestamp": now.isoformat(timespec="milliseconds"),
-        "provider": provider,
-        "model": model,
-        "raw_input": {
-            "messages": request.messages,
-            "prompt": messages_to_prompt(request.messages),
-        },
-        "request": asdict(request),
+def _response_audit_payload(response: LLMResponse) -> dict[str, Any]:
+    return {
+        "ok": response.ok,
+        "text": response.text,
+        "error": response.error,
+        "parsed_json": response.parsed_json,
+        "provider": response.provider,
+        "model": response.model,
+        "elapsed_s": response.elapsed_s,
+        "cost_usd": response.cost_usd,
+        "finish_reason": response.finish_reason,
+        "metadata": response.metadata,
     }
-    try:
-        line = json.dumps(payload, ensure_ascii=False, default=str)
-        with _LLM_REQUEST_LOG_LOCK:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-    except Exception as exc:
-        logger.warning(f"Failed to write LLM request log: {type(exc).__name__}: {exc}")
+
+
+def _finish_audit(call: LLMAuditCall, response: LLMResponse) -> LLMResponse:
+    call.finish(_response_audit_payload(response))
+    return response
+
+
+def _provider_request_id(raw: Any) -> str | None:
+    value = getattr(raw, "_request_id", None)
+    return str(value) if value else None
+
+
+def _api_response_metadata(raw: Any) -> dict[str, Any]:
+    usage = getattr(raw, "usage", None)
+    if usage is None:
+        return {}
+    model_dump = getattr(usage, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return {"usage": model_dump(mode="json")}
+        except TypeError:
+            return {"usage": model_dump()}
+    return {"usage": usage}
 
 
 def make_request(prompt: PromptLike, **kwargs: Any) -> LLMRequest:
@@ -264,12 +276,14 @@ class OpenAICompatibleClient(BaseBatchMixin):
         model: str | None = None,
         max_workers: int = 10,
         timeout: int = API_TIMEOUT_SECONDS,
+        audit_logger: LLMAuditLogger | None = None,
     ):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.max_workers = max_workers
         self.timeout = timeout
+        self.audit_logger = audit_logger or LLMAuditLogger()
         self.is_deepseek_api = _is_deepseek_api(base_url)
         proxy_url = openrouter_proxy_url(base_url or "")
         self.http_client = (
@@ -284,132 +298,234 @@ class OpenAICompatibleClient(BaseBatchMixin):
         )
 
     def generate(self, request: LLMRequest) -> LLMResponse:
-        model = self.model
-        if not model:
-            raise ValueError("model is required for api backend")
-        _log_llm_request(request, provider=self.provider, model=model)
+        model = self.model or ""
+        with self.audit_logger.start_call(
+            request=request,
+            provider=self.provider,
+            model=model,
+            backend={"base_url": self.base_url},
+        ) as audit_call:
+            if not model:
+                raise ValueError("model is required for api backend")
 
-        params: dict[str, Any] = {
-            "model": model,
-            "messages": request.messages,
-            "stream": request.stream,
-        }
-        if request.max_tokens is not None:
-            params["max_tokens"] = request.max_tokens
-        if request.temperature is not None:
-            params["temperature"] = request.temperature
-        if request.top_p is not None:
-            params["top_p"] = request.top_p
-        extra_body = dict(request.extra_body or {})
-        if extra_body:
-            params["extra_body"] = extra_body
-        if request.timeout is not None:
-            params["timeout"] = request.timeout
-        if request.json_schema:
-            if self.is_deepseek_api:
+            params: dict[str, Any] = {
+                "model": model,
+                "messages": request.messages,
+                "stream": request.stream,
+            }
+            if request.max_tokens is not None:
+                params["max_tokens"] = request.max_tokens
+            if request.temperature is not None:
+                params["temperature"] = request.temperature
+            if request.top_p is not None:
+                params["top_p"] = request.top_p
+            extra_body = dict(request.extra_body or {})
+            if extra_body:
+                params["extra_body"] = extra_body
+            if request.timeout is not None:
+                params["timeout"] = request.timeout
+            if request.json_schema:
+                if self.is_deepseek_api:
+                    params["response_format"] = {"type": "json_object"}
+                else:
+                    params["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "llm_response",
+                            "schema": request.json_schema,
+                            "strict": True,
+                        },
+                    }
+            elif request.json_mode:
                 params["response_format"] = {"type": "json_object"}
-            else:
-                params["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "llm_response",
-                        "schema": request.json_schema,
-                        "strict": True,
-                    },
-                }
-        elif request.json_mode:
-            params["response_format"] = {"type": "json_object"}
 
-        t0 = time.time()
-        empty_json_retries = 0
-        for attempt in range(OPENAI_API_MAX_RETRIES + 1):
-            try:
-                raw = self.client.chat.completions.create(**params)
+            t0 = time.time()
+            empty_json_retries = 0
+            for attempt_index in range(OPENAI_API_MAX_RETRIES + 1):
+                attempt = attempt_index + 1
+                audit_call.start_attempt(
+                    attempt,
+                    parameters={
+                        key: value for key, value in params.items() if key != "messages"
+                    },
+                )
+                try:
+                    raw = self.client.chat.completions.create(**params)
+                except BadRequestError as exc:
+                    response_format = params.get("response_format")
+                    will_retry = bool(
+                        request.json_schema
+                        and isinstance(response_format, dict)
+                        and response_format.get("type") == "json_schema"
+                        and _response_format_type_unavailable(exc)
+                    )
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="failed",
+                        error=exc,
+                        provider_request_id=getattr(exc, "request_id", None),
+                        will_retry=will_retry,
+                        retry_reason="json_schema_unsupported" if will_retry else None,
+                    )
+                    if will_retry:
+                        params["response_format"] = {"type": "json_object"}
+                        logger.warning(
+                            "OpenAI-compatible API does not support response_format "
+                            "type json_schema; falling back to json_object"
+                        )
+                        continue
+                    elapsed = round(time.time() - t0, 3)
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=elapsed,
+                        ),
+                    )
+                except Exception as exc:
+                    will_retry = attempt_index < OPENAI_API_MAX_RETRIES
+                    delay = calculate_retry_delay(attempt_index) if will_retry else None
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="failed",
+                        error=exc,
+                        provider_request_id=getattr(exc, "request_id", None),
+                        will_retry=will_retry,
+                        retry_reason="provider_error" if will_retry else None,
+                        retry_delay_s=delay,
+                    )
+                    if will_retry and delay is not None:
+                        logger.warning(
+                            f"OpenAI-compatible API failed: {type(exc).__name__}: {exc}; "
+                            f"retry {attempt}/{OPENAI_API_MAX_RETRIES + 1} after {delay:.2f}s"
+                        )
+                        time.sleep(delay)
+                        continue
+                    elapsed = round(time.time() - t0, 3)
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=elapsed,
+                        ),
+                    )
+
                 elapsed = round(time.time() - t0, 3)
-                choice = raw.choices[0]
-                text = choice.message.content
+                provider_request_id = _provider_request_id(raw)
+                try:
+                    choice = raw.choices[0]
+                    text = choice.message.content
+                except Exception as exc:
+                    will_retry = attempt_index < OPENAI_API_MAX_RETRIES
+                    delay = calculate_retry_delay(attempt_index) if will_retry else None
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="invalid_response",
+                        response=raw,
+                        error=exc,
+                        provider_request_id=provider_request_id,
+                        will_retry=will_retry,
+                        retry_reason="invalid_response" if will_retry else None,
+                        retry_delay_s=delay,
+                    )
+                    if will_retry and delay is not None:
+                        logger.warning(
+                            f"OpenAI-compatible API returned an invalid response: "
+                            f"{type(exc).__name__}: {exc}; retry {attempt}/"
+                            f"{OPENAI_API_MAX_RETRIES + 1} after {delay:.2f}s"
+                        )
+                        time.sleep(delay)
+                        continue
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            error=f"invalid response: {type(exc).__name__}: {exc}",
+                            raw=raw,
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=elapsed,
+                            metadata=_api_response_metadata(raw),
+                        ),
+                    )
+
                 if not (text or "").strip():
-                    if (
+                    will_retry = bool(
                         (request.json_schema or request.json_mode)
                         and empty_json_retries < 1
-                    ):
+                    )
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="empty_response",
+                        response=raw,
+                        provider_request_id=provider_request_id,
+                        will_retry=will_retry,
+                        retry_reason="empty_json" if will_retry else None,
+                    )
+                    if will_retry:
                         empty_json_retries += 1
                         logger.warning(
                             "OpenAI-compatible API returned empty JSON content; "
                             "retrying once"
                         )
                         continue
-                    return LLMResponse(
-                        ok=False,
-                        text=text,
-                        error="empty response",
-                        raw=raw,
-                        provider=self.provider,
-                        model=model,
-                        elapsed_s=elapsed,
-                        finish_reason=choice.finish_reason,
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            text=text,
+                            error="empty response",
+                            raw=raw,
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=elapsed,
+                            finish_reason=choice.finish_reason,
+                            metadata=_api_response_metadata(raw),
+                        ),
                     )
+
+                audit_call.finish_attempt(
+                    attempt,
+                    status="succeeded",
+                    response=raw,
+                    provider_request_id=provider_request_id,
+                )
                 try:
                     parsed_json = _maybe_parse_response_json(request, text)
                 except Exception as exc:
-                    return LLMResponse(
-                        ok=False,
-                        text=text,
-                        error=f"json parse fail: {type(exc).__name__}: {exc}",
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            text=text,
+                            error=f"json parse fail: {type(exc).__name__}: {exc}",
+                            raw=raw,
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=elapsed,
+                            finish_reason=choice.finish_reason,
+                            metadata=_api_response_metadata(raw),
+                        ),
+                    )
+                return _finish_audit(
+                    audit_call,
+                    LLMResponse(
+                        ok=True,
+                        text=text.strip(),
+                        parsed_json=parsed_json,
                         raw=raw,
                         provider=self.provider,
                         model=model,
                         elapsed_s=elapsed,
                         finish_reason=choice.finish_reason,
-                    )
-                return LLMResponse(
-                    ok=True,
-                    text=text.strip(),
-                    parsed_json=parsed_json,
-                    raw=raw,
-                    provider=self.provider,
-                    model=model,
-                    elapsed_s=elapsed,
-                    finish_reason=choice.finish_reason,
-                )
-            except BadRequestError as exc:
-                response_format = params.get("response_format")
-                if (
-                    request.json_schema
-                    and isinstance(response_format, dict)
-                    and response_format.get("type") == "json_schema"
-                    and _response_format_type_unavailable(exc)
-                ):
-                    params["response_format"] = {"type": "json_object"}
-                    logger.warning(
-                        "OpenAI-compatible API does not support response_format "
-                        "type json_schema; falling back to json_object"
-                    )
-                    continue
-                elapsed = round(time.time() - t0, 3)
-                return LLMResponse(
-                    ok=False,
-                    error=f"{type(exc).__name__}: {exc}",
-                    provider=self.provider,
-                    model=model,
-                    elapsed_s=elapsed,
-                )
-            except Exception as exc:
-                if attempt < OPENAI_API_MAX_RETRIES:
-                    delay = calculate_retry_delay(attempt)
-                    logger.warning(
-                        f"OpenAI-compatible API failed: {type(exc).__name__}: {exc}; "
-                        f"retry {attempt + 1}/{OPENAI_API_MAX_RETRIES + 1} after {delay:.2f}s"
-                    )
-                    time.sleep(delay)
-                    continue
-                elapsed = round(time.time() - t0, 3)
-                return LLMResponse(
-                    ok=False,
-                    error=f"{type(exc).__name__}: {exc}",
-                    provider=self.provider,
-                    model=model,
-                    elapsed_s=elapsed,
+                        metadata=_api_response_metadata(raw),
+                    ),
                 )
 
     def close(self) -> None:
@@ -438,6 +554,7 @@ class CodexExecClient(BaseBatchMixin):
         cwd: str | Path | None = None,
         extra_args: Iterable[str] | None = None,
         enable_web_search: bool = False,
+        audit_logger: LLMAuditLogger | None = None,
     ):
         self.model = model
         self.effort = effort
@@ -449,6 +566,7 @@ class CodexExecClient(BaseBatchMixin):
         self.requests_dir = CODEX_EXEC_RUN_DIR / "requests"
         self.extra_args = list(extra_args or [])
         self.enable_web_search = enable_web_search
+        self.audit_logger = audit_logger or LLMAuditLogger()
 
     def _build_command(
         self,
@@ -492,136 +610,216 @@ class CodexExecClient(BaseBatchMixin):
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         model = request.model or self.model or ""
-        prompt = messages_to_prompt(request.messages)
         timeout = request.timeout or self.timeout
-        _log_llm_request(request, provider=self.provider, model=model)
-        t0 = time.time()
-
-        self.requests_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="request-",
-            dir=self.requests_dir,
-            ignore_cleanup_errors=True,
-        ) as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            output_path = tmp_path / "last_message.txt"
-            schema_path = None
-            if request.json_schema:
-                schema_path = tmp_path / "output_schema.json"
-                schema_path.write_text(
-                    json.dumps(request.json_schema, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            cmd = self._build_command(
-                request,
-                output_path=output_path,
-                schema_path=schema_path,
-                cwd=self.cwd,
-            )
-
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                return LLMResponse(
-                    ok=False,
-                    error=f"timeout>{timeout}s",
-                    provider=self.provider,
-                    model=model,
-                    elapsed_s=round(time.time() - t0, 3),
-                )
-
-            output_text = ""
-            if output_path.exists():
-                output_text = output_path.read_text(encoding="utf-8").strip()
-
-        elapsed = round(time.time() - t0, 3)
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        usage: dict[str, int] = {}
-        web_search_calls = 0
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = event.get("item")
-            if (
-                event.get("type") == "item.completed"
-                and isinstance(item, dict)
-                and item.get("type") == "web_search"
-            ):
-                web_search_calls += 1
-            if event.get("type") != "turn.completed":
-                continue
-            raw_usage = event.get("usage")
-            if not isinstance(raw_usage, dict):
-                continue
-            usage = {
-                str(key): value
-                for key, value in raw_usage.items()
-                if isinstance(value, int) and not isinstance(value, bool)
-            }
-        metadata: dict[str, Any] = {}
-        if usage:
-            metadata["usage"] = usage
-        if self.enable_web_search:
-            metadata["web_search_calls"] = web_search_calls
-
-        if proc.returncode != 0:
-            detail = output_text or stdout[:400]
-            blob = f"{stderr} || {detail}"
-            return LLMResponse(
-                ok=False,
-                error=f"returncode={proc.returncode}[{_classify_error(blob)}]: {blob[:400]}",
-                raw={"stdout": stdout, "stderr": stderr, "output": output_text},
-                provider=self.provider,
-                model=model,
-                elapsed_s=elapsed,
-                metadata=metadata,
-            )
-
-        text = output_text or stdout
-        if not text:
-            return LLMResponse(
-                ok=False,
-                error="empty response",
-                raw={"stdout": stdout, "stderr": stderr},
-                provider=self.provider,
-                model=model,
-                elapsed_s=elapsed,
-                metadata=metadata,
-            )
-        try:
-            parsed_json = _maybe_parse_response_json(request, text)
-        except Exception as exc:
-            return LLMResponse(
-                ok=False,
-                text=text,
-                error=f"json parse fail: {type(exc).__name__}: {exc}",
-                raw={"stdout": stdout, "stderr": stderr, "output": output_text},
-                provider=self.provider,
-                model=model,
-                elapsed_s=elapsed,
-                metadata=metadata,
-            )
-
-        return LLMResponse(
-            ok=True,
-            text=text.strip(),
-            parsed_json=parsed_json,
-            raw={"stdout": stdout, "stderr": stderr, "output": output_text},
+        with self.audit_logger.start_call(
+            request=request,
             provider=self.provider,
             model=model,
-            elapsed_s=elapsed,
-            metadata=metadata,
-        )
+            backend={
+                "command": self.command,
+                "cwd": self.cwd,
+                "sandbox": self.sandbox,
+                "enable_web_search": self.enable_web_search,
+                "extra_args": self.extra_args,
+            },
+        ) as audit_call:
+            prompt = messages_to_prompt(request.messages)
+            t0 = time.time()
+            attempt = 1
+
+            self.requests_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="request-",
+                dir=self.requests_dir,
+                ignore_cleanup_errors=True,
+            ) as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                output_path = tmp_path / "last_message.txt"
+                schema_path = None
+                if request.json_schema:
+                    schema_path = tmp_path / "output_schema.json"
+                    schema_path.write_text(
+                        json.dumps(request.json_schema, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                cmd = self._build_command(
+                    request,
+                    output_path=output_path,
+                    schema_path=schema_path,
+                    cwd=self.cwd,
+                )
+
+                audit_call.start_attempt(
+                    attempt,
+                    parameters={
+                        "model": model,
+                        "effort": request.effort or self.effort,
+                        "timeout": timeout,
+                        "sandbox": self.sandbox,
+                        "cwd": self.cwd,
+                        "json_schema": request.json_schema,
+                        "enable_web_search": self.enable_web_search,
+                        "extra_args": self.extra_args,
+                    },
+                )
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="timeout",
+                        error=exc,
+                    )
+                    return _finish_audit(
+                        audit_call,
+                        LLMResponse(
+                            ok=False,
+                            error=f"timeout>{timeout}s",
+                            provider=self.provider,
+                            model=model,
+                            elapsed_s=round(time.time() - t0, 3),
+                        ),
+                    )
+                except Exception as exc:
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="failed",
+                        error=exc,
+                    )
+                    raise
+
+                output_text = ""
+                try:
+                    if output_path.exists():
+                        output_text = output_path.read_text(encoding="utf-8").strip()
+                except Exception as exc:
+                    audit_call.finish_attempt(
+                        attempt,
+                        status="failed",
+                        response={
+                            "returncode": proc.returncode,
+                            "stdout": proc.stdout,
+                            "stderr": proc.stderr,
+                        },
+                        error=exc,
+                    )
+                    raise
+
+            elapsed = round(time.time() - t0, 3)
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            raw_response = {
+                "returncode": proc.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "output": output_text,
+            }
+            audit_call.finish_attempt(
+                attempt,
+                status="succeeded" if proc.returncode == 0 else "failed",
+                response=raw_response,
+            )
+
+            usage: dict[str, int] = {}
+            web_search_calls = 0
+            for line in stdout.splitlines():
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                item = event.get("item")
+                if (
+                    event.get("type") == "item.completed"
+                    and isinstance(item, dict)
+                    and item.get("type") == "web_search"
+                ):
+                    web_search_calls += 1
+                if event.get("type") != "turn.completed":
+                    continue
+                raw_usage = event.get("usage")
+                if not isinstance(raw_usage, dict):
+                    continue
+                usage = {
+                    str(key): value
+                    for key, value in raw_usage.items()
+                    if isinstance(value, int) and not isinstance(value, bool)
+                }
+            metadata: dict[str, Any] = {}
+            if usage:
+                metadata["usage"] = usage
+            if self.enable_web_search:
+                metadata["web_search_calls"] = web_search_calls
+
+            if proc.returncode != 0:
+                detail = output_text or stdout[:400]
+                blob = f"{stderr} || {detail}"
+                return _finish_audit(
+                    audit_call,
+                    LLMResponse(
+                        ok=False,
+                        error=(
+                            f"returncode={proc.returncode}[{_classify_error(blob)}]: "
+                            f"{blob[:400]}"
+                        ),
+                        raw=raw_response,
+                        provider=self.provider,
+                        model=model,
+                        elapsed_s=elapsed,
+                        metadata=metadata,
+                    ),
+                )
+
+            text = output_text or stdout
+            if not text:
+                return _finish_audit(
+                    audit_call,
+                    LLMResponse(
+                        ok=False,
+                        error="empty response",
+                        raw=raw_response,
+                        provider=self.provider,
+                        model=model,
+                        elapsed_s=elapsed,
+                        metadata=metadata,
+                    ),
+                )
+            try:
+                parsed_json = _maybe_parse_response_json(request, text)
+            except Exception as exc:
+                return _finish_audit(
+                    audit_call,
+                    LLMResponse(
+                        ok=False,
+                        text=text,
+                        error=f"json parse fail: {type(exc).__name__}: {exc}",
+                        raw=raw_response,
+                        provider=self.provider,
+                        model=model,
+                        elapsed_s=elapsed,
+                        metadata=metadata,
+                    ),
+                )
+
+            return _finish_audit(
+                audit_call,
+                LLMResponse(
+                    ok=True,
+                    text=text.strip(),
+                    parsed_json=parsed_json,
+                    raw=raw_response,
+                    provider=self.provider,
+                    model=model,
+                    elapsed_s=elapsed,
+                    metadata=metadata,
+                ),
+            )
 
     def close(self) -> None:
         return None
@@ -680,6 +878,7 @@ def build_llm_client(
     effort: str = "low",
     command: str = "codex",
     sandbox: str = "read-only",
+    audit_logger: LLMAuditLogger | None = None,
 ) -> LLMClient:
     normalized_provider = normalize_provider(provider)
     resolved_model = model or model_name
@@ -692,6 +891,7 @@ def build_llm_client(
             timeout=timeout or 120,
             command=command,
             sandbox=sandbox,
+            audit_logger=audit_logger,
         )
 
     if config_path is not None:
@@ -718,12 +918,14 @@ def build_llm_client(
         model=str(resolved_model),
         max_workers=max_workers,
         timeout=timeout or API_TIMEOUT_SECONDS,
+        audit_logger=audit_logger,
     )
 
 
 __all__ = [
     "CodexExecClient",
     "LLMClient",
+    "LLMAuditLogger",
     "LLMRequest",
     "LLMResponse",
     "OpenAICompatibleClient",

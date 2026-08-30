@@ -25,6 +25,17 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 可通过 `AGENTSCROLL_INFERENCE_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
 
+### 推理审计日志
+
+同步 LLM 调用默认写入 `outputs/logs/llm_audit/YYYY-MM-DD.jsonl`，文件权限为 `600`。每次逻辑调用使用一个 `call_id` 串联以下事件：
+
+- `call.started`：完整 `LLMRequest` 和后端通用参数。
+- `attempt.started`：本次实际 provider 请求采用的参数，不重复保存 messages。
+- `attempt.finished`：响应或异常、耗时、provider request ID，以及是否重试和重试原因。
+- `call.finished`：最终 `LLMResponse`、解析结果、usage、总耗时和最终错误。
+
+审计记录会按结构化字段名遮盖 API Key、Authorization、Cookie、密码和访问令牌；messages 与模型响应按原文保留。直接把 `agentscroll.inference` 用作基础设施库时，默认目录是项目根下的 `logs/llm_audit`，可通过通用环境变量 `LLM_AUDIT_LOG_DIR` 或注入 `LLMAuditLogger` 修改。`LLMAuditLogger(strict=True)` 可让审计写入失败直接阻止请求；默认只告警，不中断推理。
+
 ## 主题搜索
 
 ### CLI
@@ -159,7 +170,7 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 
 ### 拉取榜单
 
-不传 `--groups` 时默认使用“综合”组，依次包括微博（`weibo`）、虎扑（`hupu`）、百度贴吧（`tieba`）、Bilibili 热搜（`bilibili-hot-search`）和知乎（`zhihu`）。
+不传 `--groups` 时默认使用“综合”组，依次包括微博（`weibo`）、虎扑（`hupu`）、百度贴吧（`tieba`）和知乎（`zhihu`）。
 
 ```bash
 # 查看全部类别及其 Source ID
@@ -272,19 +283,21 @@ docker compose down
   --share-output-dir outputs/shares
 ```
 
-两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。同一话题存在其他平台标题时以非知乎标题为代表并直接采集；只有整组标题都来自知乎时，才批量生成微博和 Bilibili 检索词。知识卡证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子。
+两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。模型选出的代表标题保持不变，正文采集独立优先使用同话题的非知乎入口；只有整组标题都来自知乎时，才批量生成检索词并只到微博补采。最后的主动搜索复用 `agentscroll search` 的采集入口：`news` 搜微博、微信公众号和今日头条，`fun` 搜微博和小红书，每个话题最多保留 3 条实际读到正文的内容。第一轮证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子；主动搜索沿用同一查询日期范围，并过滤已知日期超出范围的内容。
 
 常用参数与产物：
 
 - 第一轮最多选择 15 个话题。
-- 第一轮实际发送给模型的标题会追加到热榜快照所在目录的 `hotlist_title_cache.txt`；后续筛选会按 Unicode 兼容字符、大小写和连续空白规范化后跳过命中标题。没有新标题时不调用筛选模型。
+- 热榜快照目录的 `hotlist_history.json` 同时保存近期未选标题和事件真实标题。后续筛选先按 Unicode 兼容字符、大小写和连续空白规范化后跳过完全相同的标题，再在本地为每个新标题召回最多 3 个相似历史事件；没有新标题时不调用筛选模型。历史窗口为快照日期及其之前连续 7 个自然日。
+- `hotlist_history.json` 的 `ignored_titles` 保存未选标题及最近出现时间；`events` 中每项保存稳定的 `event_id`、`label`、首末出现时间、最终状态、真实标题数组，以及当前知识卡的 `current_card_file` 和 `current_topic_id`。旧事件仍可保留，但只有窗口内标题参与匹配。
+- 第一轮模型在原有一次请求中同时返回 `new`、`update` 和 `seen`。`seen` 不再采集；`new` 生成新卡，`update` 读取历史事件当前卡片后验证是否确有进展。每个当前标题最多召回 3 个历史事件，不限制所有召回标题的合计字符数，也不生成摘要或 signature。
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享目录。
-- 一次运行先保存一份标题筛选 JSON，再保存一份批次 JSON、一份批次 TXT 和一份最终分享队列。标题筛选文件中的 `items` 仅保留代表标题 `title`、代表平台 `source`、类别 `label` 和同话题标题 `related_titles`，并记录输入标题数、缓存命中数、实际发送数、缓存文件、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
-- 批次 JSON 记录全部话题的 `complete`、`needs_research`、`rejected` 状态；`rejected` 话题通过 `rejection_reason` 保留淘汰原因，但没有知识内容，也不会进入分享队列。
-- 每张卡片用顶层 `share_score` 记录 0 至 10 的分享评分；低于 7 分时 `share` 为 `null`，达到 7 分时 `share` 才包含分享文字、来源和评论选择。
-- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因、公共搜索请求数和原生 Web Search 次数。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
+- 一次运行先保存一份标题筛选 JSON，再保存最终分享队列；有 `new` 话题时另存一份只包含新卡的批次 JSON 和 TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、事件关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、历史文件、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
+- 新卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 不进入新批次，而是在原卡中改写 `knowledge` 并替换 `latest_update`；该对象保存更新时间、当前标题、本次进展摘要及本次证据。证据不足或被淘汰的更新不改原卡。
+- 每张卡片用顶层 `share_score` 记录 0 分或 1 至 4 分的分享评分，最多保留一位小数；低于 3 分时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
+- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。
 
@@ -297,7 +310,7 @@ uv pip install --python .venv/bin/python playwright
 .venv/bin/python -m playwright install chromium
 ```
 
-`jieba` 是用于提升中文相关性排序的可选依赖。
+`jieba` 随项目安装，用于中文分词和词性加权匹配。
 
 常用环境变量：
 

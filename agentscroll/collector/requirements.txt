@@ -6,5 +6,5 @@ mcp-server-weibo>=1.2.0,<2
 # Optional: browser-based collection for rendered or login-protected platforms.
 playwright
 
-# Optional: better Chinese tokenization. Without it, CJK bigrams are used.
+# Chinese tokenization and part-of-speech matching.
 jieba
