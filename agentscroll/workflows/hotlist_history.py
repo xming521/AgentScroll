@@ -353,11 +353,6 @@ def attach_history_matches(
             word_score = _term_coverage(query_terms, item["terms"], term_idf)
             score = word_score or _cosine(query_bigrams, item["bigrams"], bigram_idf)
             elapsed = _elapsed_since(item["last_seen_at"], at=at)
-            hours_ago = (
-                round(elapsed.total_seconds() / 3600, 1)
-                if elapsed is not None
-                else None
-            )
             recent_same_person = bool(query_people.intersection(item["people"])) and (
                 elapsed is not None and elapsed <= RECENT_PERSON_WINDOW
             )
@@ -367,7 +362,6 @@ def attach_history_matches(
             match = {
                 **item,
                 "score": score,
-                "hours_ago": hours_ago,
                 "recent_same_person": recent_same_person,
             }
             if current is None or (
@@ -416,10 +410,8 @@ def attach_history_matches(
             history_item = {
                 "history_id": history_id,
                 "title": match["title"],
-                "hours_ago": match["hours_ago"],
+                "last_seen_date": str(match["last_seen_at"])[:10],
             }
-            if match["recent_same_person"]:
-                history_item["recent_same_person"] = True
             payload_by_id[candidate_id].setdefault("history", []).append(history_item)
 
     prompt_chars = len(

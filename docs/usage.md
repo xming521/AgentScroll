@@ -297,7 +297,7 @@ docker compose down
 - 一次运行先保存一份标题筛选 JSON，再保存最终分享队列；有 `new` 话题时另存一份只包含新卡的批次 JSON 和 TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、事件关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、历史文件、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
 - 新卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 不进入新批次，而是在原卡中改写 `knowledge` 并替换 `latest_update`；该对象保存更新时间、当前标题、本次进展摘要及本次证据。证据不足或被淘汰的更新不改原卡。
 - 每张卡片用顶层 `share_score` 记录 0 分或 1 至 4 分的分享评分，最多保留一位小数；低于 3 分时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
-- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
+- 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`skipped_empty_evidence_count` 和 `skipped_empty_evidence_topics` 记录第一轮与补搜都没有可读正文、因而跳过模型请求的话题数和话题 ID；`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。
 

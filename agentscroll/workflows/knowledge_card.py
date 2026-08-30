@@ -1655,8 +1655,18 @@ def supplement_hotlist_knowledge_cards(
     for topic in research_topics:
         topic["research_evidence"] = search_results.get(topic["topic_id"], [])
 
+    model_research_topics = [
+        topic
+        for topic in research_topics
+        if topic["evidence"] or topic["research_evidence"]
+    ]
+    skipped_empty_evidence_topics = [
+        topic["topic_id"]
+        for topic in research_topics
+        if not topic["evidence"] and not topic["research_evidence"]
+    ]
     research_cards, supplement_inference = _generate_topic_cards(
-        research_topics,
+        model_research_topics,
         settings=settings,
         research=True,
         max_tokens=8_000,
@@ -1669,6 +1679,12 @@ def supplement_hotlist_knowledge_cards(
     ]
     supplement_inference["web_search_calls"] = 0
     supplement_inference.update(active_search_diagnostics)
+    supplement_inference["skipped_empty_evidence_count"] = len(
+        skipped_empty_evidence_topics
+    )
+    supplement_inference["skipped_empty_evidence_topics"] = (
+        skipped_empty_evidence_topics
+    )
     inference = {
         "initial": dict(initial_result.get("inference") or {}),
         "supplement": supplement_inference,
