@@ -19,6 +19,7 @@ from agentscroll.prompts.knowledge_card import (
     KNOWLEDGE_CARD_RESEARCH_PROMPT,
 )
 from agentscroll.prompts.hotlist import ZHIHU_SEARCH_QUERY_PROMPT
+from agentscroll.sharing.message import render_share_message
 
 _LABEL_ALIASES = {
     "news": "news",
@@ -200,9 +201,9 @@ def _selection_with_zhihu_search_queries(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Generate one batch of non-Zhihu search queries from Zhihu clues."""
     from agentscroll.collector.hotlist import list_hotlist_entries
-    from agentscroll.inference_config import (
+    from agentscroll.config import (
         build_configured_client,
-        load_inference_settings,
+        load_settings,
         make_configured_request,
     )
 
@@ -266,7 +267,7 @@ def _selection_with_zhihu_search_queries(
         f"{ZHIHU_SEARCH_QUERY_PROMPT.strip()}\n\n"
         f"待转换的知乎线索（JSON）：\n{payload}"
     )
-    settings = load_inference_settings(config_path)
+    settings = load_settings(config_path)
     request = make_configured_request(
         prompt,
         settings,
@@ -673,7 +674,7 @@ def _generate_topic_cards(
             "failed_topics": [],
         }
 
-    from agentscroll.inference_config import (
+    from agentscroll.config import (
         build_configured_client,
         make_configured_request,
     )
@@ -1147,19 +1148,6 @@ def _share_documents(
     return shares
 
 
-def _render_share_text(share: Mapping[str, Any]) -> str:
-    comment_label = (
-        "网友评论" if share.get("comment_type") == "platform" else "我的评论"
-    )
-    return "\n".join(
-        (
-            str(share["text"]),
-            str(share["url"]),
-            f"{comment_label}：{share['comment']}",
-        )
-    )
-
-
 def _save_share_batch(
     cards: list[dict[str, Any]],
     *,
@@ -1185,7 +1173,7 @@ def _save_share_batch(
     json_path = destination / f"{timestamp}_即时分享批次.json"
     text_path = destination / f"{timestamp}_即时分享批次.txt"
     serialized_text = "\n\n=====\n\n".join(
-        _render_share_text(share) for share in shares
+        render_share_message(share) for share in shares
     )
     if serialized_text:
         serialized_text += "\n"
@@ -1456,10 +1444,10 @@ def _generate_hotlist_knowledge_cards(
     config_path: str | Path | None = None,
     effort: str = "xhigh",
 ) -> dict[str, Any]:
-    from agentscroll.inference_config import load_inference_settings
+    from agentscroll.config import load_settings
 
     topics = _prompt_payload(evidence)
-    settings = load_inference_settings(config_path)
+    settings = load_settings(config_path)
     minimum_evidence_count = evidence.get("max_entries_per_topic", 1)
     if (
         isinstance(minimum_evidence_count, bool)
@@ -1615,7 +1603,7 @@ def supplement_hotlist_knowledge_cards(
     _save_result: bool = True,
 ) -> dict[str, Any]:
     """Actively collect platform evidence for failed topics and save one batch."""
-    from agentscroll.inference_config import load_inference_settings
+    from agentscroll.config import load_settings
 
     topics = _prompt_payload(evidence)
     initial_cards = _validate_cards(initial_result.get("cards"), topics)
@@ -1644,7 +1632,7 @@ def supplement_hotlist_knowledge_cards(
         result["supplemented_count"] = 0
         return result
 
-    settings = load_inference_settings(config_path)
+    settings = load_settings(config_path)
     days, as_of = _research_date_window(evidence)
     search_results, active_search_diagnostics = _collect_active_search_evidence(
         research_topics,

@@ -2,7 +2,7 @@
 
 本文集中说明 AgentScroll 的配置、CLI、数据格式、平台支持和测试命令。内容处理规则、系统结构、平台采集实现和技术原则见[系统设计与内容规则](design.md)。
 
-## 环境与推理配置
+## 环境与配置
 
 项目要求 Python 3.11 及以上。从仓库运行 Python、pytest 或模块入口时使用 `.venv/bin/python`。
 项目依赖准备完成后，以可编辑方式安装 AgentScroll 并生成 `agentscroll` 命令：
@@ -23,7 +23,7 @@ cp settings.example.jsonc settings.jsonc
 export AGENTSCROLL_LLM_API_KEY='your-api-key'
 ```
 
-可通过 `AGENTSCROLL_INFERENCE_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
+可通过 `AGENTSCROLL_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
 
 ### 推理审计日志
 
@@ -240,6 +240,46 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 
 同一进程最多同时执行一轮。某轮执行时间超过间隔时不会并发启动下一轮；程序停止期间错过的任务不会在重启后回放。服务部署时直接以前台方式运行该命令，由 Docker、systemd 等运行环境负责进程保活。
 
+### AstrBot IM 自动分享
+
+即时分享只随 `hotlist run --scheduled` 或 `hotlist run --every ...` 的常驻进程启用；不带定时参数的一次性 `hotlist run` 和 `hotlist learn` 仍只生成文件，不自动发送。平台无关的分享分发器负责批次选择、限流、延迟调度和持久状态，AstrBot transport 只请求 `POST /api/v1/im/message`，再由 AstrBot 按 UMO 将纯文本消息转发到 QQ、Telegram 等已连接平台，不需要安装 AgentScroll 专用的 AstrBot 插件。
+
+先在 AstrBot 中创建带 `im` scope 的 API Key，并取得目标会话的 UMO。UMO 格式为 `platform:message_type:session_id`；也可以在目标会话中使用 AstrBot 的 `/sid` 命令确认。API Key 只写入环境变量：
+
+```bash
+export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
+```
+
+再在 `settings.jsonc` 增加：
+
+```jsonc
+"sharing": {
+  "enabled": true,
+  "destinations": [
+    {
+      "transport": "astrbot",
+      "target": "qq:GroupMessage:123456789"
+    }
+  ],
+  "policy": {
+    "window_minutes": 60,
+    "max_messages_per_window": 2,
+    "min_interval_minutes": 10,
+    "bypass_score": 4.0
+  }
+},
+"integrations": {
+  "astrbot": {
+    "base_url": "http://127.0.0.1:6185",
+    "api_key_env": "AGENTSCROLL_ASTRBOT_API_KEY"
+  }
+}
+```
+
+每个 `sharing.destinations` 项选择一个 transport，并独立计算限额；`target` 的格式由对应 transport 校验。以上配置会让普通消息每个目标在滚动 60 分钟内最多发送 2 条，且相邻普通消息至少间隔 10 分钟；一个批次只保留评分最高的 2 条普通消息，其余不排队。达到 4.0 分的消息立即发送、条数不限，不受普通限额影响也不占普通额度。新批次会替换上一批尚未发送的普通消息，不形成跨批次积压；某个已选消息发送失败时也不会再用低分条目补位。
+
+分享状态保存在 `outputs/sharing/state.json`，逐日审计写入 `outputs/sharing/YYYY-MM-DD.jsonl`。状态文件记录各目标使用的 transport、普通额度和待执行任务，用于重启恢复；审计日志只保存目标摘要、任务结果和错误类型，不保存 API Key 或消息正文。首次创建状态文件时会把当时最新的分享批次记为基线，不发送此前积累的批次。AstrBot transport 只有建立连接失败时才分别等待 1 秒、3 秒重试；服务返回错误或读取响应时结果不确定均不重试，后者按可能已发送处理以防重复。
+
 ### Docker 后台运行
 
 仓库根目录的 `compose.yaml` 会同时启动 AgentScroll 和必需的 NewsNow。AgentScroll 只连接 Compose 内的 `http://newsnow:4444`，并等待 NewsNow 健康检查通过后才启动；NewsNow 数据保存在 `newsnow_data` volume，热榜快照、知识卡和分享队列仍写入仓库的 `outputs/`。
@@ -252,7 +292,7 @@ cp .env.example .env
 mkdir -p outputs
 ```
 
-在 `settings.jsonc` 中填写实际模型名，在 `.env` 中填写 `AGENTSCROLL_LLM_API_KEY`。Docker 部署使用 API 推理后端，不在容器内提供本机 Codex CLI。然后启动服务：
+在 `settings.jsonc` 中填写实际模型名，在 `.env` 中填写 `AGENTSCROLL_LLM_API_KEY`。使用 AstrBot transport 自动分享时还要填写 `AGENTSCROLL_ASTRBOT_API_KEY`。Docker 部署使用 API 推理后端，不在容器内提供本机 Codex CLI。Compose 已把 `host.docker.internal` 映射到宿主机，并用 `AGENTSCROLL_ASTRBOT_BASE_URL=http://host.docker.internal:6185` 覆盖本地地址，因此 AstrBot 需要把 Dashboard 的 6185 端口发布到宿主机。然后启动服务：
 
 ```bash
 docker compose up -d --build
@@ -323,6 +363,8 @@ uv pip install --python .venv/bin/python playwright
 | `AGENTSCROLL_DISABLE_BROWSER=1` | 禁用浏览器采集 |
 | `AGENTSCROLL_ALLOW_COMMENT_BROWSER=1` | 全局禁用浏览器时，单独允许评论浏览器路径 |
 | `AGENTSCROLL_NEWSNOW_BASE_URL` | NewsNow 服务地址 |
+| `AGENTSCROLL_ASTRBOT_API_KEY` | AstrBot OpenAPI Key；使用 AstrBot transport 时必填 |
+| `AGENTSCROLL_ASTRBOT_BASE_URL` | 覆盖 `integrations.astrbot.base_url`；Docker Compose 用它访问宿主机 AstrBot |
 
 每个平台每次搜索的返回上限由 `--depth` 控制；平台实际可返回的结果可能少于该上限。
 

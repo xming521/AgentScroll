@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import pyjson5
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .inference import (
     CodexExecClient,
@@ -16,8 +17,8 @@ from .inference import (
 )
 
 
-INFERENCE_CONFIG_ENV = "AGENTSCROLL_INFERENCE_CONFIG"
-DEFAULT_INFERENCE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "settings.jsonc"
+CONFIG_ENV = "AGENTSCROLL_CONFIG"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "settings.jsonc"
 MODEL_PLACEHOLDER = "replace-with-model-name"
 INFERENCE_AUDIT_DIR = Path.cwd() / "outputs" / "logs" / "llm_audit"
 
@@ -69,7 +70,83 @@ class ScheduleSettings(BaseModel):
         return f"{hour:02d}:{minute:02d}"
 
 
-class InferenceSettings(BaseModel):
+class SharePolicySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window_minutes: int = Field(default=60, gt=0)
+    max_messages_per_window: int = Field(default=2, gt=0)
+    min_interval_minutes: int = Field(default=10, ge=0)
+    bypass_score: float = Field(default=4.0, ge=0, le=4)
+
+
+class ShareDestinationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transport: str
+    target: str
+
+    @field_validator("transport", "target")
+    @classmethod
+    def validate_nonempty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("sharing destination 的 transport 和 target 不能为空")
+        return normalized
+
+
+class SharingSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    policy: SharePolicySettings = Field(default_factory=SharePolicySettings)
+    destinations: tuple[ShareDestinationSettings, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_enabled_destinations(self) -> SharingSettings:
+        identities = [
+            (destination.transport, destination.target)
+            for destination in self.destinations
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("sharing.destinations 不能包含重复目标")
+        if self.enabled and not self.destinations:
+            raise ValueError("启用即时分享时至少配置一个 destination")
+        return self
+
+
+class AstrBotIntegrationSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "http://127.0.0.1:6185"
+    api_key_env: str = "AGENTSCROLL_ASTRBOT_API_KEY"
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("integrations.astrbot.base_url 必须是 HTTP(S) 地址")
+        return normalized
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("integrations.astrbot.api_key_env 不能为空")
+        return normalized
+
+
+class IntegrationsSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    astrbot: AstrBotIntegrationSettings = Field(
+        default_factory=AstrBotIntegrationSettings
+    )
+
+
+class AgentScrollSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: Literal["api", "codex_exec"]
@@ -78,25 +155,27 @@ class InferenceSettings(BaseModel):
     api: APISettings
     codex_exec: CodexExecSettings = Field(default_factory=CodexExecSettings)
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
+    sharing: SharingSettings = Field(default_factory=SharingSettings)
+    integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
 
 
-def resolve_inference_config_path(config_path: str | Path | None = None) -> Path:
-    configured = config_path or os.environ.get(INFERENCE_CONFIG_ENV) or DEFAULT_INFERENCE_CONFIG_PATH
+def resolve_config_path(config_path: str | Path | None = None) -> Path:
+    configured = config_path or os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH
     return Path(configured).expanduser().resolve()
 
 
-def load_inference_settings(config_path: str | Path | None = None) -> InferenceSettings:
-    path = resolve_inference_config_path(config_path)
+def load_settings(config_path: str | Path | None = None) -> AgentScrollSettings:
+    path = resolve_config_path(config_path)
     if not path.is_file():
-        raise FileNotFoundError(f"Inference config not found: {path}")
+        raise FileNotFoundError(f"AgentScroll config not found: {path}")
 
     data = pyjson5.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError(f"Inference config must be a JSON object: {path}")
-    return InferenceSettings.model_validate(data)
+        raise ValueError(f"AgentScroll config must be a JSON object: {path}")
+    return AgentScrollSettings.model_validate(data)
 
 
-def _validated_model(settings: InferenceSettings) -> str:
+def _validated_model(settings: AgentScrollSettings) -> str:
     model = settings.model.strip()
     if not model or model == MODEL_PLACEHOLDER:
         raise ValueError("Set a real model name in settings.jsonc before running inference")
@@ -104,7 +183,7 @@ def _validated_model(settings: InferenceSettings) -> str:
 
 
 def build_configured_client(
-    settings: InferenceSettings,
+    settings: AgentScrollSettings,
     *,
     enable_web_search: bool = False,
 ) -> LLMClient:
@@ -140,7 +219,7 @@ def build_configured_client(
 
 def make_configured_request(
     prompt: str,
-    settings: InferenceSettings,
+    settings: AgentScrollSettings,
     **overrides: Any,
 ) -> LLMRequest:
     request_args: dict[str, Any] = {
@@ -154,12 +233,17 @@ def make_configured_request(
 
 
 __all__ = [
-    "DEFAULT_INFERENCE_CONFIG_PATH",
-    "INFERENCE_CONFIG_ENV",
-    "InferenceSettings",
+    "AstrBotIntegrationSettings",
+    "AgentScrollSettings",
+    "CONFIG_ENV",
+    "DEFAULT_CONFIG_PATH",
+    "IntegrationsSettings",
     "ScheduleSettings",
+    "ShareDestinationSettings",
+    "SharePolicySettings",
+    "SharingSettings",
     "build_configured_client",
-    "load_inference_settings",
+    "load_settings",
     "make_configured_request",
-    "resolve_inference_config_path",
+    "resolve_config_path",
 ]

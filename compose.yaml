@@ -30,8 +30,12 @@ services:
         condition: service_healthy
     environment:
       AGENTSCROLL_LLM_API_KEY: ${AGENTSCROLL_LLM_API_KEY:?请先在 .env 中设置 AGENTSCROLL_LLM_API_KEY}
+      AGENTSCROLL_ASTRBOT_API_KEY: ${AGENTSCROLL_ASTRBOT_API_KEY:-}
+      AGENTSCROLL_ASTRBOT_BASE_URL: http://host.docker.internal:6185
       AGENTSCROLL_NEWSNOW_BASE_URL: http://newsnow:4444
       TZ: ${TZ:-Asia/Shanghai}
+    extra_hosts:
+      - host.docker.internal:host-gateway
     volumes:
       - ./settings.jsonc:/config/settings.jsonc:ro
       - ./outputs:/app/outputs

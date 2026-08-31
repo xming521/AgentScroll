@@ -28,5 +28,26 @@
     // 使用运行机器的当地时间；跨越午夜时，结束时间属于次日。
     "start_time": "08:00",
     "end_time": "00:00"
+  },
+
+  "sharing": {
+    // 只在 hotlist run --scheduled 或 --every 的常驻进程中自动分享。
+    "enabled": false,
+    "destinations": [],
+    "policy": {
+      // 每个目标分别限制普通消息；4.0 分消息不受这些限制且不占普通额度。
+      "window_minutes": 60,
+      "max_messages_per_window": 2,
+      "min_interval_minutes": 10,
+      "bypass_score": 4.0
+    }
+  },
+
+  "integrations": {
+    "astrbot": {
+      // AgentScroll 在宿主机运行时使用本机地址；Docker Compose 会通过环境变量覆盖。
+      "base_url": "http://127.0.0.1:6185",
+      "api_key_env": "AGENTSCROLL_ASTRBOT_API_KEY"
+    }
   }
 }

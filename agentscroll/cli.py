@@ -68,7 +68,7 @@ def _config_path(context: click.Context) -> Path | None:
 @click.option(
     "--config-path",
     type=_INPUT_FILE,
-    help="推理配置文件；默认读取 settings.jsonc 或 AGENTSCROLL_INFERENCE_CONFIG。",
+    help="AgentScroll 配置文件；默认读取 settings.jsonc 或 AGENTSCROLL_CONFIG。",
 )
 @click.pass_context
 def cli(context: click.Context, config_path: Path | None) -> None:
@@ -308,16 +308,68 @@ def hotlist_run(
 
     from agentscroll.scheduler import run_at_interval
 
+    from agentscroll.config import load_settings
+
+    settings = _run(lambda: load_settings(_config_path(context)))
+    share_dispatcher = None
+    if settings.sharing.enabled:
+        from agentscroll.integrations import build_share_transports
+        from agentscroll.sharing import ShareDispatcher
+
+        transport_names = {
+            destination.transport
+            for destination in settings.sharing.destinations
+        }
+        transports = _run(
+            lambda: build_share_transports(transport_names, settings.integrations)
+        )
+        share_dispatcher = _run(
+            lambda: ShareDispatcher(
+                settings.sharing,
+                transports=transports,
+                share_output_dir=share_output_dir,
+            )
+        )
+        policy = settings.sharing.policy
+        click.echo(
+            "即时分享已启用："
+            f"{len(settings.sharing.destinations)} 个目标，"
+            f"普通消息每 {policy.window_minutes} 分钟最多 "
+            f"{policy.max_messages_per_window} 条",
+            err=True,
+        )
+
     def scheduled_run() -> None:
-        _print_json(run_once())
+        result = run_once()
+        if share_dispatcher is not None:
+            manifest_file = result.get("learn", {}).get("share_manifest_file")
+            if manifest_file:
+                try:
+                    result["sharing"] = share_dispatcher.submit_manifest(manifest_file)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    result["sharing"] = {
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+        _print_json(result)
+
+    configure_scheduler = (
+        share_dispatcher.attach_scheduler
+        if share_dispatcher is not None
+        else None
+    )
 
     if every is not None:
-        _run(lambda: run_at_interval(scheduled_run, interval_seconds=every))
+        _run(
+            lambda: run_at_interval(
+                scheduled_run,
+                interval_seconds=every,
+                configure_scheduler=configure_scheduler,
+            )
+        )
         return
 
-    from agentscroll.inference_config import load_inference_settings
-
-    schedule = _run(lambda: load_inference_settings(_config_path(context)).schedule)
+    schedule = settings.schedule
     interval_seconds = _run(lambda: _parse_interval_seconds(schedule.every))
     click.echo(
         f"定时运行：本地时间 {schedule.start_time} 至 {schedule.end_time}，"
@@ -330,6 +382,7 @@ def hotlist_run(
             interval_seconds=interval_seconds,
             start_time=schedule.start_time,
             end_time=schedule.end_time,
+            configure_scheduler=configure_scheduler,
         )
     )
 

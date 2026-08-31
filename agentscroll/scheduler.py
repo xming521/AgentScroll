@@ -72,6 +72,7 @@ def run_at_interval(
     interval_seconds: int,
     start_time: str | None = None,
     end_time: str | None = None,
+    configure_scheduler: Callable[[BlockingScheduler], None] | None = None,
 ) -> None:
     """Run a job continuously, optionally at fixed local-time slots."""
     if interval_seconds <= 0:
@@ -104,6 +105,9 @@ def run_at_interval(
             ),
             **job_options,
         )
+
+    if configure_scheduler is not None:
+        configure_scheduler(scheduler)
 
     previous_handlers: dict[signal.Signals, signal.Handlers] = {}
     shutdown_started = Event()

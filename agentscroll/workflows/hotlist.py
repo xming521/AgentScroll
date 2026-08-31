@@ -92,9 +92,9 @@ def select_hotlist_first_pass(
     """Select topic-level candidates without opening URLs or collecting details."""
     from agentscroll.collector.hotlist import list_hotlist_entries
     from agentscroll.collector.newsnow import _title_dedupe_key
-    from agentscroll.inference_config import (
+    from agentscroll.config import (
         build_configured_client,
-        load_inference_settings,
+        load_settings,
         make_configured_request,
     )
     from .hotlist_history import (
@@ -162,7 +162,7 @@ def select_hotlist_first_pass(
         )
     )
     candidate_payloads = order_candidates_by_similarity(candidate_payloads)
-    settings = load_inference_settings(config_path)
+    settings = load_settings(config_path)
     request = make_configured_request(
         _first_pass_prompt(candidate_payloads),
         settings,
