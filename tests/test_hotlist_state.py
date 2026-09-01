@@ -1,3 +1,5 @@
+"""Tests for durable hot-list topic state and title matching."""
+
 from __future__ import annotations
 
 import json
@@ -5,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agentscroll.storage import connect_database
-from agentscroll.workflows.hotlist_history import (
+from agentscroll.workflows.hotlist_state import (
     active_exact_title_keys,
     load_history,
     recent_update_timeline,

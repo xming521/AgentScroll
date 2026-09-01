@@ -1,15 +1,12 @@
-"""Unified entry point for collecting raw data from Chinese platforms."""
+"""Search Chinese platforms and persist compact knowledge artifacts."""
 
 from __future__ import annotations
 
-import argparse
-import json
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from .knowledge_store import save_knowledge_document
+from .knowledge_artifacts import save_knowledge_document
 from .routing import SCENE_SOURCES, normalize_scene, route_topic
 from .sources import (
     bilibili,
@@ -245,58 +242,3 @@ def collect(
         result["knowledge_file"] = str(knowledge_file)
         result["knowledge_metadata_file"] = str(knowledge_file.with_suffix(".json"))
     return result
-
-
-def _parse_source_argument(value: str) -> tuple[str, ...]:
-    return _normalize_sources(value.split(","))
-
-
-def _parse_scene_argument(value: str) -> str:
-    return normalize_scene(value)
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="AgentScroll 独立数据采集器")
-    parser.add_argument("topic", help="要搜索的话题或关键词")
-    parser.add_argument(
-        "--sources",
-        type=_parse_source_argument,
-        default=None,
-        help="逗号分隔的数据源；显式指定后优先于场景路由",
-    )
-    parser.add_argument(
-        "--scene",
-        type=_parse_scene_argument,
-        default="auto",
-        help="搜索场景：auto、formal（正式）或 informal（非正式）",
-    )
-    parser.add_argument("--days", type=int, default=30, help="回溯天数，默认 30")
-    parser.add_argument("--as-of", help="查询终点日期，格式为 YYYY-MM-DD")
-    parser.add_argument(
-        "--depth",
-        choices=("quick", "default", "deep"),
-        default="default",
-        help="采集深度",
-    )
-    parser.add_argument(
-        "--output-dir",
-        help="聚合知识文件目录；默认保存到 ./outputs/knowledge",
-    )
-    args = parser.parse_args(argv)
-
-    try:
-        result = collect(
-            args.topic,
-            sources=args.sources,
-            scene=args.scene,
-            days=args.days,
-            as_of=args.as_of,
-            depth=args.depth,
-            output_dir=args.output_dir,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
-    sys.stdout.write("\n")
-    return 0

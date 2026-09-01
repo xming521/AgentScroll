@@ -1,4 +1,4 @@
-"""Persist and match recent hot-list titles across learning batches."""
+"""Match and persist hot-list topic state across learning batches."""
 
 from __future__ import annotations
 

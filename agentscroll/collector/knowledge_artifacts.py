@@ -1,4 +1,4 @@
-"""Persist one compact, model-facing text file per search."""
+"""Build and persist compact, model-facing search artifacts."""
 
 from __future__ import annotations
 

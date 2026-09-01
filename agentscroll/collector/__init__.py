@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from .collector import ALL_SOURCES, collect
+from .search import ALL_SOURCES, collect
 from .routing import SCENE_SOURCES, route_topic
 
 

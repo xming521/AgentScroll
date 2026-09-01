@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .knowledge_store import build_knowledge_document
+from .knowledge_artifacts import build_knowledge_document
 from .newsnow import _title_dedupe_key
 from .sources import bilibili, dates, hupu, tieba
 from .sources.weibo import collect_hot_topic_posts

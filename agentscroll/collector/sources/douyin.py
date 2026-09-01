@@ -15,7 +15,16 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from . import comments, dates, live_artifacts, page_content, relevance, throttle, web_search
+from . import (
+    browser,
+    comments,
+    dates,
+    live_artifacts,
+    page_content,
+    relevance,
+    throttle,
+    web_search,
+)
 from .request_profiles import api_headers, navigation_headers
 
 
@@ -46,10 +55,9 @@ def search_douyin(
 
     if not items:
         try:
-            from . import crawler_bridge
-            if crawler_bridge.is_playwright_available():
+            if browser.is_playwright_available():
                 sys.stderr.write("[抖音] 尝试 Playwright 浏览器搜索...\n")
-                items = crawler_bridge.crawl_douyin(topic, limit)
+                items = crawl_douyin(topic, limit)
                 if items:
                     sys.stderr.write(f"[抖音] 爬虫模式获取 {len(items)} 条结果\n")
         except Exception as e:
@@ -80,6 +88,198 @@ def search_douyin(
 
     scored.sort(key=lambda x: x.get("relevance", 0), reverse=True)
     return scored[:limit]
+
+
+def crawl_douyin(topic: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Use Playwright to collect Douyin search results."""
+    if not browser.is_playwright_available():
+        return []
+
+    items: List[Dict[str, Any]] = []
+    try:
+        with browser.browser_context("douyin", mobile=True) as (_, _, page):
+            captured: Dict[str, Any] = {"payload": None}
+
+            def _on_response(response) -> None:
+                try:
+                    if (
+                        "/aweme/v1/web/search/item" in response.url
+                        and response.status == 200
+                    ):
+                        data = response.json()
+                        if isinstance(data, dict) and data.get("data"):
+                            captured["payload"] = data
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+            search_url = f"https://www.douyin.com/search/{topic}?type=video"
+            try:
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                sys.stderr.write(f"[爬虫-抖音] 页面加载失败: {exc}\n")
+
+            for _ in range(5):
+                if captured["payload"]:
+                    break
+                try:
+                    page.mouse.wheel(0, 2000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1500)
+
+            payload = captured["payload"]
+            if isinstance(payload, dict):
+                for entry in (payload.get("data") or [])[:limit]:
+                    aweme = entry.get("aweme_info") or entry
+                    if not isinstance(aweme, dict):
+                        continue
+                    aweme_id = aweme.get("aweme_id", "")
+                    author = aweme.get("author") or {}
+                    stats = aweme.get("statistics") or {}
+                    items.append(
+                        {
+                            "text": aweme.get("desc", ""),
+                            "url": (
+                                f"https://www.douyin.com/video/{aweme_id}"
+                                if aweme_id
+                                else ""
+                            ),
+                            "author_name": author.get("nickname", ""),
+                            "author_id": author.get("uid", ""),
+                            "date": None,
+                            "engagement": {
+                                "views": stats.get("play_count", 0),
+                                "likes": stats.get("digg_count", 0),
+                                "comments": stats.get("comment_count", 0),
+                                "shares": stats.get("share_count", 0),
+                            },
+                            "hashtags": [],
+                            "duration": (aweme.get("duration") or 0) // 1000,
+                            "source": "crawler-xhr",
+                        }
+                    )
+
+            if not items:
+                video_elements = page.query_selector_all(
+                    "div[class*='video-card'], li[class*='search-result'], "
+                    "div[class*='search-result-card']"
+                )
+                for element in video_elements[:limit]:
+                    try:
+                        title_element = element.query_selector(
+                            "a[class*='title'], span[class*='title'], "
+                            "p[class*='desc']"
+                        )
+                        title = title_element.inner_text() if title_element else ""
+                        link_element = element.query_selector("a[href*='/video/']")
+                        link = ""
+                        if link_element:
+                            href = link_element.get_attribute("href") or ""
+                            link = (
+                                f"https://www.douyin.com{href}"
+                                if href.startswith("/")
+                                else href
+                            )
+                        if not title or "/video/" not in link:
+                            continue
+
+                        author_element = element.query_selector(
+                            "span[class*='author'], span[class*='nickname']"
+                        )
+                        likes_element = element.query_selector(
+                            "span[class*='like'], span[class*='digg']"
+                        )
+                        items.append(
+                            {
+                                "text": title,
+                                "url": link,
+                                "author_name": (
+                                    author_element.inner_text()
+                                    if author_element
+                                    else ""
+                                ),
+                                "author_id": "",
+                                "date": None,
+                                "engagement": {
+                                    "views": 0,
+                                    "likes": comments.count(
+                                        likes_element.inner_text()
+                                        if likes_element
+                                        else "0"
+                                    ),
+                                    "comments": 0,
+                                    "shares": 0,
+                                },
+                                "hashtags": [],
+                                "duration": 0,
+                                "source": "crawler-dom",
+                            }
+                        )
+                    except Exception:
+                        continue
+            if not items:
+                items = _crawl_douyin_public_pages(page, topic, limit)
+    except Exception as exc:
+        sys.stderr.write(f"[爬虫-抖音] 浏览器爬取失败: {exc}\n")
+    return items
+
+
+def _crawl_douyin_public_pages(
+    page: Any,
+    topic: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Read public mobile share pages after desktop search hits a CAPTCHA."""
+    items: List[Dict[str, Any]] = []
+    for result in _discover_site_results(topic, limit):
+        match = re.search(r"/video/(\d+)", result["url"])
+        if not match:
+            continue
+        aweme_id = match.group(1)
+        try:
+            page.goto(
+                f"https://www.iesdouyin.com/share/video/{aweme_id}/",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            description = (
+                page.locator("meta[name='description']")
+                .first.get_attribute("content")
+                or page.locator("meta[property='og:description']")
+                .first.get_attribute("content")
+                or ""
+            )
+            text = _clean_text(description)
+            if not text or relevance.token_overlap_relevance(topic, text) <= 0:
+                continue
+            items.append(
+                {
+                    "text": text,
+                    "url": f"https://www.douyin.com/video/{aweme_id}",
+                    "author_name": "",
+                    "author_id": "",
+                    "date": None,
+                    "engagement": {
+                        "views": 0,
+                        "likes": 0,
+                        "comments": 0,
+                        "shares": 0,
+                    },
+                    "hashtags": re.findall(r"#([^#\s]+)#?", text),
+                    "duration": 0,
+                    "source": "crawler-public-page",
+                }
+            )
+            if len(items) >= limit:
+                break
+        except Exception:
+            continue
+    if items:
+        sys.stderr.write(
+            f"[爬虫-抖音] 搜索页触发验证码，已从公开分享页读取 {len(items)} 条内容。\n"
+        )
+    return items
 
 
 def _fetch_html(url: str, timeout: int = 8) -> str:
@@ -300,8 +500,7 @@ def _enrich_video_contents(items: List[Dict[str, Any]]) -> None:
 
     if unresolved and _detail_browser_enabled():
         try:
-            from . import crawler_bridge
-            with crawler_bridge._launch_browser_context(
+            with browser.browser_context(
                 "douyin_detail",
                 mobile=True,
             ) as (_, _, page):

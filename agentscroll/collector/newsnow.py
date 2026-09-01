@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
@@ -379,51 +378,3 @@ def fetch_newsnow_hotlists(
         _, title_path = _save_snapshot(result, selected_groups, output_dir=output_dir)
         result["snapshot_text_file"] = str(title_path)
     return result
-
-
-def _parse_group_argument(value: str) -> tuple[str, ...]:
-    return _normalize_groups(value.split(","))
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="按类别调用 NewsNow 热榜")
-    parser.add_argument(
-        "--groups",
-        type=_parse_group_argument,
-        default=("综合",),
-        help="逗号分隔的类别，默认：综合",
-    )
-    parser.add_argument("--base-url", help="NewsNow 部署地址")
-    parser.add_argument(
-        "--latest", action="store_true", help="向 NewsNow 传 latest=true"
-    )
-    parser.add_argument("--per-source-limit", type=int, help="每个榜单最多保留多少条")
-    parser.add_argument("--timeout", type=int, default=15, help="单榜单超时秒数")
-    parser.add_argument("--output-dir", help="热榜 JSON 快照目录")
-    parser.add_argument("--no-save", action="store_true", help="不保存本地快照")
-    parser.add_argument(
-        "--list-groups", action="store_true", help="列出所有类别及 Source ID"
-    )
-    args = parser.parse_args(argv)
-
-    if args.list_groups:
-        print(json.dumps(list_newsnow_groups(), ensure_ascii=False, indent=2))
-        return 0
-    try:
-        result = fetch_newsnow_hotlists(
-            args.groups,
-            base_url=args.base_url,
-            latest=args.latest,
-            per_source_limit=args.per_source_limit,
-            timeout=args.timeout,
-            output_dir=args.output_dir,
-            save=not args.no_save,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if result["total_items"] else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

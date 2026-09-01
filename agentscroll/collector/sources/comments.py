@@ -33,7 +33,7 @@ def clean_text(value: Any) -> str:
 
 
 def count(value: Any) -> int:
-    """Normalize common Chinese abbreviated counters such as ``1.2万``."""
+    """Normalize abbreviated counters such as ``1.2万``, ``1.2w``, or ``12k``."""
     if value is None or value == "":
         return 0
     if isinstance(value, bool):
@@ -42,11 +42,15 @@ def count(value: Any) -> int:
         return max(0, int(value))
     text = str(value).strip().replace(",", "").rstrip("+")
     multiplier = 1
-    if text.endswith("万"):
+    lowered = text.lower()
+    if text.endswith("万") or lowered.endswith("w"):
         multiplier = 10_000
         text = text[:-1]
     elif text.endswith("亿"):
         multiplier = 100_000_000
+        text = text[:-1]
+    elif lowered.endswith("k"):
+        multiplier = 1_000
         text = text[:-1]
     try:
         return max(0, int(float(text) * multiplier))

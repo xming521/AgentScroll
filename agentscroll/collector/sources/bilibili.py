@@ -15,7 +15,16 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional
 
-from . import comments, dates, live_artifacts, page_content, relevance, throttle, web_search
+from . import (
+    browser,
+    comments,
+    dates,
+    live_artifacts,
+    page_content,
+    relevance,
+    throttle,
+    web_search,
+)
 from .request_profiles import api_headers, navigation_headers
 
 
@@ -57,10 +66,9 @@ def search_bilibili(
 
     if not items:
         try:
-            from . import crawler_bridge
-            if crawler_bridge.is_playwright_available():
+            if browser.is_playwright_available():
                 sys.stderr.write("[B站] API 无结果，尝试 Playwright 浏览器搜索...\n")
-                items = crawler_bridge.crawl_bilibili(topic, limit)
+                items = crawl_bilibili(topic, limit)
                 if items:
                     sys.stderr.write(f"[B站] 爬虫模式获取 {len(items)} 条结果\n")
         except Exception as e:
@@ -89,6 +97,150 @@ def search_bilibili(
     _enrich_video_comments(items, opener)
     live_artifacts.save_stage("bilibili", "03_comments", topic, items)
     return items[:limit]
+
+
+def crawl_bilibili(topic: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Use Playwright to collect Bilibili search results."""
+    if not browser.is_playwright_available():
+        return []
+
+    items: List[Dict[str, Any]] = []
+    try:
+        with browser.browser_context("bilibili") as (_, _, page):
+            search_url = (
+                "https://search.bilibili.com/all?"
+                f"keyword={urllib.parse.quote(topic)}&order=totalrank"
+            )
+            try:
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                sys.stderr.write(f"[爬虫-B站] 页面加载失败: {exc}\n")
+
+            browser.wait_for(
+                page,
+                lambda: bool(
+                    page.query_selector(
+                        "div.bili-video-card, div[class*='video-list-item'], "
+                        "a[href*='/video/BV']"
+                    )
+                ),
+                timeout_ms=8000,
+            )
+            video_elements = page.query_selector_all(
+                "div.bili-video-card, div[class*='video-list-item'], "
+                "div[class*='video-item']"
+            )
+            for element in video_elements[:limit]:
+                try:
+                    title_element = element.query_selector(
+                        "h3[class*='title'], a[class*='title']"
+                    )
+                    title = (
+                        _clean_html(title_element.inner_text())
+                        if title_element
+                        else ""
+                    )
+                    link_element = element.query_selector("a[href*='/video/']")
+                    link = ""
+                    if link_element:
+                        href = link_element.get_attribute("href") or ""
+                        if href.startswith("//"):
+                            link = f"https:{href}"
+                        elif href.startswith("/"):
+                            link = f"https://www.bilibili.com{href}"
+                        else:
+                            link = href
+                    if not title or "/video/" not in link:
+                        continue
+
+                    author_element = element.query_selector(
+                        "span[class*='name'], "
+                        "span.bili-video-card__info--author"
+                    )
+                    views_element = element.query_selector(
+                        "span[class*='play'], span[class*='view']"
+                    )
+                    items.append(
+                        {
+                            "title": title,
+                            "url": link,
+                            "bvid": "",
+                            "channel_name": (
+                                author_element.inner_text()
+                                if author_element
+                                else ""
+                            ),
+                            "author_mid": "",
+                            "date": None,
+                            "duration": "",
+                            "description": "",
+                            "engagement": {
+                                "views": comments.count(
+                                    views_element.inner_text()
+                                    if views_element
+                                    else "0"
+                                ),
+                                "danmaku": 0,
+                                "comments": 0,
+                                "favorites": 0,
+                                "likes": 0,
+                            },
+                            "source": "crawler",
+                        }
+                    )
+                except Exception:
+                    continue
+
+            if not items:
+                seen = set()
+                for link_element in page.query_selector_all("a[href*='/video/BV']"):
+                    try:
+                        href = link_element.get_attribute("href") or ""
+                        if href.startswith("//"):
+                            link = f"https:{href}"
+                        elif href.startswith("/"):
+                            link = f"https://www.bilibili.com{href}"
+                        else:
+                            link = href
+                        link = link.split("?", 1)[0]
+                        if not link or link in seen:
+                            continue
+                        title = _clean_html(
+                            link_element.get_attribute("title")
+                            or link_element.inner_text()
+                            or ""
+                        )
+                        if not title:
+                            continue
+                        seen.add(link)
+                        match = re.search(r"/video/(BV[0-9A-Za-z]+)", link)
+                        items.append(
+                            {
+                                "title": title,
+                                "url": link,
+                                "bvid": match.group(1) if match else "",
+                                "channel_name": "",
+                                "author_mid": "",
+                                "date": None,
+                                "duration": "",
+                                "description": "",
+                                "engagement": {
+                                    "views": 0,
+                                    "danmaku": 0,
+                                    "comments": 0,
+                                    "favorites": 0,
+                                    "likes": 0,
+                                },
+                                "source": "crawler-link",
+                            }
+                        )
+                        if len(items) >= limit:
+                            break
+                    except Exception:
+                        continue
+    except Exception as exc:
+        sys.stderr.write(f"[爬虫-B站] 浏览器爬取失败: {exc}\n")
+    return items
 
 
 def _rank_items(topic: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

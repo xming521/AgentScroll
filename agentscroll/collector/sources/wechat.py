@@ -325,8 +325,8 @@ def _enrich_wechat_comments(
         return
 
     try:
-        from . import crawler_bridge
-        with crawler_bridge._launch_browser_context(
+        from . import browser
+        with browser.browser_context(
             "wechat",
             mobile=True,
         ) as (_, _, page):
@@ -355,7 +355,7 @@ def _enrich_wechat_comments(
                         wait_until="domcontentloaded",
                         timeout=30000,
                     )
-                    crawler_bridge._wait_for(
+                    browser.wait_for(
                         page,
                         lambda: isinstance(captured["payload"], dict),
                         timeout_ms=10000,

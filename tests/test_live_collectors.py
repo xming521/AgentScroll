@@ -17,7 +17,13 @@ from typing import Any, Callable, Dict, Iterable
 import pytest
 
 from agentscroll.collector import ALL_SOURCES, SCENE_SOURCES, collect
-from agentscroll.collector.sources import crawler_bridge, live_artifacts
+from agentscroll.collector.sources import (
+    bilibili,
+    browser,
+    douyin,
+    live_artifacts,
+    xiaohongshu,
+)
 
 QUERY_FLAG = "AGENTSCROLL_RUN_LIVE_TESTS"
 BROWSER_FLAG = "AGENTSCROLL_RUN_BROWSER_TESTS"
@@ -69,9 +75,9 @@ _ARTIFACT_RUN_LOCK = threading.Lock()
 _ARTIFACT_RUN_DIR: Path | None = None
 
 BROWSER_CRAWLERS: Dict[str, Callable[[str, int], list[dict[str, Any]]]] = {
-    "xiaohongshu": crawler_bridge.crawl_xiaohongshu,
-    "bilibili": crawler_bridge.crawl_bilibili,
-    "douyin": crawler_bridge.crawl_douyin,
+    "xiaohongshu": xiaohongshu.crawl_xiaohongshu,
+    "bilibili": bilibili.crawl_bilibili,
+    "douyin": douyin.crawl_douyin,
 }
 
 
@@ -329,7 +335,7 @@ def test_live_platform_search_and_detail_and_comments(
     # URLs and snippets from a search-engine fallback are still rejected below.
     monkeypatch.delenv("AGENTSCROLL_DISABLE_BROWSER", raising=False)
     monkeypatch.setenv("AGENTSCROLL_ALLOW_DETAIL_BROWSER", "1")
-    crawler_bridge._playwright_available = None
+    browser._playwright_available = None
 
     topic = os.environ.get("AGENTSCROLL_LIVE_TOPIC", "人工智能").strip()
     days = int(os.environ.get("AGENTSCROLL_LIVE_DAYS", "30"))
@@ -478,12 +484,12 @@ def test_live_browser_crawler(source: str, monkeypatch: pytest.MonkeyPatch) -> N
     _ensure_artifact_run_dir()
 
     monkeypatch.delenv("AGENTSCROLL_DISABLE_BROWSER", raising=False)
-    crawler_bridge._playwright_available = None
+    browser._playwright_available = None
     topic = os.environ.get("AGENTSCROLL_LIVE_TOPIC", "人工智能").strip()
     limit = int(os.environ.get("AGENTSCROLL_LIVE_BROWSER_LIMIT", "5"))
     items: list[dict[str, Any]] = []
     try:
-        assert crawler_bridge.is_playwright_available(), (
+        assert browser.is_playwright_available(), (
             "Playwright 不可用；请安装 browser 可选依赖并执行 "
             "`python3 -m playwright install chromium`"
         )

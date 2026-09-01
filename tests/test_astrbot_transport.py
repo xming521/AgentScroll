@@ -1,3 +1,5 @@
+"""Unit tests for the AstrBot outbound transport."""
+
 from __future__ import annotations
 
 import httpx

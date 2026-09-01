@@ -14,7 +14,16 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from . import comments, dates, live_artifacts, page_content, relevance, throttle, web_search
+from . import (
+    browser,
+    comments,
+    dates,
+    live_artifacts,
+    page_content,
+    relevance,
+    throttle,
+    web_search,
+)
 from .request_profiles import api_headers, navigation_headers
 
 def search_xiaohongshu(
@@ -49,10 +58,9 @@ def search_xiaohongshu(
 
     if not items and depth != "quick":
         try:
-            from . import crawler_bridge
-            if crawler_bridge.is_playwright_available():
+            if browser.is_playwright_available():
                 sys.stderr.write("[小红书] 尝试 Playwright 浏览器搜索...\n")
-                items = crawler_bridge.crawl_xiaohongshu(topic, limit)
+                items = crawl_xiaohongshu(topic, limit)
                 if items:
                     sys.stderr.write(f"[小红书] 爬虫模式获取 {len(items)} 条结果\n")
         except Exception as e:
@@ -86,6 +94,311 @@ def search_xiaohongshu(
 
     scored.sort(key=lambda x: x.get("relevance", 0), reverse=True)
     return scored[:limit]
+
+
+def crawl_xiaohongshu(topic: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Use Playwright to collect Xiaohongshu search results."""
+    if not browser.is_playwright_available():
+        return []
+
+    items: List[Dict[str, Any]] = []
+    try:
+        with browser.browser_context("xiaohongshu") as (_, _, page):
+            captured: Dict[str, Any] = {"items": [], "endpoint": ""}
+
+            def _on_response(response) -> None:
+                try:
+                    url = response.url
+                    lowered = url.lower()
+                    if response.status != 200 or "xiaohongshu.com" not in lowered:
+                        return
+                    if "/api/" not in lowered or "search" not in lowered:
+                        return
+                    note_items = _extract_xhs_note_items(response.json())
+                    if note_items and not captured["items"]:
+                        captured["items"] = note_items
+                        captured["endpoint"] = url.split("?", 1)[0]
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+            search_url = (
+                "https://www.xiaohongshu.com/search_result?"
+                f"keyword={urllib.parse.quote(topic, safe='')}"
+                "&source=web_search_result_notes"
+            )
+            try:
+                page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                sys.stderr.write(f"[爬虫-小红书] 页面加载失败: {exc}\n")
+
+            if not captured["items"]:
+                _submit_xhs_search(page, topic)
+
+            for _ in range(8):
+                if captured["items"]:
+                    break
+                try:
+                    page.mouse.wheel(0, 2000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(1000)
+
+            for raw in captured["items"][:limit]:
+                parsed = _parse_crawler_xhs_note(raw)
+                if parsed:
+                    items.append(parsed)
+
+            if not captured["items"]:
+                sys.stderr.write(
+                    "[爬虫-小红书] 未捕获包含笔记卡片的搜索响应；"
+                    "可能需要重新登录、通过验证码，或平台接口已调整；"
+                    "将继续尝试 DOM/站内搜索兜底。\n"
+                )
+
+            if not items:
+                note_elements = page.query_selector_all(
+                    "section.note-item, div[class*='note-item'], "
+                    "a[class*='cover'], a[href*='/explore/']"
+                )
+                for element in note_elements[:limit]:
+                    try:
+                        title_element = element.query_selector(
+                            "span[class*='title'], div[class*='title']"
+                        )
+                        title = title_element.inner_text() if title_element else ""
+                        link = element.get_attribute("href") or ""
+                        if link and not link.startswith("http"):
+                            link = f"https://www.xiaohongshu.com{link}"
+                        if not title or "/explore/" not in link:
+                            continue
+
+                        author_element = element.query_selector(
+                            "span[class*='name'], div[class*='author']"
+                        )
+                        likes_element = element.query_selector(
+                            "span[class*='like'], span[class*='count']"
+                        )
+                        items.append(
+                            {
+                                "title": title,
+                                "desc": "",
+                                "url": link,
+                                "author_name": (
+                                    author_element.inner_text()
+                                    if author_element
+                                    else ""
+                                ),
+                                "author_id": "",
+                                "date": None,
+                                "engagement": {
+                                    "likes": comments.count(
+                                        likes_element.inner_text()
+                                        if likes_element
+                                        else "0"
+                                    ),
+                                    "collects": 0,
+                                    "comments": 0,
+                                    "shares": 0,
+                                },
+                                "hashtags": [],
+                                "images": [],
+                                "source": "crawler-dom",
+                            }
+                        )
+                    except Exception:
+                        continue
+            if not items:
+                items = _crawl_xhs_public_pages(page, topic, limit)
+            if not items:
+                sys.stderr.write(
+                    "[爬虫-小红书] Playwright 未解析到结果；"
+                    "这通常是登录态失效、反爬验证或页面结构变更导致。\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(f"[爬虫-小红书] 浏览器爬取失败: {exc}\n")
+    return items
+
+
+def _submit_xhs_search(page: Any, topic: str) -> bool:
+    """Submit the search box when the page does not auto-run the query."""
+    selectors = (
+        "input[placeholder*='搜索']",
+        "input[placeholder*='搜']",
+        "input[type='search']",
+    )
+    for selector in selectors:
+        try:
+            for element in page.query_selector_all(selector):
+                if not element.is_visible():
+                    continue
+                element.fill(topic)
+                element.press("Enter")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _extract_xhs_note_items(payload: Any) -> List[Dict[str, Any]]:
+    """Find note-card records in changing search-response envelopes."""
+
+    def is_note_record(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        card = value.get("note_card")
+        if isinstance(card, dict):
+            return bool(
+                (card.get("note_id") or value.get("id"))
+                and (
+                    card.get("title")
+                    or card.get("display_title")
+                    or card.get("desc")
+                )
+            )
+        return bool(
+            (value.get("note_id") or value.get("id"))
+            and (
+                value.get("title")
+                or value.get("display_title")
+                or value.get("desc")
+            )
+        )
+
+    def walk(value: Any) -> List[Dict[str, Any]]:
+        if isinstance(value, list):
+            records = [item for item in value if is_note_record(item)]
+            if records:
+                return records
+            for item in value:
+                records = walk(item)
+                if records:
+                    return records
+        elif isinstance(value, dict):
+            for child in value.values():
+                records = walk(child)
+                if records:
+                    return records
+        return []
+
+    return walk(payload)
+
+
+def _parse_crawler_xhs_note(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize one note-card record captured by Playwright."""
+    note_card = raw.get("note_card") if isinstance(raw.get("note_card"), dict) else raw
+    note_id = raw.get("id") or note_card.get("note_id") or raw.get("note_id", "")
+    if not note_id:
+        return None
+    xsec_token = raw.get("xsec_token") or note_card.get("xsec_token") or ""
+    note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    if xsec_token:
+        note_url = f"{note_url}?{urllib.parse.urlencode({'xsec_token': xsec_token, 'xsec_source': 'pc_search'})}"
+    user = note_card.get("user") or raw.get("user") or {}
+    interact = note_card.get("interact_info") or raw.get("interact_info") or {}
+    return {
+        "title": (
+            note_card.get("display_title")
+            or note_card.get("title")
+            or raw.get("title", "")
+        ),
+        "desc": (
+            note_card.get("desc")
+            or note_card.get("description")
+            or raw.get("desc", "")
+        ),
+        "url": note_url,
+        "author_name": (
+            user.get("nickname") or user.get("nick_name") or user.get("name", "")
+        ),
+        "author_id": user.get("user_id") or user.get("userid") or user.get("id", ""),
+        "date": None,
+        "engagement": {
+            "likes": comments.count(
+                interact.get("liked_count", raw.get("liked_count", "0"))
+            ),
+            "collects": comments.count(
+                interact.get("collected_count", raw.get("collected_count", "0"))
+            ),
+            "comments": comments.count(
+                interact.get("comment_count", raw.get("comment_count", "0"))
+            ),
+            "shares": comments.count(
+                interact.get("share_count", raw.get("share_count", "0"))
+            ),
+        },
+        "hashtags": [],
+        "images": [
+            image.get("url_default") or image.get("url", "")
+            for image in (
+                note_card.get("image_list") or raw.get("image_list") or []
+            )
+            if isinstance(image, dict)
+        ],
+        "source": "crawler-xhr",
+    }
+
+
+def _crawl_xhs_public_pages(
+    page: Any,
+    topic: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Read indexed public note pages through the active browser context."""
+    items: List[Dict[str, Any]] = []
+    for result in _discover_site_results(topic, limit):
+        try:
+            page.goto(result["url"], wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(500)
+            if urllib.parse.urlsplit(page.url).path.rstrip("/") == "/404":
+                continue
+            title = (
+                page.locator("meta[property='og:title']")
+                .first.get_attribute("content")
+                or page.title()
+                or ""
+            )
+            desc = (
+                page.locator("meta[property='og:description']")
+                .first.get_attribute("content")
+                or page.locator("meta[name='description']")
+                .first.get_attribute("content")
+                or ""
+            )
+            title = re.sub(r"\s*-\s*小红书\s*$", "", title).strip()
+            desc = _clean_text(desc)
+            if not title or "访问的页面不见了" in title:
+                continue
+            if relevance.token_overlap_relevance(topic, f"{title} {desc}") <= 0:
+                continue
+            items.append(
+                {
+                    "title": title,
+                    "desc": desc,
+                    "url": result["url"],
+                    "author_name": "",
+                    "author_id": "",
+                    "date": None,
+                    "engagement": {
+                        "likes": 0,
+                        "collects": 0,
+                        "comments": 0,
+                        "shares": 0,
+                    },
+                    "hashtags": re.findall(r"#([^#\s]+)#?", f"{title} {desc}"),
+                    "images": [],
+                    "source": "crawler-public-page",
+                }
+            )
+            if len(items) >= limit:
+                break
+        except Exception:
+            continue
+    if items:
+        sys.stderr.write(
+            f"[爬虫-小红书] 搜索页要求登录，已从公开笔记详情页读取 {len(items)} 条内容。\n"
+        )
+    return items
 
 
 def _fetch_html(url: str, timeout: int = 8) -> str:
@@ -378,8 +691,7 @@ def _enrich_note_comments(items: List[Dict[str, Any]]) -> None:
         return
 
     try:
-        from . import crawler_bridge
-        with crawler_bridge._launch_browser_context(
+        with browser.browser_context(
             "xiaohongshu",
             mobile=False,
         ) as (_, _, page):
@@ -409,7 +721,7 @@ def _enrich_note_comments(items: List[Dict[str, Any]]) -> None:
                         wait_until="domcontentloaded",
                         timeout=30000,
                     )
-                    crawler_bridge._wait_for(
+                    browser.wait_for(
                         page,
                         lambda: isinstance(captured["payload"], dict),
                         timeout_ms=10000,

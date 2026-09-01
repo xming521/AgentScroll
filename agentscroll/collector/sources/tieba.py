@@ -9,7 +9,7 @@ from html.parser import HTMLParser
 from typing import Any, Iterable, Mapping
 from urllib.parse import urljoin, urlsplit
 
-from . import comments, crawler_bridge, page_content, throttle
+from . import browser, comments, page_content, throttle
 
 
 _TIEBA_HOSTS = {"tieba.baidu.com"}
@@ -330,7 +330,7 @@ def collect_hotlist_threads(
                 "prepare_error": f"{type(exc).__name__}: {exc}",
             })
 
-    if not crawler_bridge.is_playwright_available():
+    if not browser.is_playwright_available():
         browser_error = "Playwright 浏览器不可用，无法打开贴吧帖子页"
         return [
             {
@@ -346,7 +346,7 @@ def collect_hotlist_threads(
         ]
 
     results: list[dict[str, Any]] = []
-    with crawler_bridge._launch_browser_context("tieba") as (_, __, page):
+    with browser.browser_context("tieba") as (_, __, page):
         for item in prepared:
             error = item.get("prepare_error")
             posts: list[dict[str, Any]] = []

@@ -173,9 +173,9 @@ def collect_hotlist_threads(
         except Exception as exc:
             prepared.append((query, None, f"{type(exc).__name__}: {exc}"))
 
-    from . import crawler_bridge
+    from . import browser
 
-    if not crawler_bridge.is_playwright_available():
+    if not browser.is_playwright_available():
         browser_error = "Playwright 浏览器不可用，无法打开知乎详情页"
         return [
             {
@@ -189,7 +189,7 @@ def collect_hotlist_threads(
         ]
 
     results: List[Dict[str, Any]] = []
-    with crawler_bridge._launch_browser_context("zhihu") as (_, __, page):
+    with browser.browser_context("zhihu") as (_, __, page):
         for query, seed, error in prepared:
             post: Optional[Dict[str, Any]] = None
             if seed is not None and error is None:
@@ -428,12 +428,12 @@ def _enrich_zhihu_details_with_browser(
     if not items:
         return items
     try:
-        from . import crawler_bridge
+        from . import browser
 
-        if not crawler_bridge.is_playwright_available():
+        if not browser.is_playwright_available():
             return items
         enriched: List[Dict[str, Any]] = []
-        with crawler_bridge._launch_browser_context("zhihu") as (_, _, page):
+        with browser.browser_context("zhihu") as (_, _, page):
             for seed in items:
                 item = _read_detail_in_browser(page, seed)
                 if item is not None:
