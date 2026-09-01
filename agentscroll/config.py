@@ -70,6 +70,12 @@ class ScheduleSettings(BaseModel):
         return f"{hour:02d}:{minute:02d}"
 
 
+class StorageSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    database_path: Path = Path("outputs/agentscroll.sqlite3")
+
+
 class SharePolicySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -154,6 +160,7 @@ class AgentScrollSettings(BaseModel):
     max_workers: int = Field(default=10, gt=0)
     api: APISettings
     codex_exec: CodexExecSettings = Field(default_factory=CodexExecSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
     integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
@@ -242,6 +249,7 @@ __all__ = [
     "ShareDestinationSettings",
     "SharePolicySettings",
     "SharingSettings",
+    "StorageSettings",
     "build_configured_client",
     "load_settings",
     "make_configured_request",

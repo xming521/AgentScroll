@@ -25,6 +25,14 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 可通过 `AGENTSCROLL_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
 
+`storage.database_path` 指定跨轮次状态数据库，默认是 `outputs/agentscroll.sqlite3`。数据库只包含三张业务表：
+
+- `hotlist_topics`：热点稳定 ID 和当前有效知识；常用的类别、状态、时间、标题、知识、聊天语境、最新进展和分享评分是独立字段，标题链和更新链放在 `payload_json`。
+- `hotlist_title_cache`：第一轮成功判断过的全部标题缓存，包括入选、未入选、`seen` 和精确命中的标题；按规范化标题去重并刷新最近出现时间，只用于 7 天窗口内避免重复分析。
+- `share_jobs`：每个分享目标的等待、发送中和最终任务状态，以及冻结的发送 `payload_json`，用于限流和重启恢复。
+
+筛选、采集、知识卡和分享批次文件继续作为 review 产物保存，推理与分享审计继续写 JSONL；这些文件不作为生产状态读取。新版本不会导入、回读或双写旧的热榜历史 JSON 和分享 `state.json`。
+
 ### 推理审计日志
 
 同步 LLM 调用默认写入 `outputs/logs/llm_audit/YYYY-MM-DD.jsonl`，文件权限为 `600`。每次逻辑调用使用一个 `call_id` 串联以下事件：
@@ -278,11 +286,11 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
 
 每个 `sharing.destinations` 项选择一个 transport，并独立计算限额；`target` 的格式由对应 transport 校验。以上配置会让普通消息每个目标在滚动 60 分钟内最多发送 2 条，且相邻普通消息至少间隔 10 分钟；一个批次只保留评分最高的 2 条普通消息，其余不排队。达到 4.0 分的消息立即发送、条数不限，不受普通限额影响也不占普通额度。新批次会替换上一批尚未发送的普通消息，不形成跨批次积压；某个已选消息发送失败时也不会再用低分条目补位。
 
-分享状态保存在 `outputs/sharing/state.json`，逐日审计写入 `outputs/sharing/YYYY-MM-DD.jsonl`。状态文件记录各目标使用的 transport、普通额度和待执行任务，用于重启恢复；审计日志只保存目标摘要、任务结果和错误类型，不保存 API Key 或消息正文。首次创建状态文件时会把当时最新的分享批次记为基线，不发送此前积累的批次。AstrBot transport 只有建立连接失败时才分别等待 1 秒、3 秒重试；服务返回错误或读取响应时结果不确定均不重试，后者按可能已发送处理以防重复。
+分享任务和普通额度保存在 `storage.database_path` 指定数据库的 `share_jobs`，逐日审计写入 `outputs/sharing/YYYY-MM-DD.jsonl`。审计日志只保存目标摘要、任务结果和错误类型，不保存 API Key 或消息正文；`outputs/shares/` 下的批次 JSON/TXT 仅供 review，分发器不会扫描它们恢复任务。AstrBot transport 只有建立连接失败时才分别等待 1 秒、3 秒重试；服务返回错误或读取响应时结果不确定均不重试，后者按可能已发送处理以防重复。
 
 ### Docker 后台运行
 
-仓库根目录的 `compose.yaml` 会同时启动 AgentScroll 和必需的 NewsNow。AgentScroll 只连接 Compose 内的 `http://newsnow:4444`，并等待 NewsNow 健康检查通过后才启动；NewsNow 数据保存在 `newsnow_data` volume，热榜快照、知识卡和分享队列仍写入仓库的 `outputs/`。
+仓库根目录的 `compose.yaml` 会同时启动 AgentScroll 和必需的 NewsNow。AgentScroll 只连接 Compose 内的 `http://newsnow:4444`，并等待 NewsNow 健康检查通过后才启动；NewsNow 数据保存在 `newsnow_data` volume，热榜快照、知识卡、分享 review 产物和 SQLite 数据库仍写入仓库的 `outputs/`。
 
 首次启动前准备本地配置：
 
@@ -328,14 +336,14 @@ docker compose down
 常用参数与产物：
 
 - 第一轮最多选择 15 个话题。
-- 热榜快照目录的 `hotlist_history.json` 同时保存近期未选标题和事件真实标题。后续筛选先按 Unicode 兼容字符、大小写和连续空白规范化后跳过完全相同的标题，再在本地为每个新标题召回最多 3 个相似历史事件；没有新标题时不调用筛选模型。历史窗口为快照日期及其之前连续 7 个自然日。
-- `hotlist_history.json` 的 `ignored_titles` 保存未选标题及最近出现时间；`events` 中每项保存稳定的 `event_id`、`label`、首末出现时间、最终状态、真实标题数组，以及当前知识卡的 `current_card_file` 和 `current_topic_id`。旧事件仍可保留，但只有窗口内标题参与匹配。
-- 第一轮模型在原有一次请求中同时返回 `new`、`update` 和 `seen`。`seen` 不再采集；`new` 生成新卡，`update` 读取历史事件当前卡片后验证是否确有进展。每个当前标题最多召回 3 个历史事件，不限制所有召回标题的合计字符数，也不生成摘要或 signature。
+- `hotlist_title_cache` 保存第一轮成功判断过的全部标题。后续筛选先按 Unicode 兼容字符、大小写和连续空白规范化后跳过完全相同的标题，再在本地为每个新标题召回最多 3 个相似热点；没有新标题时不调用筛选模型。缓存窗口为快照日期及其之前连续 7 个自然日。
+- `hotlist_topics` 的每一行同时表示热点稳定身份和当前有效知识；本轮标题和成功更新链保存在 `payload_json`。旧热点可以长期保留，但只有窗口内标题参与匹配。
+- 第一轮模型在原有一次请求中同时返回 `new`、`update` 和 `seen`。`seen` 不再采集；`new` 创建热点，`update` 读取同一行中的当前知识，并把 7 天窗口内成功更新的代表标题和同话题标题按更新时间从旧到新放入 `timeline`，供知识卡模型判断是否确有新进展。每个当前标题最多召回 3 个热点，不限制所有召回标题的合计字符数，也不生成摘要或 signature。
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
-- `--share-output-dir` 可以单独指定分享目录。
-- 一次运行先保存一份标题筛选 JSON，再保存最终分享队列；有 `new` 话题时另存一份只包含新卡的批次 JSON 和 TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、事件关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、历史文件、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
-- 新卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 不进入新批次，而是在原卡中改写 `knowledge` 并替换 `latest_update`；该对象保存更新时间、当前标题、本次进展摘要及本次证据。证据不足或被淘汰的更新不改原卡。
+- `--share-output-dir` 可以单独指定分享 review 产物目录。
+- 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
+- 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 会同步改写 `hotlist_topics` 的当前 `knowledge` 和 `latest_update`，并向 `payload_json` 的 `updates` 追加记录；证据不足或被淘汰的更新不改变当前有效知识，也不进入更新链。
 - 每张卡片用顶层 `share_score` 记录 0 分或 1 至 4 分的分享评分，最多保留一位小数；低于 3 分时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
 - 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`skipped_empty_evidence_count` 和 `skipped_empty_evidence_topics` 记录第一轮与补搜都没有可读正文、因而跳过模型请求的话题数和话题 ID；`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 

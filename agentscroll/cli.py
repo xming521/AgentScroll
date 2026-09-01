@@ -188,7 +188,7 @@ def hotlist_fetch(
     help="每个话题期望保留的可读采集入口数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
-@click.option("--share-output-dir", type=_PATH, help="分享队列目录。")
+@click.option("--share-output-dir", type=_PATH, help="分享 review 产物目录。")
 @click.option("--no-supplement", is_flag=True, help="关闭失败话题的自动补搜。")
 @click.option("--generation-effort", default="xhigh", show_default=True)
 @click.option("--supplement-effort", default="xhigh", show_default=True)
@@ -204,7 +204,7 @@ def hotlist_learn(
     generation_effort: str,
     supplement_effort: str,
 ) -> None:
-    """粗筛热榜、采集证据并生成知识卡和分享队列。"""
+    """粗筛热榜、采集证据并生成知识卡和分享 review 产物。"""
     from agentscroll.workflows import learn_hotlist_snapshot
 
     result = _run(
@@ -244,7 +244,7 @@ def hotlist_learn(
     help="每个话题期望保留的可读采集入口数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
-@click.option("--share-output-dir", type=_PATH, help="分享队列目录。")
+@click.option("--share-output-dir", type=_PATH, help="分享 review 产物目录。")
 @click.option("--no-supplement", is_flag=True, help="关闭失败话题的自动补搜。")
 @click.option("--generation-effort", default="xhigh", show_default=True)
 @click.option("--supplement-effort", default="xhigh", show_default=True)
@@ -327,7 +327,7 @@ def hotlist_run(
             lambda: ShareDispatcher(
                 settings.sharing,
                 transports=transports,
-                share_output_dir=share_output_dir,
+                database_path=settings.storage.database_path,
             )
         )
         policy = settings.sharing.policy
@@ -342,10 +342,20 @@ def hotlist_run(
     def scheduled_run() -> None:
         result = run_once()
         if share_dispatcher is not None:
-            manifest_file = result.get("learn", {}).get("share_manifest_file")
-            if manifest_file:
+            learned = result.get("learn", {})
+            share_group_id = learned.get("share_group_id")
+            generated_at = learned.get("share_generated_at")
+            shares = learned.get("shares")
+            if (
+                share_group_id
+                and generated_at
+                and isinstance(shares, list)
+                and shares
+            ):
                 try:
-                    result["sharing"] = share_dispatcher.submit_manifest(manifest_file)
+                    result["sharing"] = share_dispatcher.submit_shares(
+                        str(share_group_id), str(generated_at), shares
+                    )
                 except (OSError, RuntimeError, ValueError) as exc:
                     result["sharing"] = {
                         "status": "error",

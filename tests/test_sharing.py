@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -12,6 +12,7 @@ from agentscroll.config import (
 )
 from agentscroll.sharing import SendResult, ShareDispatcher
 from agentscroll.sharing.dispatcher import _earliest_normal_time
+from agentscroll.storage import connect_database, database_transaction
 
 
 class FakeTransport:
@@ -55,36 +56,32 @@ def _share(score: float, index: int) -> dict[str, object]:
     }
 
 
-def _write_manifest(path, generated_at: datetime, scores: list[float]) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "generated_at": generated_at.isoformat(timespec="seconds"),
-                "share_count": len(scores),
-                "shares": [
-                    _share(score, index) for index, score in enumerate(scores)
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+def _jobs(database: Path) -> list[dict[str, object]]:
+    connection = connect_database(database)
+    try:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM share_jobs ORDER BY destination_id, share_group_id, share_index"
+            )
+        ]
+    finally:
+        connection.close()
 
 
-def _dispatcher(tmp_path, current_time, *, targets=("room-one",)):
-    shares = tmp_path / "shares"
-    sharing = tmp_path / "sharing"
-    shares.mkdir()
+def _dispatcher(tmp_path: Path, current_time, *, targets=("room-one",)):
+    database = tmp_path / "agentscroll.sqlite3"
     transport = FakeTransport()
     dispatcher = ShareDispatcher(
         _settings(targets=targets),
         transports={"fake": transport},
-        share_output_dir=shares,
-        sharing_output_dir=sharing,
+        database_path=database,
+        sharing_output_dir=tmp_path / "sharing",
         now=lambda: current_time[0],
     )
     scheduler = BlockingScheduler(timezone=timezone.utc)
     dispatcher.attach_scheduler(scheduler)
-    return dispatcher, scheduler, shares, transport
+    return dispatcher, scheduler, database, transport
 
 
 def test_rolling_window_and_minimum_interval() -> None:
@@ -111,127 +108,117 @@ def test_rolling_window_and_minimum_interval() -> None:
     assert second == base + timedelta(minutes=70)
 
 
-def test_first_start_baselines_history_and_new_batch_is_bounded(tmp_path) -> None:
+def test_batch_is_persisted_and_bounded_without_reading_review_files(
+    tmp_path: Path,
+) -> None:
     now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
-    shares = tmp_path / "shares"
-    shares.mkdir()
-    old = shares / "20260831-115900-000000+0800_即时分享批次.json"
-    _write_manifest(old, now[0] - timedelta(minutes=1), [4.0, 3.9])
-    dispatcher = ShareDispatcher(
-        _settings(),
-        transports={"fake": FakeTransport()},
-        share_output_dir=shares,
-        sharing_output_dir=tmp_path / "sharing",
-        now=lambda: now[0],
+    review_dir = tmp_path / "shares"
+    review_dir.mkdir()
+    (review_dir / "old_即时分享批次.json").write_text("{}", encoding="utf-8")
+    dispatcher, _scheduler, database, _transport = _dispatcher(tmp_path, now)
+
+    result = dispatcher.submit_shares(
+        "batch-1",
+        now[0],
+        [_share(score, index) for index, score in enumerate([4.0, 3.8, 3.5, 3.4])],
     )
-    scheduler = BlockingScheduler(timezone=timezone.utc)
-    dispatcher.attach_scheduler(scheduler)
-
-    assert scheduler.get_jobs() == []
-
-    new = shares / "20260831-120000-000000+0800_即时分享批次.json"
-    _write_manifest(new, now[0], [4.0, 3.8, 3.5, 3.4])
-    result = dispatcher.submit_manifest(new)
 
     assert result["bypass_scheduled"] == 1
     assert result["normal_scheduled"] == 2
     assert result["dropped"] == 1
-
-    state = json.loads(dispatcher.state_path.read_text(encoding="utf-8"))
-    destination_state = next(iter(state["destinations"].values()))
-    pending = destination_state["pending"]
-    assert len(pending) == 3
+    jobs = _jobs(database)
+    assert len(jobs) == 4
+    assert [job["status"] for job in jobs].count("waiting") == 3
     normal_due = [
-        datetime.fromisoformat(job["due_at"])
-        for job in pending
-        if not job["bypass"]
+        datetime.fromisoformat(str(job["due_at"]))
+        for job in jobs
+        if not job["bypass"] and job["status"] == "waiting"
     ]
     assert normal_due == [now[0], now[0] + timedelta(minutes=10)]
 
 
 def test_destinations_are_independent_and_new_batch_supersedes_waiting_normal(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
-    dispatcher, scheduler, shares, _transport = _dispatcher(
+    dispatcher, scheduler, database, _transport = _dispatcher(
         tmp_path,
         now,
         targets=("room-one", "room-two"),
     )
-    first = shares / "20260831-120000-000000+0800_即时分享批次.json"
-    _write_manifest(first, now[0], [3.9, 3.8])
-    result = dispatcher.submit_manifest(first)
+    result = dispatcher.submit_shares(
+        "batch-1", now[0], [_share(3.9, 0), _share(3.8, 1)]
+    )
     assert result["normal_scheduled"] == 4
 
     now[0] += timedelta(minutes=5)
-    second = shares / "20260831-120500-000000+0800_即时分享批次.json"
-    _write_manifest(second, now[0], [3.7])
-    result = dispatcher.submit_manifest(second)
+    result = dispatcher.submit_shares("batch-2", now[0], [_share(3.7, 2)])
 
     assert result["normal_scheduled"] == 2
-    state = json.loads(dispatcher.state_path.read_text(encoding="utf-8"))
-    for destination_state in state["destinations"].values():
-        pending = [
-            job for job in destination_state["pending"] if not job["bypass"]
+    jobs = _jobs(database)
+    for destination_id in {str(job["destination_id"]) for job in jobs}:
+        destination_jobs = [
+            job for job in jobs if job["destination_id"] == destination_id
         ]
-        assert len(pending) == 1
-        assert pending[0]["manifest_file"] == str(second)
+        assert sum(job["status"] == "superseded" for job in destination_jobs) == 2
+        waiting = [job for job in destination_jobs if job["status"] == "waiting"]
+        assert len(waiting) == 1
+        assert waiting[0]["share_group_id"] == "batch-2"
     assert len(scheduler.get_jobs()) == 2
 
 
-def test_dispatcher_sends_through_injected_transport_and_records_quota(
-    tmp_path,
-) -> None:
+def test_dispatcher_sends_frozen_payload_and_records_quota(tmp_path: Path) -> None:
     now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
-    dispatcher, _scheduler, shares, transport = _dispatcher(tmp_path, now)
-    manifest = shares / "20260831-120000-000000+0800_即时分享批次.json"
-    _write_manifest(manifest, now[0], [3.9])
-    dispatcher.submit_manifest(manifest)
-    state = json.loads(dispatcher.state_path.read_text(encoding="utf-8"))
-    destination_id, destination_state = next(iter(state["destinations"].items()))
-    job = destination_state["pending"][0]
+    dispatcher, _scheduler, database, transport = _dispatcher(tmp_path, now)
+    dispatcher.submit_shares("batch-1", now[0], [_share(3.9, 0)])
+    job = _jobs(database)[0]
 
-    dispatcher._execute_job(destination_id, job["job_id"])
+    dispatcher._execute_job(str(job["job_id"]))
 
-    state = json.loads(dispatcher.state_path.read_text(encoding="utf-8"))
-    destination_state = state["destinations"][destination_id]
-    assert destination_state["pending"] == []
-    assert destination_state["normal_events"][0]["status"] == "sent"
+    sent = _jobs(database)[0]
+    assert sent["status"] == "sent"
+    assert sent["reserved_at"] == now[0].isoformat(timespec="seconds")
     assert transport.messages == [
         ("room-one", "message-0\nhttps://example.com/0"),
         ("room-one", "comment-0"),
     ]
 
 
-def test_restart_marks_inflight_normal_as_unknown_without_resending(tmp_path) -> None:
+def test_restart_marks_inflight_as_unknown_without_resending(tmp_path: Path) -> None:
     now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
-    dispatcher, _scheduler, shares, _transport = _dispatcher(tmp_path, now)
-    manifest = shares / "20260831-120000-000000+0800_即时分享批次.json"
-    _write_manifest(manifest, now[0], [3.9])
-    dispatcher.submit_manifest(manifest)
-    state = json.loads(dispatcher.state_path.read_text(encoding="utf-8"))
-    destination_id, destination_state = next(iter(state["destinations"].items()))
-    pending = destination_state["pending"][0]
-    pending["status"] = "inflight"
-    destination_state["normal_events"].append(
-        {
-            "job_id": pending["job_id"],
-            "at": now[0].isoformat(),
-            "status": "inflight",
-        }
-    )
-    dispatcher.state_path.write_text(json.dumps(state), encoding="utf-8")
+    dispatcher, _scheduler, database, _transport = _dispatcher(tmp_path, now)
+    dispatcher.submit_shares("batch-1", now[0], [_share(3.9, 0)])
+    job = _jobs(database)[0]
+    with database_transaction(database, immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE share_jobs
+            SET status = 'inflight', reserved_at = ?, updated_at = ?
+            WHERE job_id = ?
+            """,
+            (now[0].isoformat(), now[0].isoformat(), job["job_id"]),
+        )
 
     restarted = ShareDispatcher(
         _settings(),
         transports={"fake": FakeTransport()},
-        share_output_dir=shares,
+        database_path=database,
         sharing_output_dir=tmp_path / "sharing",
         now=lambda: now[0],
     )
     restarted.attach_scheduler(BlockingScheduler(timezone=timezone.utc))
 
-    recovered = json.loads(restarted.state_path.read_text(encoding="utf-8"))
-    destination_state = recovered["destinations"][destination_id]
-    assert destination_state["pending"] == []
-    assert destination_state["normal_events"][0]["status"] == "unknown"
+    recovered = _jobs(database)[0]
+    assert recovered["status"] == "unknown"
+    assert recovered["reserved_at"] == now[0].isoformat()
+
+
+def test_share_group_submission_is_idempotent(tmp_path: Path) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    dispatcher, _scheduler, database, _transport = _dispatcher(tmp_path, now)
+    dispatcher.submit_shares("batch-1", now[0], [_share(3.9, 0)])
+
+    result = dispatcher.submit_shares("batch-1", now[0], [_share(3.9, 0)])
+
+    assert result["status"] == "already_processed"
+    assert len(_jobs(database)) == 1

@@ -97,18 +97,19 @@ def select_hotlist_first_pass(
         load_settings,
         make_configured_request,
     )
+    from agentscroll.storage import resolve_database_path
     from .hotlist_history import (
         active_exact_title_keys,
         attach_history_matches,
-        history_path,
         load_history,
         order_candidates_by_similarity,
         record_first_pass,
         reference_time,
     )
 
+    settings = load_settings(config_path)
     entries = list_hotlist_entries(hotlist)
-    state_path = history_path(hotlist)
+    state_path = resolve_database_path(settings.storage.database_path)
     evaluated_at = reference_time(hotlist)
     history_state = load_history(state_path)
     cached_title_keys = active_exact_title_keys(history_state, at=evaluated_at)
@@ -130,9 +131,8 @@ def select_hotlist_first_pass(
     if not candidates:
         record_first_pass(
             state_path,
-            history_state,
             exact_titles=exact_titles,
-            ignored_titles=[],
+            analyzed_titles=[],
             seen_topics=[],
             at=evaluated_at,
         )
@@ -144,7 +144,7 @@ def select_hotlist_first_pass(
             "seen_count": 0,
             "topics": [],
             "seen_topics": [],
-            "history_file": str(state_path),
+            "database_path": str(state_path),
             "history_event_count": len(history_state.get("events") or []),
             "history_match_count": 0,
             "history_prompt_chars": 0,
@@ -162,7 +162,6 @@ def select_hotlist_first_pass(
         )
     )
     candidate_payloads = order_candidates_by_similarity(candidate_payloads)
-    settings = load_settings(config_path)
     request = make_configured_request(
         _first_pass_prompt(candidate_payloads),
         settings,
@@ -325,16 +324,10 @@ def select_hotlist_first_pass(
             )
         )
 
-    ignored_titles = [
-        candidate["title"]
-        for candidate in candidates
-        if candidate["id"] not in selected_ids
-    ]
     record_first_pass(
         state_path,
-        history_state,
         exact_titles=exact_titles,
-        ignored_titles=ignored_titles,
+        analyzed_titles=[str(candidate["title"]) for candidate in candidates],
         seen_topics=seen_topics,
         at=evaluated_at,
     )
@@ -347,7 +340,7 @@ def select_hotlist_first_pass(
         "seen_count": len(seen_topics),
         "topics": topics,
         "seen_topics": seen_topics,
-        "history_file": str(state_path),
+        "database_path": str(state_path),
         "history_event_count": history_stats["active_event_count"],
         "history_match_count": history_stats["history_match_count"],
         "history_prompt_chars": history_stats["history_prompt_chars"],
@@ -432,7 +425,7 @@ def _save_first_pass_selection(
         "candidate_count": selection.get("candidate_count"),
         "topic_count": len(items),
         "seen_count": len(seen_items),
-        "history_file": selection.get("history_file"),
+        "database_path": selection.get("database_path"),
         "history_event_count": selection.get("history_event_count"),
         "history_match_count": selection.get("history_match_count"),
         "history_prompt_chars": selection.get("history_prompt_chars"),
@@ -486,7 +479,7 @@ def learn_hotlist_snapshot(
         record_history=True,
     )
     result["selection_file"] = str(selection_file)
-    result["history_file"] = str(selection["history_file"])
+    result["database_path"] = str(selection["database_path"])
     result["seen_count"] = int(selection.get("seen_count") or 0)
     return result
 

@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -405,16 +406,14 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "label": label,
                 "event_relation": event_relation,
                 "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
-                "current_card_file": str(raw_topic.get("current_card_file") or ""),
-                "current_topic_id": raw_topic.get("current_topic_id"),
                 "previous_card": (
                     dict(raw_topic["previous_card"])
                     if isinstance(raw_topic.get("previous_card"), Mapping)
                     else None
                 ),
-                "known_update_titles": [
+                "timeline": [
                     str(title)
-                    for title in raw_topic.get("known_update_titles") or []
+                    for title in raw_topic.get("timeline") or []
                     if str(title).strip()
                 ],
                 "evidence": compact_evidence,
@@ -432,7 +431,7 @@ def _selection_with_update_contexts(
     at: datetime,
 ) -> dict[str, Any]:
     """Attach only the current card fields needed to evaluate an update."""
-    from .hotlist_history import load_history, recent_update_titles
+    from .hotlist_history import load_history, recent_update_timeline
 
     selected_by_id = {
         topic.get("representative_id"): topic
@@ -446,16 +445,15 @@ def _selection_with_update_contexts(
     ]
     history: Mapping[str, Any] = {"events": []}
     if update_topics:
-        history_file = str(selection.get("history_file") or "").strip()
-        if not history_file:
-            raise ValueError("update 话题缺少 history_file")
-        history = load_history(history_file)
+        database_path = str(selection.get("database_path") or "").strip()
+        if not database_path:
+            raise ValueError("update 话题缺少 database_path")
+        history = load_history(database_path)
     events_by_id = {
         str(event.get("event_id") or ""): event
         for event in history.get("events") or []
         if isinstance(event, Mapping)
     }
-    batch_cache: dict[Path, Mapping[str, Any]] = {}
     enriched_topics = []
     for raw_topic in evidence.get("topics") or []:
         if not isinstance(raw_topic, Mapping):
@@ -476,44 +474,20 @@ def _selection_with_update_contexts(
         event = events_by_id.get(event_id)
         if not isinstance(event, Mapping):
             raise ValueError(f"找不到 update 对应的历史事件：{event_id!r}")
-        card_file = Path(str(event.get("current_card_file") or "")).expanduser()
-        current_topic_id = event.get("current_topic_id")
-        if not card_file.is_file() or current_topic_id is None:
-            raise ValueError(f"历史事件 {event_id} 没有可更新的当前知识卡")
-        card_file = card_file.resolve()
-        batch = batch_cache.get(card_file)
-        if batch is None:
-            loaded = json.loads(card_file.read_text(encoding="utf-8"))
-            if not isinstance(loaded, Mapping) or not isinstance(
-                loaded.get("cards"), list
-            ):
-                raise ValueError(f"历史知识卡批次结构无效：{card_file}")
-            batch = loaded
-            batch_cache[card_file] = batch
-        current_card = next(
-            (
-                card
-                for card in batch["cards"]
-                if isinstance(card, Mapping)
-                and card.get("topic_id") == current_topic_id
-            ),
-            None,
-        )
-        if not isinstance(current_card, Mapping):
-            raise ValueError(
-                f"历史知识卡 {card_file} 中找不到 topic_id={current_topic_id!r}"
-            )
-        raw_latest_update = current_card.get("latest_update")
-        if isinstance(raw_latest_update, Mapping):
-            previous_latest_update: Any = {
-                "updated_at": str(raw_latest_update.get("updated_at") or ""),
-                "title": str(raw_latest_update.get("title") or ""),
-                "summary": str(raw_latest_update.get("summary") or ""),
-            }
-        elif str(raw_latest_update or "").strip():
+        raw_latest_update = event.get("latest_update")
+        if str(raw_latest_update or "").strip():
+            updates = [
+                update
+                for update in event.get("updates") or []
+                if isinstance(update, Mapping)
+            ]
+            last_update = updates[-1] if updates else {}
+            update_titles = last_update.get("titles") or []
             previous_latest_update = {
-                "updated_at": "",
-                "title": "",
+                "updated_at": str(
+                    last_update.get("updated_at") or event.get("updated_at") or ""
+                ),
+                "title": str(update_titles[0] if update_titles else event.get("title") or ""),
                 "summary": str(raw_latest_update).strip(),
             }
         else:
@@ -521,14 +495,12 @@ def _selection_with_update_contexts(
         topic.update(
             {
                 "matched_event_id": event_id,
-                "current_card_file": str(card_file),
-                "current_topic_id": current_topic_id,
-                "known_update_titles": recent_update_titles(event, at=at),
+                "timeline": recent_update_timeline(event, at=at),
                 "previous_card": {
-                    "title": str(current_card.get("title") or ""),
-                    "status": str(current_card.get("status") or ""),
-                    "knowledge": str(current_card.get("knowledge") or ""),
-                    "chat_context": str(current_card.get("chat_context") or ""),
+                    "title": str(event.get("title") or ""),
+                    "status": str(event.get("status") or ""),
+                    "knowledge": str(event.get("knowledge") or ""),
+                    "chat_context": str(event.get("chat_context") or ""),
                     "latest_update": previous_latest_update,
                 },
             }
@@ -576,9 +548,7 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
     }
     if payload["relation"] == "update":
         payload["previous_card"] = dict(topic.get("previous_card") or {})
-        payload["known_update_titles"] = list(
-            topic.get("known_update_titles") or []
-        )
+        payload["timeline"] = list(topic.get("timeline") or [])
     if research:
         payload["research_evidence"] = compact_items(
             topic.get("research_evidence")
@@ -1166,6 +1136,7 @@ def _save_share_batch(
     inference: Mapping[str, Any],
     output_dir: str | Path | None,
     generated_at: datetime | None = None,
+    stored_topic_ids: Mapping[Any, str] | None = None,
 ) -> dict[str, Any]:
     destination = (
         Path(output_dir).expanduser().resolve()
@@ -1175,7 +1146,19 @@ def _save_share_batch(
     generated_at = generated_at or datetime.now().astimezone()
     timestamp = generated_at.strftime("%Y%m%d-%H%M%S-%f%z")
     shares = _share_documents(cards, evidence=evidence)
+    if stored_topic_ids:
+        shares = [
+            {
+                **share,
+                "topic_id": stored_topic_ids.get(
+                    share["topic_id"], str(share["topic_id"])
+                ),
+            }
+            for share in shares
+        ]
+    share_group_id = uuid.uuid4().hex
     document = {
+        "share_group_id": share_group_id,
         "generated_at": generated_at.isoformat(timespec="seconds"),
         "share_count": len(shares),
         "inference": dict(inference),
@@ -1200,8 +1183,11 @@ def _save_share_batch(
         json_tmp.replace(json_path)
         text_tmp.replace(text_path)
     return {
+        "share_group_id": share_group_id,
+        "share_generated_at": document["generated_at"],
         "share_count": len(shares),
-        "share_manifest_file": str(json_path),
+        "shares": shares,
+        "share_review_file": str(json_path),
         "share_text_file": str(text_path),
     }
 
@@ -1301,142 +1287,61 @@ def _save_selected_cards(
     cards: list[dict[str, Any]],
     *,
     evidence: Mapping[str, Any],
+    selection: Mapping[str, Any],
     inference: Mapping[str, Any],
     output_dir: str | Path | None,
     share_output_dir: str | Path | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Save new cards and replace the latest section of existing update cards."""
+    at: datetime,
+    record_history: bool,
+) -> dict[str, Any]:
+    """Persist current topic state and write an immutable review batch."""
     topics_by_id = {
         topic["topic_id"]: topic
         for topic in evidence.get("topics") or []
         if isinstance(topic, Mapping)
     }
-    new_cards = [
-        card
-        for card in cards
-        if topics_by_id[card["topic_id"]].get("event_relation") != "update"
-    ]
-    files: dict[str, Any] = {}
-    new_batch_path: Path | None = None
-    if new_cards:
-        new_topic_ids = {card["topic_id"] for card in new_cards}
-        new_evidence = dict(evidence)
-        new_evidence["topics"] = [
-            dict(topic)
-            for topic_id, topic in topics_by_id.items()
-            if topic_id in new_topic_ids
-        ]
-        files.update(
-            _save_cards(
-                new_cards,
-                evidence=new_evidence,
-                inference=inference,
-                output_dir=output_dir,
-                save_share_queue=False,
-            )
-        )
-        new_batch_path = Path(files["batch_json_file"]).resolve()
-
     updated_at = datetime.now().astimezone()
     updated_at_text = updated_at.isoformat(timespec="seconds")
-    patches_by_file: dict[Path, list[tuple[dict[str, Any], Mapping[str, Any]]]] = {}
     event_results: list[dict[str, Any]] = []
     for card in cards:
         topic = topics_by_id[card["topic_id"]]
         relation = str(topic.get("event_relation") or "new")
-        if relation == "new":
-            if new_batch_path is None:
-                raise RuntimeError("新事件缺少知识卡批次")
-            card_file = new_batch_path
-            card_topic_id = card["topic_id"]
-        elif relation == "update":
-            card_file = Path(str(topic.get("current_card_file") or "")).resolve()
-            card_topic_id = topic.get("current_topic_id")
-            if card["status"] == "complete":
-                patches_by_file.setdefault(card_file, []).append((card, topic))
-        else:
+        if relation not in {"new", "update"}:
             raise ValueError(f"无效的事件关系：{relation!r}")
         event_results.append(
             {
                 "topic_id": card["topic_id"],
                 "status": card["status"],
-                "card_file": str(card_file),
-                "card_topic_id": card_topic_id,
                 "title": str(topic.get("title") or ""),
                 "updated_at": updated_at_text,
                 "knowledge": card["knowledge"],
+                "chat_context": card["chat_context"],
                 "latest_update": card.get("latest_update", ""),
                 "share_score": card["share_score"],
-                "evidence": list(topic.get("evidence") or []),
-                "research_evidence": list(topic.get("research_evidence") or []),
             }
         )
 
-    for batch_path, patches in patches_by_file.items():
-        raw_batch = json.loads(batch_path.read_text(encoding="utf-8"))
-        if not isinstance(raw_batch, Mapping) or not isinstance(
-            raw_batch.get("cards"), list
-        ):
-            raise ValueError(f"历史知识卡批次结构无效：{batch_path}")
-        batch = dict(raw_batch)
-        documents = [
-            dict(document)
-            for document in raw_batch["cards"]
-            if isinstance(document, Mapping)
-        ]
-        documents_by_id = {
-            document.get("topic_id"): document for document in documents
-        }
-        for card, topic in patches:
-            current_topic_id = topic.get("current_topic_id")
-            document = documents_by_id.get(current_topic_id)
-            if document is None:
-                raise ValueError(
-                    f"历史知识卡 {batch_path} 中找不到 topic_id={current_topic_id!r}"
-                )
-            document.update(
-                {
-                    "updated_at": updated_at_text,
-                    "status": "complete",
-                    "rejection_reason": "",
-                    "knowledge": card["knowledge"],
-                    "chat_context": card["chat_context"],
-                    "latest_update": {
-                        "updated_at": updated_at_text,
-                        "title": str(topic.get("title") or ""),
-                        "summary": str(card.get("latest_update") or ""),
-                        "evidence": list(topic.get("evidence") or []),
-                        "research_evidence": list(
-                            topic.get("research_evidence") or []
-                        ),
-                        "collection_attempts": list(topic.get("attempts") or []),
-                    },
-                    "share_score": card["share_score"],
-                    "share": card["share"],
-                    "research_sources": card.get("research_sources") or [],
-                }
-            )
-        batch["updated_at"] = updated_at_text
-        batch["status_counts"] = {
-            status: sum(document.get("status") == status for document in documents)
-            for status in sorted(_STATUSES)
-        }
-        batch["cards"] = documents
-        text_path = batch_path.with_suffix(".txt")
-        json_tmp = batch_path.with_suffix(".json.tmp")
-        text_tmp = text_path.with_suffix(".txt.tmp")
-        batch_text = "\n\n=====\n\n".join(
-            _render_card_text(document).rstrip() for document in documents
-        ) + "\n"
-        with _write_lock:
-            json_tmp.write_text(
-                json.dumps(batch, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            text_tmp.write_text(batch_text, encoding="utf-8")
-            json_tmp.replace(batch_path)
-            text_tmp.replace(text_path)
+    stored_topic_ids: dict[Any, str] = {}
+    if record_history:
+        from .hotlist_history import record_final_batch
 
+        database_path = str(selection.get("database_path") or "").strip()
+        if not database_path:
+            raise ValueError("记录热点状态时缺少 database_path")
+        stored_topic_ids = record_final_batch(
+            database_path,
+            selection,
+            event_results,
+            at=at,
+        )
+
+    files = _save_cards(
+        cards,
+        evidence=evidence,
+        inference=inference,
+        output_dir=output_dir,
+        save_share_queue=False,
+    )
     files.update(
         _save_share_batch(
             cards,
@@ -1444,13 +1349,19 @@ def _save_selected_cards(
             inference=inference,
             output_dir=share_output_dir,
             generated_at=updated_at,
+            stored_topic_ids=stored_topic_ids,
         )
     )
     files["updated_card_count"] = sum(
-        len(items) for items in patches_by_file.values()
+        topics_by_id[card["topic_id"]].get("event_relation") == "update"
+        and card["status"] == "complete"
+        for card in cards
     )
-    files["new_card_count"] = len(new_cards)
-    return files, event_results
+    files["new_card_count"] = sum(
+        topics_by_id[card["topic_id"]].get("event_relation") != "update"
+        for card in cards
+    )
+    return files
 
 
 def _generate_hotlist_knowledge_cards(
@@ -1592,24 +1503,18 @@ def generate_selected_hotlist_knowledge_cards(
         saving_evidence = final_result.pop("_saving_evidence", evidence)
     else:
         final_result = initial_result
-    files, event_results = _save_selected_cards(
+    files = _save_selected_cards(
         final_result["cards"],
         evidence=saving_evidence,
+        selection=enriched_selection,
         inference=final_result["inference"],
         output_dir=output_dir,
         share_output_dir=share_output_dir,
+        at=reference_time(hotlist),
+        record_history=record_history,
     )
     final_result.update(files)
     final_result["search_query_inference"] = search_query_inference
-    if record_history:
-        from .hotlist_history import record_final_batch
-
-        record_final_batch(
-            str(selection.get("history_file") or ""),
-            enriched_selection,
-            event_results,
-            at=reference_time(hotlist),
-        )
     return final_result
 
 
@@ -1641,10 +1546,8 @@ def supplement_hotlist_knowledge_cards(
                 "label": topic["label"],
                 "event_relation": topic["event_relation"],
                 "matched_event_id": topic["matched_event_id"],
-                "current_card_file": topic["current_card_file"],
-                "current_topic_id": topic["current_topic_id"],
                 "previous_card": topic["previous_card"],
-                "known_update_titles": topic["known_update_titles"],
+                "timeline": topic["timeline"],
                 "evidence": topic["evidence"],
             }
         )

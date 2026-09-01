@@ -21,6 +21,11 @@
     "effort": "low"
   },
 
+  "storage": {
+    // 跨轮次热点、标题缓存和分享任务共用的 SQLite 数据库。
+    "database_path": "outputs/agentscroll.sqlite3"
+  },
+
   "schedule": {
     // 在每日执行时间范围内，每隔多久拉取并学习一次。
     "every": "2h",

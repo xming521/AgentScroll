@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import threading
 import unicodedata
 import uuid
 from collections import Counter
@@ -16,31 +15,17 @@ from typing import Any
 
 from agentscroll.collector.newsnow import _title_dedupe_key
 from agentscroll.collector.sources.cjk import CHINESE_STOPWORDS, segment_with_pos
+from agentscroll.storage import connect_database, database_transaction
 
-HISTORY_FILENAME = "hotlist_history.json"
-HISTORY_VERSION = 1
 ACTIVE_DAYS = 7
 MATCHES_PER_TITLE = 3
 MATCH_SCORE_THRESHOLD = 0.4
 SIMILARITY_ORDER_THRESHOLD = 0.4
 RECENT_PERSON_WINDOW = timedelta(hours=6)
 
-_write_lock = threading.Lock()
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _VISIBLE_TOKEN_RE = re.compile(r"[\w\u3400-\u9fff]", re.UNICODE)
 _EVENT_STATUSES = {"complete", "needs_research", "rejected"}
-
-
-def history_path(hotlist: Mapping[str, Any] | str | Path) -> Path:
-    """Resolve history beside the hot-list snapshot, replacing the old cache."""
-    snapshot_file: str | Path | None = None
-    if isinstance(hotlist, (str, Path)):
-        snapshot_file = hotlist
-    elif isinstance(hotlist.get("snapshot_file"), (str, Path)):
-        snapshot_file = hotlist["snapshot_file"]
-    if snapshot_file:
-        return Path(snapshot_file).expanduser().resolve().parent / HISTORY_FILENAME
-    return (Path.cwd() / "outputs" / "hotlists" / HISTORY_FILENAME).resolve()
 
 
 def reference_time(hotlist: Mapping[str, Any] | str | Path) -> datetime:
@@ -61,51 +46,56 @@ def reference_time(hotlist: Mapping[str, Any] | str | Path) -> datetime:
     return datetime.now().astimezone()
 
 
-def empty_history() -> dict[str, Any]:
-    return {
-        "version": HISTORY_VERSION,
-        "updated_at": None,
-        "ignored_titles": [],
-        "events": [],
-    }
-
-
 def load_history(path: str | Path) -> dict[str, Any]:
-    """Load only the current history schema; old cache files are ignored."""
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        return empty_history()
-    raw = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping) or raw.get("version") != HISTORY_VERSION:
-        raise ValueError(f"不支持的热榜历史文件：{source}")
-    ignored = raw.get("ignored_titles")
-    events = raw.get("events")
-    if not isinstance(ignored, list) or not isinstance(events, list):
-        raise ValueError(f"热榜历史文件结构无效：{source}")
+    """Load durable topic state and the exact-title cache from SQLite."""
+    connection = connect_database(path)
+    try:
+        events = [_topic_row(row) for row in connection.execute(
+            "SELECT * FROM hotlist_topics ORDER BY first_seen_at, topic_id"
+        )]
+        title_cache = [
+            {
+                "normalized": str(row["normalized_title"]),
+                "text": str(row["title"]),
+                "last_seen_at": str(row["last_seen_at"]),
+            }
+            for row in connection.execute(
+                "SELECT normalized_title, title, last_seen_at "
+                "FROM hotlist_title_cache ORDER BY last_seen_at, normalized_title"
+            )
+        ]
+        return {"title_cache": title_cache, "events": events}
+    finally:
+        connection.close()
+
+
+def _topic_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"热点 {row['topic_id']!r} 的 payload_json 无效") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"热点 {row['topic_id']!r} 的 payload_json 必须是 object")
+    titles = payload.get("titles") or []
+    updates = payload.get("updates") or []
+    if not isinstance(titles, list) or not isinstance(updates, list):
+        raise ValueError(f"热点 {row['topic_id']!r} 的 titles/updates 必须是数组")
     return {
-        "version": HISTORY_VERSION,
-        "updated_at": raw.get("updated_at"),
-        "ignored_titles": [dict(item) for item in ignored if isinstance(item, Mapping)],
-        "events": [dict(item) for item in events if isinstance(item, Mapping)],
+        "event_id": str(row["topic_id"]),
+        "label": str(row["label"]),
+        "status": str(row["status"]),
+        "last_result_status": str(row["last_result_status"]),
+        "first_seen_at": str(row["first_seen_at"]),
+        "last_seen_at": str(row["last_seen_at"]),
+        "updated_at": str(row["updated_at"]),
+        "title": str(row["title"]),
+        "knowledge": str(row["knowledge"]),
+        "chat_context": str(row["chat_context"]),
+        "latest_update": row["latest_update"],
+        "share_score": float(row["share_score"]),
+        "titles": [dict(item) for item in titles if isinstance(item, Mapping)],
+        "updates": [dict(item) for item in updates if isinstance(item, Mapping)],
     }
-
-
-def save_history(path: str | Path, history: Mapping[str, Any], *, at: datetime) -> None:
-    destination = Path(path).expanduser().resolve()
-    document = {
-        "version": HISTORY_VERSION,
-        "updated_at": at.isoformat(timespec="seconds"),
-        "ignored_titles": list(history.get("ignored_titles") or []),
-        "events": list(history.get("events") or []),
-    }
-    temporary = destination.with_suffix(f"{destination.suffix}.tmp")
-    with _write_lock:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(destination)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -128,28 +118,17 @@ def _is_active(value: Any, *, at: datetime) -> bool:
 
 def active_exact_title_keys(history: Mapping[str, Any], *, at: datetime) -> set[str]:
     keys: set[str] = set()
-    for item in history.get("ignored_titles") or []:
+    for item in history.get("title_cache") or []:
         if not isinstance(item, Mapping) or not _is_active(item.get("last_seen_at"), at=at):
             continue
         key = _title_dedupe_key(str(item.get("text") or ""))
         if key:
             keys.add(key)
-    for event in history.get("events") or []:
-        if not isinstance(event, Mapping):
-            continue
-        for item in event.get("titles") or []:
-            if not isinstance(item, Mapping) or not _is_active(
-                item.get("last_seen_at"), at=at
-            ):
-                continue
-            key = _title_dedupe_key(str(item.get("text") or ""))
-            if key:
-                keys.add(key)
     return keys
 
 
-def recent_update_titles(event: Mapping[str, Any], *, at: datetime) -> list[str]:
-    """Return active successful-update titles from oldest to newest."""
+def recent_update_timeline(event: Mapping[str, Any], *, at: datetime) -> list[str]:
+    """Return recent successful-update titles from oldest to newest."""
     raw_updates = event.get("updates") or []
     if not isinstance(raw_updates, list):
         raise ValueError(f"事件 {event.get('event_id')!r} 的 updates 必须是数组")
@@ -455,21 +434,6 @@ def attach_history_matches(
     }
 
 
-def _refresh_exact_titles(
-    history: dict[str, Any], titles: list[str], *, at: datetime
-) -> None:
-    keys = {_title_dedupe_key(title) for title in titles if title.strip()}
-    timestamp = at.isoformat(timespec="seconds")
-    for item in history.get("ignored_titles") or []:
-        if _title_dedupe_key(str(item.get("text") or "")) in keys:
-            item["last_seen_at"] = timestamp
-    for event in history.get("events") or []:
-        for item in event.get("titles") or []:
-            if _title_dedupe_key(str(item.get("text") or "")) in keys:
-                item["last_seen_at"] = timestamp
-                event["last_seen_at"] = timestamp
-
-
 def _add_event_title(
     event: dict[str, Any], title: str, *, origin: str, at: datetime
 ) -> None:
@@ -493,70 +457,80 @@ def _add_event_title(
     )
 
 
-def _event_by_id(history: Mapping[str, Any], event_id: str) -> dict[str, Any]:
-    for event in history.get("events") or []:
-        if str(event.get("event_id") or "") == event_id:
-            return event
-    raise ValueError(f"热榜历史中不存在事件：{event_id}")
-
-
 def record_first_pass(
     path: str | Path,
-    history: dict[str, Any],
     *,
     exact_titles: list[str],
-    ignored_titles: list[str],
+    analyzed_titles: list[str],
     seen_topics: list[Mapping[str, Any]],
     at: datetime,
 ) -> None:
-    """Commit exact hits, unselected titles, and model-confirmed seen aliases."""
-    _refresh_exact_titles(history, exact_titles, at=at)
+    """Cache every judged title and refresh model-confirmed seen topics."""
     timestamp = at.isoformat(timespec="seconds")
     first_date = at.date() - timedelta(days=ACTIVE_DAYS - 1)
-    retained_ignored = []
-    for item in history.get("ignored_titles") or []:
-        last_seen_at = _parse_timestamp(item.get("last_seen_at"))
-        if last_seen_at is not None and last_seen_at.date() >= first_date:
-            retained_ignored.append(item)
-    ignored_by_key = {
-        _title_dedupe_key(str(item.get("text") or "")): item
-        for item in retained_ignored
-        if _title_dedupe_key(str(item.get("text") or ""))
-    }
-    for title in ignored_titles:
-        normalized_title = " ".join(title.split())
-        key = _title_dedupe_key(normalized_title)
-        if not key:
-            continue
-        item = ignored_by_key.get(key)
-        if item is None:
-            item = {"text": normalized_title, "normalized": key}
-            retained_ignored.append(item)
-            ignored_by_key[key] = item
-        item["last_seen_at"] = timestamp
-    history["ignored_titles"] = retained_ignored
+    cached_titles: dict[str, str] = {}
+    for raw_title in [*exact_titles, *analyzed_titles]:
+        title = " ".join(str(raw_title or "").split())
+        key = _title_dedupe_key(title)
+        if key:
+            cached_titles[key] = title
 
-    for topic in seen_topics:
-        event_id = str(topic.get("matched_event_id") or "")
-        event = _event_by_id(history, event_id)
-        event["last_seen_at"] = timestamp
-        representative = topic.get("representative")
-        if isinstance(representative, Mapping):
-            _add_event_title(
-                event,
-                str(representative.get("title") or ""),
-                origin="representative",
-                at=at,
-            )
-        for related in topic.get("related") or []:
-            if isinstance(related, Mapping):
+    with database_transaction(path, immediate=True) as connection:
+        connection.execute(
+            "DELETE FROM hotlist_title_cache WHERE substr(last_seen_at, 1, 10) < ?",
+            (first_date.isoformat(),),
+        )
+        connection.executemany(
+            """
+            INSERT INTO hotlist_title_cache(normalized_title, title, last_seen_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(normalized_title) DO UPDATE SET
+                title = excluded.title,
+                last_seen_at = excluded.last_seen_at
+            """,
+            [(key, title, timestamp) for key, title in cached_titles.items()],
+        )
+
+        for topic in seen_topics:
+            event_id = str(topic.get("matched_event_id") or "")
+            row = connection.execute(
+                "SELECT * FROM hotlist_topics WHERE topic_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"热榜历史中不存在事件：{event_id}")
+            event = _topic_row(row)
+            representative = topic.get("representative")
+            if isinstance(representative, Mapping):
                 _add_event_title(
                     event,
-                    str(related.get("title") or ""),
-                    origin="related",
+                    str(representative.get("title") or ""),
+                    origin="representative",
                     at=at,
                 )
-    save_history(path, history, at=at)
+            for related in topic.get("related") or []:
+                if isinstance(related, Mapping):
+                    _add_event_title(
+                        event,
+                        str(related.get("title") or ""),
+                        origin="related",
+                        at=at,
+                    )
+            payload = {
+                "titles": event["titles"],
+                "updates": event["updates"],
+            }
+            connection.execute(
+                """
+                UPDATE hotlist_topics
+                SET last_seen_at = ?, payload_json = ?
+                WHERE topic_id = ?
+                """,
+                (
+                    timestamp,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    event_id,
+                ),
+            )
 
 
 def _card_titles(
@@ -602,96 +576,146 @@ def record_final_batch(
     event_results: list[Mapping[str, Any]],
     *,
     at: datetime,
-) -> None:
-    """Record durable new cards and in-place updates in the event history."""
-    history = load_history(path)
+) -> dict[Any, str]:
+    """Persist current topic knowledge and return selection-to-topic IDs."""
     topics_by_id = {
         topic["representative_id"]: topic
         for topic in selection.get("topics") or []
         if isinstance(topic, Mapping)
     }
     timestamp = at.isoformat(timespec="seconds")
-    all_event_title_keys: set[str] = set()
-    for card in event_results:
-        topic_id = card.get("topic_id")
-        topic = topics_by_id.get(topic_id)
-        if not isinstance(topic, Mapping):
-            raise ValueError(f"找不到话题 {topic_id!r} 的筛选结果")
-        relation = str(topic.get("event_relation") or "new")
-        label = str(topic.get("label") or "")
-        status = str(card.get("status") or "")
-        card_file = Path(str(card.get("card_file") or "")).expanduser().resolve()
-        card_topic_id = card.get("card_topic_id")
-        if status not in _EVENT_STATUSES:
-            raise ValueError(f"知识卡包含无效状态：{status!r}")
-        if not card_file.is_file() or card_topic_id is None:
-            raise ValueError(f"话题 {topic_id!r} 缺少可用知识卡位置")
-        if relation == "update":
-            event = _event_by_id(history, str(topic.get("matched_event_id") or ""))
-        elif relation == "new":
-            event = {
-                "event_id": uuid.uuid4().hex,
-                "label": label,
-                "status": status,
-                "last_result_status": status,
-                "first_seen_at": timestamp,
-                "last_seen_at": timestamp,
-                "titles": [],
-                "updates": [],
-                "current_card_file": str(card_file),
-                "current_topic_id": card_topic_id,
-            }
-            history.setdefault("events", []).append(event)
-        else:
-            raise ValueError(f"无效的事件关系：{relation!r}")
+    stored_ids: dict[Any, str] = {}
+    with database_transaction(path, immediate=True) as connection:
+        for card in event_results:
+            selection_topic_id = card.get("topic_id")
+            topic = topics_by_id.get(selection_topic_id)
+            if not isinstance(topic, Mapping):
+                raise ValueError(f"找不到话题 {selection_topic_id!r} 的筛选结果")
+            relation = str(topic.get("event_relation") or "new")
+            label = str(topic.get("label") or "")
+            status = str(card.get("status") or "")
+            if status not in _EVENT_STATUSES:
+                raise ValueError(f"知识卡包含无效状态：{status!r}")
 
-        event["last_seen_at"] = timestamp
-        event["last_result_status"] = status
-        for title, origin in _card_titles(topic, card):
-            _add_event_title(event, title, origin=origin, at=at)
-            key = _title_dedupe_key(title)
-            if key:
-                all_event_title_keys.add(key)
-        if relation == "new" or status == "complete":
-            event["status"] = status
-            event["current_card_file"] = str(card_file)
-            event["current_topic_id"] = card_topic_id
-        if relation == "update" and status == "complete":
-            update_titles = _update_titles(topic, card)
-            knowledge = str(card.get("knowledge") or "").strip()
-            latest_update = str(card.get("latest_update") or "").strip()
-            if not update_titles or not knowledge or not latest_update:
-                raise ValueError(
-                    "完整更新缺少可序列化的 titles、knowledge 或 latest_update"
-                )
-            updates = event.setdefault("updates", [])
-            if not isinstance(updates, list):
-                raise ValueError(f"事件 {event['event_id']} 的 updates 必须是数组")
-            updates.append(
-                {
+            if relation == "update":
+                stored_topic_id = str(topic.get("matched_event_id") or "")
+                row = connection.execute(
+                    "SELECT * FROM hotlist_topics WHERE topic_id = ?",
+                    (stored_topic_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"热榜历史中不存在事件：{stored_topic_id}")
+                event = _topic_row(row)
+            elif relation == "new":
+                stored_topic_id = uuid.uuid4().hex
+                event = {
+                    "event_id": stored_topic_id,
+                    "label": label,
+                    "status": status,
+                    "last_result_status": status,
+                    "first_seen_at": timestamp,
+                    "last_seen_at": timestamp,
                     "updated_at": str(card.get("updated_at") or timestamp),
-                    "titles": update_titles,
-                    "knowledge": knowledge,
-                    "latest_update": latest_update,
-                    "share_score": card.get("share_score"),
+                    "title": str(card.get("title") or topic.get("title") or ""),
+                    "knowledge": str(card.get("knowledge") or ""),
+                    "chat_context": str(card.get("chat_context") or ""),
+                    "latest_update": None,
+                    "share_score": float(card.get("share_score") or 0),
+                    "titles": [],
+                    "updates": [],
                 }
-            )
+            else:
+                raise ValueError(f"无效的事件关系：{relation!r}")
 
-    history["ignored_titles"] = [
-        item
-        for item in history.get("ignored_titles") or []
-        if _title_dedupe_key(str(item.get("text") or "")) not in all_event_title_keys
-    ]
-    save_history(path, history, at=at)
+            stored_ids[selection_topic_id] = stored_topic_id
+            event["last_seen_at"] = timestamp
+            event["last_result_status"] = status
+            for title, origin in _card_titles(topic, card):
+                _add_event_title(event, title, origin=origin, at=at)
+
+            if relation == "new" or status == "complete":
+                event.update(
+                    {
+                        "status": status,
+                        "updated_at": str(card.get("updated_at") or timestamp),
+                        "knowledge": str(card.get("knowledge") or ""),
+                        "chat_context": str(card.get("chat_context") or ""),
+                        "share_score": float(card.get("share_score") or 0),
+                    }
+                )
+                if relation == "new":
+                    event["title"] = str(card.get("title") or topic.get("title") or "")
+                    event["latest_update"] = None
+                else:
+                    event["latest_update"] = str(card.get("latest_update") or "").strip()
+            if relation == "update" and status == "complete":
+                update_titles = _update_titles(topic, card)
+                knowledge = str(card.get("knowledge") or "").strip()
+                latest_update = str(card.get("latest_update") or "").strip()
+                if not update_titles or not knowledge or not latest_update:
+                    raise ValueError(
+                        "完整更新缺少可序列化的 titles、knowledge 或 latest_update"
+                    )
+                event["updates"].append(
+                    {
+                        "updated_at": str(card.get("updated_at") or timestamp),
+                        "titles": update_titles,
+                        "knowledge": knowledge,
+                        "latest_update": latest_update,
+                        "share_score": card.get("share_score"),
+                    }
+                )
+
+            payload = {
+                "titles": event["titles"],
+                "updates": event["updates"],
+            }
+            values = (
+                stored_topic_id,
+                str(event["label"]),
+                str(event["status"]),
+                str(event["last_result_status"]),
+                str(event["first_seen_at"]),
+                str(event["last_seen_at"]),
+                str(event["updated_at"]),
+                str(event["title"]),
+                str(event["knowledge"]),
+                str(event["chat_context"]),
+                event.get("latest_update"),
+                float(event["share_score"]),
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
+            connection.execute(
+                """
+                INSERT INTO hotlist_topics(
+                    topic_id, label, status, last_result_status,
+                    first_seen_at, last_seen_at, updated_at, title,
+                    knowledge, chat_context, latest_update, share_score, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(topic_id) DO UPDATE SET
+                    label = excluded.label,
+                    status = excluded.status,
+                    last_result_status = excluded.last_result_status,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at,
+                    title = excluded.title,
+                    knowledge = excluded.knowledge,
+                    chat_context = excluded.chat_context,
+                    latest_update = excluded.latest_update,
+                    share_score = excluded.share_score,
+                    payload_json = excluded.payload_json
+                """,
+                values,
+            )
+    return stored_ids
 
 
 __all__ = [
     "active_exact_title_keys",
     "attach_history_matches",
-    "history_path",
     "load_history",
     "order_candidates_by_similarity",
-    "recent_update_titles",
+    "recent_update_timeline",
     "record_final_batch",
     "record_first_pass",
     "reference_time",
