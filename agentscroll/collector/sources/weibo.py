@@ -5,10 +5,16 @@ import html
 import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlencode
 
 import httpx
-from mcp_server_weibo.consts import DEFAULT_HEADERS
+from mcp_server_weibo.consts import DEFAULT_HEADERS, SEARCH_URL
 from mcp_server_weibo.weibo import WeiboCrawler
+
+try:
+    from mcp_server_weibo.converters import to_feed_item as _to_feed_item
+except ImportError:  # mcp-server-weibo 1.2.x
+    _to_feed_item = None
 
 from . import comments, dates, live_artifacts, page_content, relevance, throttle
 
@@ -16,6 +22,7 @@ from . import comments, dates, live_artifacts, page_content, relevance, throttle
 _DETAIL_URL = "https://m.weibo.cn/statuses/show?id={feed_id}"
 _LONG_TEXT_URL = "https://m.weibo.cn/statuses/extend?id={feed_id}"
 _CONTENT_SOURCE = "mcp-server-weibo-feed-detail"
+_HOT_TOPIC_SEARCH_CANDIDATE_LIMIT = 15
 
 
 def search_weibo(
@@ -112,25 +119,42 @@ async def _collect_hot_topic_posts(
             })
             continue
         try:
-            feeds = await crawler.search_content(
+            feeds = await _safe_search_content(
+                crawler,
                 keyword=topic,
-                limit=posts_per_topic,
+                limit=max(posts_per_topic, _HOT_TOPIC_SEARCH_CANDIDATE_LIMIT),
                 page=1,
             )
             items = [_normalize_feed(feed) for feed in feeds]
             search_count = len(items)
-            await _enrich_post_contents(items, crawler=crawler)
-            items = _retain_date_range(
-                items,
-                from_date=from_date,
-                to_date=to_date,
-                require_known_date=require_known_date,
+            items = [
+                item
+                for item in items
+                if relevance.token_overlap_relevance(topic, item.get("text", ""))
+                >= relevance.MIN_POST_RELEVANCE
+            ]
+            items.sort(
+                key=lambda item: (item.get("engagement") or {}).get("comments", 0),
+                reverse=True,
             )
-            items = page_content.retain_readable_details(
-                items,
-                allowed_sources={_CONTENT_SOURCE},
-            )
-            posts = _rank_items(topic, items, posts_per_topic)
+            posts = []
+            for item in items:
+                await _enrich_post_contents([item], crawler=crawler)
+                retained = _retain_date_range(
+                    [item],
+                    from_date=from_date,
+                    to_date=to_date,
+                    require_known_date=require_known_date,
+                )
+                retained = page_content.retain_readable_details(
+                    retained,
+                    allowed_sources={_CONTENT_SOURCE},
+                )
+                if retained:
+                    posts.extend(retained)
+                if len(posts) >= posts_per_topic:
+                    break
+            posts = _rank_items_by_comments(topic, posts, posts_per_topic)
             await _enrich_post_comments(posts, crawler=crawler)
             results.append({
                 "query": topic,
@@ -199,10 +223,132 @@ def _rank_items(
     return scored[:limit]
 
 
+def _rank_items_by_comments(
+    topic: str,
+    items: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    scored = _rank_items(topic, items, len(items))
+    scored.sort(
+        key=lambda item: (item.get("engagement") or {}).get("comments", 0),
+        reverse=True,
+    )
+    return scored[:limit]
+
+
 async def _search_content(topic: str, limit: int) -> List[Dict[str, Any]]:
     crawler = WeiboCrawler()
-    feeds = await crawler.search_content(keyword=topic, limit=limit, page=1)
+    feeds = await _safe_search_content(
+        crawler,
+        keyword=topic,
+        limit=limit,
+        page=1,
+    )
     return [_normalize_feed(feed) for feed in feeds]
+
+
+async def _safe_search_content(
+    crawler: WeiboCrawler,
+    *,
+    keyword: str,
+    limit: int,
+    page: int,
+) -> List[Any]:
+    """Keep earlier Weibo search pages when a later API page fails."""
+    ensure_cookies = getattr(crawler, "_ensure_cookies", None)
+    legacy_converter = getattr(crawler, "_to_feed_item", None)
+    if not callable(ensure_cookies) or (
+        not callable(legacy_converter) and _to_feed_item is None
+    ):
+        return await crawler.search_content(keyword=keyword, limit=limit, page=page)
+
+    await ensure_cookies()
+    cookies = getattr(crawler, "cookies", None)
+    if not cookies:
+        raise RuntimeError("未能取得微博访客 Cookie")
+
+    client_options: Dict[str, Any] = {
+        "cookies": cookies,
+        "trust_env": False,
+        "timeout": 20,
+    }
+    transport = getattr(crawler, "_transport", None)
+    if transport is not None:
+        client_options["transport"] = transport
+
+    results: List[Any] = []
+    seen_ids: set[str] = set()
+    current_page = page
+    async with httpx.AsyncClient(**client_options) as client:
+        while len(results) < limit:
+            params = {
+                "containerid": f"100103type=1&q={keyword}",
+                "page_type": "searchall",
+                "page": current_page,
+            }
+            try:
+                response = await client.get(
+                    f"{SEARCH_URL}?{urlencode(params)}",
+                    headers=DEFAULT_HEADERS,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("ok") != 1:
+                    raise ValueError("微博搜索接口返回无效数据")
+            except (httpx.HTTPError, ValueError):
+                if results:
+                    break
+                raise
+
+            data = payload.get("data") or {}
+            cards = data.get("cards") or []
+            content_cards = []
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                if card.get("card_type") == 9:
+                    content_cards.append(card)
+                elif isinstance(card.get("card_group"), list):
+                    content_cards.extend(
+                        item
+                        for item in card["card_group"]
+                        if isinstance(item, dict) and item.get("card_type") == 9
+                    )
+            if not content_cards:
+                break
+
+            added_count = 0
+            for card in content_cards:
+                mblog = card.get("mblog")
+                if not isinstance(mblog, dict) or mblog.get("id") is None:
+                    continue
+                feed_id = str(mblog["id"])
+                if feed_id in seen_ids:
+                    continue
+                try:
+                    feed = (
+                        legacy_converter(mblog)
+                        if callable(legacy_converter)
+                        else _to_feed_item(mblog)
+                    )
+                except (ValueError, KeyError, TypeError):
+                    continue
+                results.append(feed)
+                seen_ids.add(feed_id)
+                added_count += 1
+                if len(results) >= limit:
+                    break
+
+            cardlist_info = data.get("cardlistInfo") or {}
+            if (
+                not added_count
+                or not cardlist_info.get("page")
+                or str(cardlist_info.get("page")) == "1"
+            ):
+                break
+            current_page += 1
+
+    return results[:limit]
 
 
 async def _enrich_post_contents(
