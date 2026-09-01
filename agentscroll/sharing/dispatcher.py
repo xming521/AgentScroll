@@ -16,7 +16,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from agentscroll.config import ShareDestinationSettings, SharingSettings
 
-from .message import render_share_message
+from .message import render_share_messages
 
 
 _STATE_VERSION = 1
@@ -420,7 +420,7 @@ class ShareDispatcher:
                 score = float(share["score"])
                 if score < 3 or score > 4:
                     raise ValueError
-                render_share_message(share)
+                render_share_messages(share)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"即时分享批次字段错误：{path}") from exc
         return document
@@ -513,7 +513,7 @@ class ShareDispatcher:
         try:
             manifest = self._load_manifest(Path(str(job["manifest_file"])))
             share = manifest["shares"][int(job["share_index"])]
-            message = render_share_message(share)
+            messages = render_share_messages(share)
         except (IndexError, OSError, TypeError, ValueError) as exc:
             self._finish_job(
                 destination_id,
@@ -524,7 +524,24 @@ class ShareDispatcher:
 
         destination_state = self._state["destinations"][destination_id]
         transport = self.transports[str(destination_state["transport"])]
-        result = transport.send(str(destination_state["target"]), message)
+        target = str(destination_state["target"])
+        attempts = 0
+        sent_count = 0
+        for message in messages:
+            result = transport.send(target, message)
+            attempts += result.attempts
+            if result.status == "sent":
+                sent_count += 1
+                continue
+            if sent_count:
+                result = SendResult(
+                    "unknown",
+                    f"partial_{result.status}:{result.detail}",
+                    attempts,
+                )
+            break
+        else:
+            result = SendResult("sent", "ok", attempts)
         self._finish_job(destination_id, job, result)
 
     def _finish_job(

@@ -148,6 +148,34 @@ def active_exact_title_keys(history: Mapping[str, Any], *, at: datetime) -> set[
     return keys
 
 
+def recent_update_titles(event: Mapping[str, Any], *, at: datetime) -> list[str]:
+    """Return active successful-update titles from oldest to newest."""
+    raw_updates = event.get("updates") or []
+    if not isinstance(raw_updates, list):
+        raise ValueError(f"事件 {event.get('event_id')!r} 的 updates 必须是数组")
+    ordered_updates: list[tuple[datetime, int, Mapping[str, Any]]] = []
+    for index, update in enumerate(raw_updates):
+        if not isinstance(update, Mapping):
+            continue
+        updated_at = _parse_timestamp(update.get("updated_at"))
+        if updated_at is None or not _is_active(updated_at, at=at):
+            continue
+        ordered_updates.append((updated_at, index, update))
+    ordered_updates.sort(key=lambda item: (item[0], item[1]))
+
+    titles: list[str] = []
+    seen: set[str] = set()
+    for _updated_at, _index, update in ordered_updates:
+        for raw_title in update.get("titles") or []:
+            title = " ".join(str(raw_title or "").split())
+            key = _title_dedupe_key(title)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            titles.append(title)
+    return titles
+
+
 def _weighted_terms(text: str) -> dict[str, float]:
     terms: dict[str, float] = {}
     normalized = unicodedata.normalize("NFKC", text).lower()
@@ -554,6 +582,20 @@ def _card_titles(
     return [(title, origin) for title, origin in titles if title.strip()]
 
 
+def _update_titles(topic: Mapping[str, Any], card: Mapping[str, Any]) -> list[str]:
+    titles: list[str] = []
+    seen: set[str] = set()
+    for title, origin in _card_titles(topic, card):
+        if origin == "evidence":
+            continue
+        key = _title_dedupe_key(title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        titles.append(title)
+    return titles
+
+
 def record_final_batch(
     path: str | Path,
     selection: Mapping[str, Any],
@@ -595,6 +637,7 @@ def record_final_batch(
                 "first_seen_at": timestamp,
                 "last_seen_at": timestamp,
                 "titles": [],
+                "updates": [],
                 "current_card_file": str(card_file),
                 "current_topic_id": card_topic_id,
             }
@@ -613,6 +656,26 @@ def record_final_batch(
             event["status"] = status
             event["current_card_file"] = str(card_file)
             event["current_topic_id"] = card_topic_id
+        if relation == "update" and status == "complete":
+            update_titles = _update_titles(topic, card)
+            knowledge = str(card.get("knowledge") or "").strip()
+            latest_update = str(card.get("latest_update") or "").strip()
+            if not update_titles or not knowledge or not latest_update:
+                raise ValueError(
+                    "完整更新缺少可序列化的 titles、knowledge 或 latest_update"
+                )
+            updates = event.setdefault("updates", [])
+            if not isinstance(updates, list):
+                raise ValueError(f"事件 {event['event_id']} 的 updates 必须是数组")
+            updates.append(
+                {
+                    "updated_at": str(card.get("updated_at") or timestamp),
+                    "titles": update_titles,
+                    "knowledge": knowledge,
+                    "latest_update": latest_update,
+                    "share_score": card.get("share_score"),
+                }
+            )
 
     history["ignored_titles"] = [
         item
@@ -628,6 +691,7 @@ __all__ = [
     "history_path",
     "load_history",
     "order_candidates_by_similarity",
+    "recent_update_titles",
     "record_final_batch",
     "record_first_pass",
     "reference_time",

@@ -198,10 +198,8 @@ def test_dispatcher_sends_through_injected_transport_and_records_quota(
     assert destination_state["pending"] == []
     assert destination_state["normal_events"][0]["status"] == "sent"
     assert transport.messages == [
-        (
-            "room-one",
-            "message-0\nhttps://example.com/0\n网友评论：comment-0",
-        )
+        ("room-one", "message-0\nhttps://example.com/0"),
+        ("room-one", "comment-0"),
     ]
 
 

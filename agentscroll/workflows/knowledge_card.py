@@ -19,7 +19,7 @@ from agentscroll.prompts.knowledge_card import (
     KNOWLEDGE_CARD_RESEARCH_PROMPT,
 )
 from agentscroll.prompts.hotlist import ZHIHU_SEARCH_QUERY_PROMPT
-from agentscroll.sharing.message import render_share_message
+from agentscroll.sharing.message import render_share_messages
 
 _LABEL_ALIASES = {
     "news": "news",
@@ -412,6 +412,11 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
                     if isinstance(raw_topic.get("previous_card"), Mapping)
                     else None
                 ),
+                "known_update_titles": [
+                    str(title)
+                    for title in raw_topic.get("known_update_titles") or []
+                    if str(title).strip()
+                ],
                 "evidence": compact_evidence,
             }
         )
@@ -423,9 +428,11 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _selection_with_update_contexts(
     evidence: Mapping[str, Any],
     selection: Mapping[str, Any],
+    *,
+    at: datetime,
 ) -> dict[str, Any]:
     """Attach only the current card fields needed to evaluate an update."""
-    from .hotlist_history import load_history
+    from .hotlist_history import load_history, recent_update_titles
 
     selected_by_id = {
         topic.get("representative_id"): topic
@@ -516,6 +523,7 @@ def _selection_with_update_contexts(
                 "matched_event_id": event_id,
                 "current_card_file": str(card_file),
                 "current_topic_id": current_topic_id,
+                "known_update_titles": recent_update_titles(event, at=at),
                 "previous_card": {
                     "title": str(current_card.get("title") or ""),
                     "status": str(current_card.get("status") or ""),
@@ -568,6 +576,9 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
     }
     if payload["relation"] == "update":
         payload["previous_card"] = dict(topic.get("previous_card") or {})
+        payload["known_update_titles"] = list(
+            topic.get("known_update_titles") or []
+        )
     if research:
         payload["research_evidence"] = compact_items(
             topic.get("research_evidence")
@@ -1173,7 +1184,7 @@ def _save_share_batch(
     json_path = destination / f"{timestamp}_即时分享批次.json"
     text_path = destination / f"{timestamp}_即时分享批次.txt"
     serialized_text = "\n\n=====\n\n".join(
-        render_share_message(share) for share in shares
+        "\n\n".join(render_share_messages(share)) for share in shares
     )
     if serialized_text:
         serialized_text += "\n"
@@ -1352,6 +1363,10 @@ def _save_selected_cards(
                 "card_file": str(card_file),
                 "card_topic_id": card_topic_id,
                 "title": str(topic.get("title") or ""),
+                "updated_at": updated_at_text,
+                "knowledge": card["knowledge"],
+                "latest_update": card.get("latest_update", ""),
+                "share_score": card["share_score"],
                 "evidence": list(topic.get("evidence") or []),
                 "research_evidence": list(topic.get("research_evidence") or []),
             }
@@ -1551,7 +1566,13 @@ def generate_selected_hotlist_knowledge_cards(
         posts_per_entry=posts_per_entry,
         max_entries_per_topic=max_entries_per_topic,
     )
-    evidence = _selection_with_update_contexts(evidence, enriched_selection)
+    from .hotlist_history import reference_time
+
+    evidence = _selection_with_update_contexts(
+        evidence,
+        enriched_selection,
+        at=reference_time(hotlist),
+    )
     initial_result = _generate_hotlist_knowledge_cards(
         evidence,
         config_path=config_path,
@@ -1581,7 +1602,7 @@ def generate_selected_hotlist_knowledge_cards(
     final_result.update(files)
     final_result["search_query_inference"] = search_query_inference
     if record_history:
-        from .hotlist_history import record_final_batch, reference_time
+        from .hotlist_history import record_final_batch
 
         record_final_batch(
             str(selection.get("history_file") or ""),
@@ -1623,6 +1644,7 @@ def supplement_hotlist_knowledge_cards(
                 "current_card_file": topic["current_card_file"],
                 "current_topic_id": topic["current_topic_id"],
                 "previous_card": topic["previous_card"],
+                "known_update_titles": topic["known_update_titles"],
                 "evidence": topic["evidence"],
             }
         )
