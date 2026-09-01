@@ -331,11 +331,18 @@ def hotlist_run(
             )
         )
         policy = settings.sharing.policy
+        if policy.mode == "score_only":
+            policy_summary = (
+                f"仅发送评分不低于 {policy.score_only.min_score:g} 的消息"
+            )
+        else:
+            policy_summary = (
+                f"普通消息每 {policy.window.window_minutes} 分钟最多 "
+                f"{policy.window.max_messages_per_window} 条"
+            )
         click.echo(
             "即时分享已启用："
-            f"{len(settings.sharing.destinations)} 个目标，"
-            f"普通消息每 {policy.window_minutes} 分钟最多 "
-            f"{policy.max_messages_per_window} 条",
+            f"{len(settings.sharing.destinations)} 个目标，{policy_summary}",
             err=True,
         )
 

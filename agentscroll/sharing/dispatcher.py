@@ -52,19 +52,36 @@ def _earliest_normal_time(
     window: timedelta,
     limit: int,
     min_interval: timedelta,
+    interval_reservations: list[datetime] | None = None,
 ) -> datetime:
     candidate = now
     ordered = sorted(reservations)
+    interval_ordered = sorted(
+        reservations if interval_reservations is None else interval_reservations
+    )
     while True:
         recent = [event_at for event_at in ordered if event_at > candidate - window]
         next_candidate = candidate
         if len(recent) >= limit:
             next_candidate = max(next_candidate, recent[-limit] + window)
-        if ordered:
-            next_candidate = max(next_candidate, ordered[-1] + min_interval)
+        if interval_ordered:
+            next_candidate = max(
+                next_candidate, interval_ordered[-1] + min_interval
+            )
         if next_candidate == candidate:
             return candidate
         candidate = next_candidate
+
+
+def _earliest_interval_time(
+    *,
+    now: datetime,
+    reservations: list[datetime],
+    min_interval: timedelta,
+) -> datetime:
+    if not reservations:
+        return now
+    return max(now, max(reservations) + min_interval)
 
 
 class ShareDispatcher:
@@ -101,8 +118,10 @@ class ShareDispatcher:
             else (Path.cwd() / "outputs" / "sharing").resolve()
         )
         self._now_factory = now or (lambda: datetime.now().astimezone())
-        self._window = timedelta(minutes=settings.policy.window_minutes)
-        self._min_interval = timedelta(minutes=settings.policy.min_interval_minutes)
+        self._window = timedelta(minutes=settings.policy.window.window_minutes)
+        self._min_interval = timedelta(
+            minutes=settings.policy.delivery.min_interval_minutes
+        )
         self._lock = RLock()
         self._scheduler: BlockingScheduler | None = None
 
@@ -161,7 +180,10 @@ class ShareDispatcher:
                         status = "dropped"
                         detail = "destination_removed"
                         event = "share_dropped_destination_removed"
-                    elif _parse_datetime(str(row["expires_at"])) <= now:
+                    elif (
+                        self.settings.policy.mode == "window"
+                        and _parse_datetime(str(row["expires_at"])) <= now
+                    ):
                         status = "expired"
                         detail = "expired_before_restore"
                         event = "share_dropped_expired"
@@ -236,6 +258,8 @@ class ShareDispatcher:
         scheduled: list[tuple[str, str]] = []
         removed_job_ids: list[str] = []
         audit_events: list[tuple[str, dict[str, Any]]] = []
+        policy = self.settings.policy
+        score_only = policy.mode == "score_only"
         summary: dict[str, Any] = {
             "status": "planned",
             "share_group_id": group_id,
@@ -281,22 +305,41 @@ class ShareDispatcher:
                             )
                         )
 
-                    reservations = self._normal_event_times(
-                        connection, destination_id, now
+                    reservations = (
+                        self._normal_event_times(connection, destination_id, now)
+                        if not score_only
+                        else []
+                    )
+                    interval_reservations = self._interval_event_times(
+                        connection, destination_id, include_waiting=True
                     )
                     ordinary_count = 0
                     for share_index, share in normalized_shares:
                         score = float(share["score"])
-                        bypass = score >= self.settings.policy.bypass_score
+                        eligible = (
+                            not score_only or score >= policy.score_only.min_score
+                        )
+                        immediate_score = policy.delivery.immediate_score
+                        immediate = (
+                            eligible
+                            and immediate_score is not None
+                            and score >= immediate_score
+                        )
+                        bypass = immediate
                         status = "waiting"
                         detail: str | None = None
                         due_at = now
-                        if expires_at <= now:
+                        if not eligible:
+                            status = "dropped"
+                            detail = "score_below_threshold"
+                        elif not score_only and expires_at <= now:
                             status = "expired"
                             detail = "batch_expired"
-                        elif not bypass:
+                        elif immediate:
+                            pass
+                        elif not score_only:
                             ordinary_count += 1
-                            if ordinary_count > self.settings.policy.max_messages_per_window:
+                            if ordinary_count > policy.window.max_messages_per_window:
                                 status = "dropped"
                                 detail = "batch_limit"
                             else:
@@ -304,14 +347,23 @@ class ShareDispatcher:
                                     now=now,
                                     reservations=reservations,
                                     window=self._window,
-                                    limit=self.settings.policy.max_messages_per_window,
+                                    limit=policy.window.max_messages_per_window,
                                     min_interval=self._min_interval,
+                                    interval_reservations=interval_reservations,
                                 )
                                 if due_at >= expires_at:
                                     status = "dropped"
                                     detail = "rate_limit"
                                 else:
                                     reservations.append(due_at)
+                                    interval_reservations.append(due_at)
+                        else:
+                            due_at = _earliest_interval_time(
+                                now=now,
+                                reservations=interval_reservations,
+                                min_interval=self._min_interval,
+                            )
+                            interval_reservations.append(due_at)
 
                         job_id = self._job_id(
                             group_id, destination_id, share_index, score, bypass
@@ -358,11 +410,15 @@ class ShareDispatcher:
                                 summary["normal_scheduled"] += 1
                         else:
                             summary["dropped"] += 1
+                            dropped_event = {
+                                "batch_expired": "share_dropped_expired",
+                                "score_below_threshold": (
+                                    "share_dropped_score_threshold"
+                                ),
+                            }.get(detail, "share_dropped_rate_limit")
                             audit_events.append(
                                 (
-                                    "share_dropped_expired"
-                                    if status == "expired"
-                                    else "share_dropped_rate_limit",
+                                    dropped_event,
                                     {
                                         "destination_id": destination_id,
                                         "job_id": job_id,
@@ -371,7 +427,7 @@ class ShareDispatcher:
                                 )
                             )
 
-                if expires_at <= now:
+                if not score_only and expires_at <= now:
                     summary["status"] = "expired"
 
             for job_id in removed_job_ids:
@@ -383,6 +439,7 @@ class ShareDispatcher:
             self._audit(
                 "share_batch_planned",
                 share_group_id=group_id,
+                mode=policy.mode,
                 bypass_scheduled=summary["bypass_scheduled"],
                 normal_scheduled=summary["normal_scheduled"],
                 dropped=summary["dropped"],
@@ -431,6 +488,47 @@ class ShareDispatcher:
             if (event_at := _parse_datetime(str(row["reserved_at"]))) > cutoff
         ]
 
+    def _interval_event_times(
+        self,
+        connection: sqlite3.Connection,
+        destination_id: str,
+        *,
+        exclude_job_id: str | None = None,
+        include_waiting: bool = False,
+    ) -> list[datetime]:
+        parameters: list[Any] = [destination_id]
+        exclude_sql = ""
+        if exclude_job_id is not None:
+            exclude_sql = " AND job_id != ?"
+            parameters.append(exclude_job_id)
+        rows = connection.execute(
+            """
+            SELECT reserved_at FROM share_jobs
+            WHERE destination_id = ? AND bypass = 0
+              AND status IN ('inflight', 'sent', 'unknown')
+              AND reserved_at IS NOT NULL
+            """
+            + exclude_sql,
+            parameters,
+        ).fetchall()
+        events = [_parse_datetime(str(row["reserved_at"])) for row in rows]
+        if include_waiting:
+            waiting_parameters: list[Any] = [destination_id]
+            waiting_exclude_sql = ""
+            if exclude_job_id is not None:
+                waiting_exclude_sql = " AND job_id != ?"
+                waiting_parameters.append(exclude_job_id)
+            waiting_rows = connection.execute(
+                "SELECT due_at FROM share_jobs "
+                "WHERE destination_id = ? AND bypass = 0 AND status = 'waiting'"
+                + waiting_exclude_sql,
+                waiting_parameters,
+            ).fetchall()
+            events.extend(
+                _parse_datetime(str(row["due_at"])) for row in waiting_rows
+            )
+        return events
+
     def _schedule_job(self, job_id: str, due_at: str) -> None:
         if self._scheduler is None:
             raise RuntimeError("Share dispatcher is not attached")
@@ -459,6 +557,7 @@ class ShareDispatcher:
         with self._lock:
             now = self._now()
             now_text = _isoformat(now)
+            policy = self.settings.policy
             audit_event: tuple[str, dict[str, Any]] | None = None
             with database_transaction(self.database_path, immediate=True) as connection:
                 row = connection.execute(
@@ -467,7 +566,10 @@ class ShareDispatcher:
                 if row is None or row["status"] != "waiting":
                     return
                 expires_at = _parse_datetime(str(row["expires_at"]))
-                if expires_at <= now:
+                if (
+                    policy.mode == "window"
+                    and expires_at <= now
+                ):
                     connection.execute(
                         """
                         UPDATE share_jobs
@@ -482,22 +584,58 @@ class ShareDispatcher:
                         {"destination_id": row["destination_id"], "job_id": job_id},
                     )
                 else:
-                    if not bool(row["bypass"]):
-                        reservations = self._normal_event_times(
+                    if (
+                        policy.mode == "score_only"
+                        and float(row["score"])
+                        < policy.score_only.min_score
+                    ):
+                        connection.execute(
+                            """
+                            UPDATE share_jobs
+                            SET status = 'dropped', finished_at = ?, updated_at = ?,
+                                result_detail = 'score_below_threshold'
+                            WHERE job_id = ? AND status = 'waiting'
+                            """,
+                            (now_text, now_text, job_id),
+                        )
+                        audit_event = (
+                            "share_dropped_score_threshold",
+                            {
+                                "destination_id": row["destination_id"],
+                                "job_id": job_id,
+                                "score": row["score"],
+                            },
+                        )
+                    elif not bool(row["bypass"]):
+                        destination_id = str(row["destination_id"])
+                        interval_reservations = self._interval_event_times(
                             connection,
-                            str(row["destination_id"]),
-                            now,
+                            destination_id,
                             exclude_job_id=job_id,
                         )
-                        due_at = _earliest_normal_time(
-                            now=now,
-                            reservations=reservations,
-                            window=self._window,
-                            limit=self.settings.policy.max_messages_per_window,
-                            min_interval=self._min_interval,
-                        )
+                        if policy.mode == "window":
+                            reservations = self._normal_event_times(
+                                connection,
+                                destination_id,
+                                now,
+                                exclude_job_id=job_id,
+                            )
+                            due_at = _earliest_normal_time(
+                                now=now,
+                                reservations=reservations,
+                                window=self._window,
+                                limit=policy.window.max_messages_per_window,
+                                min_interval=self._min_interval,
+                                interval_reservations=interval_reservations,
+                            )
+                        else:
+                            due_at = _earliest_interval_time(
+                                now=now,
+                                reservations=interval_reservations,
+                                min_interval=self._min_interval,
+                            )
                         if due_at > now:
-                            if due_at >= expires_at:
+                            if policy.mode == "window" and due_at >= expires_at:
                                 connection.execute(
                                     """
                                     UPDATE share_jobs

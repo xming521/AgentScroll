@@ -76,13 +76,37 @@ class StorageSettings(BaseModel):
     database_path: Path = Path("outputs/agentscroll.sqlite3")
 
 
-class SharePolicySettings(BaseModel):
+class WindowSharePolicySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     window_minutes: int = Field(default=60, gt=0)
     max_messages_per_window: int = Field(default=2, gt=0)
+
+
+class ShareDeliverySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     min_interval_minutes: int = Field(default=10, ge=0)
-    bypass_score: float = Field(default=4.0, ge=0, le=4)
+    immediate_score: float | None = Field(default=4.0, ge=3, le=4)
+
+
+class ScoreOnlySharePolicySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_score: float = Field(default=4.0, ge=3, le=4)
+
+
+class SharePolicySettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["window", "score_only"] = "window"
+    delivery: ShareDeliverySettings = Field(default_factory=ShareDeliverySettings)
+    window: WindowSharePolicySettings = Field(
+        default_factory=WindowSharePolicySettings
+    )
+    score_only: ScoreOnlySharePolicySettings = Field(
+        default_factory=ScoreOnlySharePolicySettings
+    )
 
 
 class ShareDestinationSettings(BaseModel):
@@ -246,10 +270,13 @@ __all__ = [
     "DEFAULT_CONFIG_PATH",
     "IntegrationsSettings",
     "ScheduleSettings",
+    "ScoreOnlySharePolicySettings",
+    "ShareDeliverySettings",
     "ShareDestinationSettings",
     "SharePolicySettings",
     "SharingSettings",
     "StorageSettings",
+    "WindowSharePolicySettings",
     "build_configured_client",
     "load_settings",
     "make_configured_request",

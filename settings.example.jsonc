@@ -40,11 +40,21 @@
     "enabled": false,
     "destinations": [],
     "policy": {
-      // 每个目标分别限制普通消息；4.0 分消息不受这些限制且不占普通额度。
-      "window_minutes": 60,
-      "max_messages_per_window": 2,
-      "min_interval_minutes": 10,
-      "bypass_score": 4.0
+      "mode": "window",
+      "delivery": {
+        // 普通分享遵守最小间隔；达到 immediate_score 的分享立即发送。
+        "min_interval_minutes": 10,
+        "immediate_score": 4.0
+      },
+      "window": {
+        // 每个目标分别限制普通分享。
+        "window_minutes": 60,
+        "max_messages_per_window": 2
+      },
+      "score_only": {
+        // 只发送达到 min_score 的消息。
+        "min_score": 4.0
+      }
     }
   },
 

@@ -6,9 +6,12 @@ from pathlib import Path
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from agentscroll.config import (
+    ScoreOnlySharePolicySettings,
+    ShareDeliverySettings,
     ShareDestinationSettings,
     SharePolicySettings,
     SharingSettings,
+    WindowSharePolicySettings,
 )
 from agentscroll.sharing import SendResult, ShareDispatcher
 from agentscroll.sharing.dispatcher import _earliest_normal_time
@@ -28,18 +31,27 @@ class FakeTransport:
         return SendResult("sent", "ok", 1)
 
 
-def _settings(*, targets: tuple[str, ...] = ("room-one",)) -> SharingSettings:
+def _settings(
+    *,
+    targets: tuple[str, ...] = ("room-one",),
+    policy: SharePolicySettings | None = None,
+) -> SharingSettings:
     return SharingSettings(
         enabled=True,
         destinations=tuple(
             ShareDestinationSettings(transport="fake", target=target)
             for target in targets
         ),
-        policy=SharePolicySettings(
-            window_minutes=60,
-            max_messages_per_window=2,
-            min_interval_minutes=10,
-            bypass_score=4.0,
+        policy=policy
+        or SharePolicySettings(
+            delivery=ShareDeliverySettings(
+                min_interval_minutes=10,
+                immediate_score=4.0,
+            ),
+            window=WindowSharePolicySettings(
+                window_minutes=60,
+                max_messages_per_window=2,
+            )
         ),
     )
 
@@ -69,11 +81,17 @@ def _jobs(database: Path) -> list[dict[str, object]]:
         connection.close()
 
 
-def _dispatcher(tmp_path: Path, current_time, *, targets=("room-one",)):
+def _dispatcher(
+    tmp_path: Path,
+    current_time,
+    *,
+    targets=("room-one",),
+    policy: SharePolicySettings | None = None,
+):
     database = tmp_path / "agentscroll.sqlite3"
     transport = FakeTransport()
     dispatcher = ShareDispatcher(
-        _settings(targets=targets),
+        _settings(targets=targets, policy=policy),
         transports={"fake": transport},
         database_path=database,
         sharing_output_dir=tmp_path / "sharing",
@@ -134,7 +152,98 @@ def test_batch_is_persisted_and_bounded_without_reading_review_files(
         for job in jobs
         if not job["bypass"] and job["status"] == "waiting"
     ]
-    assert normal_due == [now[0], now[0] + timedelta(minutes=10)]
+    assert normal_due == [
+        now[0],
+        now[0] + timedelta(minutes=10),
+    ]
+    immediate = next(job for job in jobs if job["bypass"])
+    assert immediate["due_at"] == now[0].isoformat()
+
+
+def test_score_only_sends_every_share_at_or_above_threshold_without_time_limits(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    policy = SharePolicySettings(
+        mode="score_only",
+        delivery=ShareDeliverySettings(
+            min_interval_minutes=10,
+            immediate_score=4.0,
+        ),
+        window=WindowSharePolicySettings(
+            window_minutes=60,
+            max_messages_per_window=1,
+        ),
+        score_only=ScoreOnlySharePolicySettings(min_score=3.8),
+    )
+    dispatcher, _scheduler, database, transport = _dispatcher(
+        tmp_path, now, policy=policy
+    )
+
+    result = dispatcher.submit_shares(
+        "batch-1",
+        now[0] - timedelta(hours=2),
+        [_share(score, index) for index, score in enumerate([3.9, 3.8, 3.7])],
+    )
+
+    assert result == {
+        "status": "planned",
+        "share_group_id": "batch-1",
+        "destination_count": 1,
+        "bypass_scheduled": 0,
+        "normal_scheduled": 2,
+        "dropped": 1,
+    }
+    jobs = _jobs(database)
+    assert [job["status"] for job in jobs] == ["waiting", "waiting", "dropped"]
+    assert [job["result_detail"] for job in jobs] == [
+        None,
+        None,
+        "score_below_threshold",
+    ]
+    assert [job["due_at"] for job in jobs[:2]] == [
+        now[0].isoformat(),
+        (now[0] + timedelta(minutes=10)).isoformat(),
+    ]
+
+    dispatcher._execute_job(str(jobs[0]["job_id"]))
+    now[0] += timedelta(minutes=10)
+    dispatcher._execute_job(str(jobs[1]["job_id"]))
+
+    assert [job["status"] for job in _jobs(database)] == ["sent", "sent", "dropped"]
+    assert transport.messages == [
+        ("room-one", "message-0\nhttps://example.com/0"),
+        ("room-one", "comment-0"),
+        ("room-one", "message-1\nhttps://example.com/1"),
+        ("room-one", "comment-1"),
+    ]
+
+
+def test_immediate_share_does_not_consume_ordinary_limits(tmp_path: Path) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    policy = SharePolicySettings(
+        delivery=ShareDeliverySettings(
+            min_interval_minutes=10,
+            immediate_score=4.0,
+        ),
+        window=WindowSharePolicySettings(
+            window_minutes=60,
+            max_messages_per_window=1,
+        ),
+    )
+    dispatcher, _scheduler, database, _transport = _dispatcher(
+        tmp_path, now, policy=policy
+    )
+    dispatcher.submit_shares("batch-1", now[0], [_share(4.0, 0)])
+    immediate = _jobs(database)[0]
+    dispatcher._execute_job(str(immediate["job_id"]))
+
+    result = dispatcher.submit_shares("batch-2", now[0], [_share(3.9, 1)])
+
+    ordinary = _jobs(database)[1]
+    assert result["normal_scheduled"] == 1
+    assert ordinary["status"] == "waiting"
+    assert ordinary["due_at"] == now[0].isoformat()
 
 
 def test_destinations_are_independent_and_new_batch_supersedes_waiting_normal(
