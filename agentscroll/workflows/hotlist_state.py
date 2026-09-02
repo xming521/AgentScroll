@@ -23,6 +23,11 @@ MATCH_SCORE_THRESHOLD = 0.4
 SIMILARITY_ORDER_THRESHOLD = 0.4
 RECENT_PERSON_WINDOW = timedelta(hours=6)
 
+_EVIDENCE_MATCH_COVERAGE_THRESHOLD = 0.65
+_EVIDENCE_MATCH_MIN_TERM_COUNT = 4
+_EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT = 2
+_EVIDENCE_MATCH_MIN_MARGIN = 0.1
+
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _VISIBLE_TOKEN_RE = re.compile(r"[\w\u3400-\u9fff]", re.UNICODE)
 _EVENT_STATUSES = {"complete", "needs_research", "rejected"}
@@ -434,6 +439,133 @@ def attach_history_matches(
     }
 
 
+def match_new_topics_from_evidence(
+    topics: list[Mapping[str, Any]],
+    history: Mapping[str, Any],
+    *,
+    at: datetime,
+) -> dict[int, dict[str, Any]]:
+    """Find high-confidence history matches using already collected evidence."""
+    event_documents: list[dict[str, Any]] = []
+    for event in history.get("events") or []:
+        if (
+            not isinstance(event, Mapping)
+            or event.get("status") != "complete"
+            or event.get("label") not in {"news", "fun"}
+        ):
+            continue
+        active_titles = [
+            str(item.get("text") or "")
+            for item in event.get("titles") or []
+            if isinstance(item, Mapping)
+            and _is_active(item.get("last_seen_at"), at=at)
+        ]
+        if not active_titles:
+            continue
+        terms = _weighted_terms(
+            "\n".join(
+                [
+                    str(event.get("title") or ""),
+                    str(event.get("knowledge") or ""),
+                    str(event.get("latest_update") or ""),
+                    *active_titles,
+                ]
+            )
+        )
+        if not terms:
+            continue
+        event_documents.append(
+            {
+                "event_id": str(event.get("event_id") or ""),
+                "label": str(event.get("label") or ""),
+                "title": str(event.get("title") or ""),
+                "terms": terms,
+            }
+        )
+    if not event_documents:
+        return {}
+
+    term_idf = _idf([set(item["terms"]) for item in event_documents])
+    matches: dict[int, dict[str, Any]] = {}
+    for topic in topics:
+        if not isinstance(topic, Mapping) or topic.get("event_relation") != "new":
+            continue
+        topic_id = topic.get("topic_id")
+        if isinstance(topic_id, bool) or not isinstance(topic_id, int):
+            continue
+        topic_title = str(topic.get("title") or "")
+        current_documents = [_weighted_terms(topic_title)]
+        for field in ("evidence", "research_evidence"):
+            for item in topic.get(field) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                current_documents.append(
+                    _weighted_terms(
+                        "\n".join(
+                            [
+                                topic_title,
+                                str(item.get("title") or ""),
+                                str(item.get("source_title") or ""),
+                                str(item.get("content") or ""),
+                            ]
+                        )
+                    )
+                )
+        ranked: list[dict[str, Any]] = []
+        for event in event_documents:
+            if event["label"] != topic.get("label"):
+                continue
+            event_terms = event["terms"]
+            best_document = (0.0, 0, 0)
+            for current_terms in current_documents:
+                overlap = set(event_terms).intersection(current_terms)
+                weighted_overlap = {
+                    term
+                    for term in overlap
+                    if event_terms[term] >= 2 and current_terms[term] >= 2
+                }
+                best_document = max(
+                    best_document,
+                    (
+                        _term_coverage(event_terms, current_terms, term_idf),
+                        len(overlap),
+                        len(weighted_overlap),
+                    ),
+                )
+            ranked.append(
+                {
+                    "event_id": event["event_id"],
+                    "history_title": event["title"],
+                    "coverage": best_document[0],
+                    "term_count": best_document[1],
+                    "weighted_term_count": best_document[2],
+                }
+            )
+        if not ranked:
+            continue
+        ranked.sort(
+            key=lambda item: (-item["coverage"], item["history_title"])
+        )
+        best = ranked[0]
+        runner_up_coverage = ranked[1]["coverage"] if len(ranked) > 1 else 0.0
+        margin = best["coverage"] - runner_up_coverage
+        if (
+            best["coverage"] < _EVIDENCE_MATCH_COVERAGE_THRESHOLD
+            or best["term_count"] < _EVIDENCE_MATCH_MIN_TERM_COUNT
+            or best["weighted_term_count"]
+            < _EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT
+            or margin < _EVIDENCE_MATCH_MIN_MARGIN
+        ):
+            continue
+        matches[topic_id] = {
+            **best,
+            "coverage": round(best["coverage"], 3),
+            "runner_up_coverage": round(runner_up_coverage, 3),
+            "margin": round(margin, 3),
+        }
+    return matches
+
+
 def _add_event_title(
     event: dict[str, Any], title: str, *, origin: str, at: datetime
 ) -> None:
@@ -544,6 +676,9 @@ def _card_titles(
         if isinstance(related, Mapping):
             titles.append((str(related.get("title") or ""), "related"))
     titles.append((str(card.get("title") or ""), "card"))
+    share = card.get("share")
+    if isinstance(share, Mapping):
+        titles.append((str(share.get("text") or ""), "share"))
     for field in ("evidence", "research_evidence"):
         for item in card.get(field) or []:
             if isinstance(item, Mapping):
@@ -560,7 +695,7 @@ def _update_titles(topic: Mapping[str, Any], card: Mapping[str, Any]) -> list[st
     titles: list[str] = []
     seen: set[str] = set()
     for title, origin in _card_titles(topic, card):
-        if origin == "evidence":
+        if origin in {"evidence", "share"}:
             continue
         key = _title_dedupe_key(title)
         if not key or key in seen:
@@ -714,6 +849,7 @@ __all__ = [
     "active_exact_title_keys",
     "attach_history_matches",
     "load_history",
+    "match_new_topics_from_evidence",
     "order_candidates_by_similarity",
     "recent_update_timeline",
     "record_final_batch",

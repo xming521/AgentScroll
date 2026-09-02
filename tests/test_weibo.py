@@ -45,11 +45,14 @@ def test_hot_topic_prefers_search_result_with_most_comments(monkeypatch) -> None
             self.detail_ids.append(feed_id)
             return high_comment_feed if feed_id == "2" else low_comment_feed
 
-        async def get_comments(self, feed_id: str, page: int):
-            self.comment_ids.append(feed_id)
-            return [{"id": "c1", "text": "真实评论"}]
+    async def fake_hotflow_comments(crawler, feed_id: str, *, limit: int):
+        assert isinstance(crawler, FakeCrawler)
+        assert limit == 20
+        FakeCrawler.comment_ids.append(feed_id)
+        return [{"id": "c1", "text": "真实评论"}]
 
     monkeypatch.setattr(weibo, "WeiboCrawler", FakeCrawler)
+    monkeypatch.setattr(weibo, "_get_hotflow_comments", fake_hotflow_comments)
     monkeypatch.setattr(weibo.throttle, "wait_for_detail_request", lambda _: None)
 
     result = weibo.collect_hot_topic_posts(["测试话题"])
@@ -75,10 +78,12 @@ def test_hot_topic_filters_irrelevant_result_before_comment_ranking(monkeypatch)
             self.detail_ids.append(feed_id)
             return relevant_feed
 
-        async def get_comments(self, feed_id: str, page: int):
-            return []
+    async def fake_hotflow_comments(_crawler, _feed_id: str, *, limit: int):
+        assert limit == 20
+        return []
 
     monkeypatch.setattr(weibo, "WeiboCrawler", FakeCrawler)
+    monkeypatch.setattr(weibo, "_get_hotflow_comments", fake_hotflow_comments)
     monkeypatch.setattr(weibo.throttle, "wait_for_detail_request", lambda _: None)
 
     result = weibo.collect_hot_topic_posts(["测试话题"])
@@ -177,3 +182,134 @@ def test_safe_search_does_not_treat_invalid_first_page_as_empty() -> None:
                 page=1,
             )
         )
+
+
+def test_hotflow_comments_keep_likes_and_reply_counts(monkeypatch) -> None:
+    requested_params: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_params.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "ok": 1,
+                "data": {
+                    "data": [
+                        {
+                            "id": 101,
+                            "text": "第一条评论",
+                            "created_at": "Tue Sep 01 12:00:00 +0800 2026",
+                            "like_count": 12,
+                            "total_number": 3,
+                        },
+                        {
+                            "id": 102,
+                            "text": "第二条评论",
+                            "created_at": "Tue Sep 01 12:01:00 +0800 2026",
+                            "like_count": "1.2万",
+                            "total_number": 0,
+                        },
+                        {
+                            "id": 103,
+                            "text": (
+                                '<span class="url-icon"><img alt="[可爱]" '
+                                'src="emoji.png" /></span>'
+                            ),
+                            "created_at": "Tue Sep 01 12:02:00 +0800 2026",
+                            "like_count": 2,
+                            "total_number": 0,
+                        },
+                    ],
+                    "max_id": 0,
+                    "max_id_type": 0,
+                },
+            },
+        )
+
+    class HotflowCrawler:
+        cookies = {"SUB": "visitor", "SUBP": "visitor"}
+        _transport = httpx.MockTransport(handler)
+
+        async def _ensure_cookies(self) -> None:
+            return None
+
+    item = {"platform_id": "123", "engagement": {"comments": 2}}
+    monkeypatch.setattr(weibo.throttle, "wait_for_detail_request", lambda _: None)
+
+    asyncio.run(weibo._enrich_post_comments([item], crawler=HotflowCrawler()))
+
+    assert requested_params == [
+        {"id": "123", "mid": "123", "max_id_type": "0"}
+    ]
+    assert item["comments"] == [
+        {
+            "comment_id": "101",
+            "text": "第一条评论",
+            "created_at": "Tue Sep 01 12:00:00 +0800 2026",
+            "likes": 12,
+            "reply_count": 3,
+        },
+        {
+            "comment_id": "102",
+            "text": "第二条评论",
+            "created_at": "Tue Sep 01 12:01:00 +0800 2026",
+            "likes": 12000,
+            "reply_count": 0,
+        },
+        {
+            "comment_id": "103",
+            "text": "[可爱]",
+            "created_at": "Tue Sep 01 12:02:00 +0800 2026",
+            "likes": 2,
+            "reply_count": 0,
+        },
+    ]
+    assert item["comment_extraction_evidence"] == {
+        "kind": "platform-api",
+        "endpoint": "/comments/hotflow",
+        "feed_id": "123",
+        "limit": 20,
+    }
+
+
+def test_hotflow_comments_keep_first_batch_when_next_cursor_redirects() -> None:
+    requested_max_ids: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_max_ids.append(request.url.params.get("max_id"))
+        if "max_id" not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "ok": 1,
+                    "data": {
+                        "data": [
+                            {"id": index, "text": f"评论{index}"}
+                            for index in range(1, 21)
+                        ],
+                        "max_id": 12345,
+                        "max_id_type": 0,
+                    },
+                },
+            )
+        return httpx.Response(
+            302,
+            headers={"location": "https://passport.weibo.com/sso/signin"},
+        )
+
+    class PagingCrawler:
+        cookies = {"SUB": "visitor", "SUBP": "visitor"}
+        _transport = httpx.MockTransport(handler)
+
+        async def _ensure_cookies(self) -> None:
+            return None
+
+    result = asyncio.run(
+        weibo._get_hotflow_comments(PagingCrawler(), "123", limit=25)
+    )
+
+    assert requested_max_ids == [None, "12345"]
+    assert len(result) == 20
+    assert [str(comment["id"]) for comment in result] == [
+        str(index) for index in range(1, 21)
+    ]

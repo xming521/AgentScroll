@@ -367,7 +367,7 @@ docker compose down
 
 - 第一轮最多选择 15 个话题。
 - `hotlist_title_cache` 保存第一轮成功判断过的全部标题。后续筛选先按 Unicode 兼容字符、大小写和连续空白规范化后跳过完全相同的标题，再在本地为每个新标题召回最多 3 个相似热点；没有新标题时不调用筛选模型。缓存窗口为快照日期及其之前连续 7 个自然日。
-- `hotlist_topics` 的每一行同时表示热点稳定身份和当前有效知识；本轮标题和成功更新链保存在 `payload_json`。旧热点可以长期保留，但只有窗口内标题参与匹配。
+- `hotlist_topics` 的每一行同时表示热点稳定身份和当前有效知识；本轮标题、最终分享文案、实际使用的来源标题和成功更新链保存在 `payload_json`。最终分享文案与来源标题只作为后续本地召回别名，不进入成功更新时间线。旧热点可以长期保留，但只有窗口内标题参与匹配。
 - 第一轮模型在原有一次请求中同时返回 `new`、`update` 和 `seen`。`seen` 不再采集；`new` 创建热点，`update` 读取同一行中的当前知识，并把 7 天窗口内成功更新的代表标题和同话题标题按更新时间从旧到新放入 `timeline`，供知识卡模型判断是否确有新进展。每个当前标题最多召回 3 个热点，不限制所有召回标题的合计字符数，也不生成摘要或 signature。
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
@@ -375,6 +375,7 @@ docker compose down
 - 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
 - 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 会同步改写 `hotlist_topics` 的当前 `knowledge` 和 `latest_update`，并向 `payload_json` 的 `updates` 追加记录；证据不足或被淘汰的更新不改变当前有效知识，也不进入更新链。
 - 每张卡片用顶层 `share_score` 记录 0 分或 1 至 4 分的分享评分，最多保留一位小数；低于 3 分时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
+- 启用自动分享且暂定为 `new` 的卡片达到 `sharing.policy.delivery.immediate_score` 时，保存前会用现有正文和来源标题复核近期历史。命中后只重评对应话题一次，并以 `update` 结果替换暂定结果。批次 `inference.immediate_history_recheck` 记录触发数、命中事件、匹配分数、重评请求数和独立 Token 用量；没有达到即时分数的卡片不会触发该步骤。
 - 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`skipped_empty_evidence_count` 和 `skipped_empty_evidence_topics` 记录第一轮与补搜都没有可读正文、因而跳过模型请求的话题数和话题 ID；`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。

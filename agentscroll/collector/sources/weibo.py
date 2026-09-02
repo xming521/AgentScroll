@@ -21,8 +21,13 @@ from . import comments, dates, live_artifacts, page_content, relevance, throttle
 
 _DETAIL_URL = "https://m.weibo.cn/statuses/show?id={feed_id}"
 _LONG_TEXT_URL = "https://m.weibo.cn/statuses/extend?id={feed_id}"
+_COMMENTS_URL = "https://m.weibo.cn/comments/hotflow"
 _CONTENT_SOURCE = "mcp-server-weibo-feed-detail"
 _HOT_TOPIC_SEARCH_CANDIDATE_LIMIT = 15
+_COMMENT_IMAGE_ALT_RE = re.compile(
+    r'''<img\b[^>]*\balt=(["'])(.*?)\1[^>]*>''',
+    re.IGNORECASE,
+)
 
 
 def search_weibo(
@@ -451,7 +456,7 @@ async def _enrich_post_comments(
     *,
     crawler: Optional[WeiboCrawler] = None,
 ) -> None:
-    """Read one public comment page for every returned Weibo post."""
+    """Read public hot-flow comments for every returned Weibo post."""
     crawler = crawler or WeiboCrawler()
     for item in items:
         feed_id = str(item.get("platform_id") or "")
@@ -466,16 +471,19 @@ async def _enrich_post_comments(
             continue
         try:
             await asyncio.to_thread(throttle.wait_for_detail_request, "weibo")
-            raw_comments = await crawler.get_comments(feed_id=feed_id, page=1)
+            raw_comments = await _get_hotflow_comments(
+                crawler,
+                feed_id,
+                limit=comments.limit(),
+            )
             parsed = []
-            for raw in raw_comments[:comments.limit()]:
-                data = raw.model_dump() if hasattr(raw, "model_dump") else raw
-                if not isinstance(data, dict):
-                    continue
+            for data in raw_comments:
                 value = comments.entry(
                     data.get("id"),
-                    data.get("text"),
+                    _comment_text(data.get("text")),
                     created_at=data.get("created_at"),
+                    likes=data.get("like_count"),
+                    reply_count=data.get("total_number"),
                 )
                 if value:
                     parsed.append(value)
@@ -487,9 +495,9 @@ async def _enrich_post_comments(
                 source="weibo-comments-api",
                 evidence={
                     "kind": "platform-api",
-                    "endpoint": "/api/comments/show",
+                    "endpoint": "/comments/hotflow",
                     "feed_id": feed_id,
-                    "page": 1,
+                    "limit": comments.limit(),
                 },
             )
         except Exception:
@@ -500,6 +508,92 @@ async def _enrich_post_comments(
                 source="weibo-comments-api",
                 evidence={"kind": "platform-api", "feed_id": feed_id},
             )
+
+
+async def _get_hotflow_comments(
+    crawler: WeiboCrawler,
+    feed_id: str,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Read hot-flow comments, keeping the first batch if later cursors fail."""
+    await crawler._ensure_cookies()
+    cookies = getattr(crawler, "cookies", None)
+    if not cookies:
+        raise RuntimeError("未能取得微博访客 Cookie")
+
+    client_options: Dict[str, Any] = {
+        "cookies": cookies,
+        "trust_env": False,
+        "timeout": 20,
+    }
+    transport = getattr(crawler, "_transport", None)
+    if transport is not None:
+        client_options["transport"] = transport
+
+    results: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    max_id: Any = None
+    max_id_type: Any = 0
+    async with httpx.AsyncClient(**client_options) as client:
+        while len(results) < limit:
+            params: Dict[str, Any] = {
+                "id": feed_id,
+                "mid": feed_id,
+                "max_id_type": max_id_type,
+            }
+            if max_id is not None:
+                params["max_id"] = max_id
+            try:
+                response = await client.get(
+                    _COMMENTS_URL,
+                    params=params,
+                    headers=DEFAULT_HEADERS,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("ok") != 1:
+                    raise ValueError("微博评论接口返回无效数据")
+            except (httpx.HTTPError, ValueError):
+                if results:
+                    break
+                raise
+
+            data = payload.get("data") or {}
+            raw_comments = data.get("data") or []
+            if not isinstance(raw_comments, list):
+                if results:
+                    break
+                raise ValueError("微博评论接口未返回评论数组")
+
+            added_count = 0
+            for raw in raw_comments:
+                if not isinstance(raw, dict) or raw.get("id") is None:
+                    continue
+                comment_id = str(raw["id"])
+                if comment_id in seen_ids:
+                    continue
+                results.append(raw)
+                seen_ids.add(comment_id)
+                added_count += 1
+                if len(results) >= limit:
+                    break
+
+            next_max_id = data.get("max_id")
+            if not added_count or not next_max_id or len(results) >= limit:
+                break
+            max_id = next_max_id
+            max_id_type = data.get("max_id_type", 0)
+
+    return results[:limit]
+
+
+def _comment_text(value: Any) -> str:
+    """Keep Weibo emoji labels before shared HTML cleanup removes image tags."""
+    return _COMMENT_IMAGE_ALT_RE.sub(
+        lambda match: match.group(2),
+        str(value or ""),
+    )
 
 
 def _normalize_feed(feed: Any) -> Dict[str, Any]:

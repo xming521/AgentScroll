@@ -591,6 +591,130 @@ def _generate_topic_cards(
     return [cards_by_id[topic["topic_id"]] for topic in topics], inference
 
 
+def _recheck_immediate_history_matches(
+    cards: list[KnowledgeCard],
+    *,
+    evidence: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    settings: Any,
+    at: datetime,
+    immediate_score: float,
+    effort: str,
+) -> tuple[
+    list[KnowledgeCard],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Re-evaluate provisional immediate shares that match recent history."""
+    from .hotlist_state import load_history, match_new_topics_from_evidence
+
+    def attach_research_evidence(
+        prompt_topics: list[dict[str, Any]],
+        raw_evidence: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        raw_topics_by_id = {
+            topic.get("topic_id"): topic
+            for topic in raw_evidence.get("topics") or []
+            if isinstance(topic, Mapping)
+        }
+        for topic in prompt_topics:
+            raw_topic = raw_topics_by_id.get(topic["topic_id"])
+            topic["research_evidence"] = [
+                dict(item)
+                for item in (raw_topic or {}).get("research_evidence") or []
+                if isinstance(item, Mapping)
+            ]
+        return prompt_topics
+
+    topics = attach_research_evidence(_prompt_payload(evidence), evidence)
+    cards_by_id = {card.topic_id: card for card in cards}
+    triggered_topics = [
+        topic
+        for topic in topics
+        if topic.get("event_relation") == "new"
+        and (card := cards_by_id.get(topic["topic_id"])) is not None
+        and card.status == "complete"
+        and card.share is not None
+        and card.share_score >= immediate_score
+    ]
+    if not triggered_topics:
+        return cards, dict(evidence), dict(selection), {}
+
+    database_path = str(selection.get("database_path") or "").strip()
+    history: Mapping[str, Any] = {"events": []}
+    if database_path:
+        history = load_history(database_path)
+    matches = match_new_topics_from_evidence(
+        triggered_topics,
+        history,
+        at=at,
+    )
+    diagnostics: dict[str, Any] = {
+        "immediate_score": immediate_score,
+        "triggered_topic_count": len(triggered_topics),
+        "history_match_count": len(matches),
+        "matches": [
+            {"topic_id": topic_id, **match}
+            for topic_id, match in sorted(matches.items())
+        ],
+        "request_count": 0,
+        "usage": {},
+    }
+    if not matches:
+        return cards, dict(evidence), dict(selection), diagnostics
+
+    revised_selection = dict(selection)
+    revised_selection["topics"] = [
+        {
+            **dict(topic),
+            **(
+                {
+                    "event_relation": "update",
+                    "matched_event_id": matches[topic.get("representative_id")][
+                        "event_id"
+                    ],
+                }
+                if topic.get("representative_id") in matches
+                else {}
+            ),
+        }
+        for topic in selection.get("topics") or []
+        if isinstance(topic, Mapping)
+    ]
+    revised_evidence = _selection_with_update_contexts(
+        evidence,
+        revised_selection,
+        at=at,
+    )
+    revised_topics_by_id = {
+        topic["topic_id"]: topic
+        for topic in attach_research_evidence(
+            _prompt_payload(revised_evidence),
+            revised_evidence,
+        )
+    }
+    recheck_topics = [
+        revised_topics_by_id[topic_id] for topic_id in matches
+    ]
+    rechecked_cards, recheck_inference = _generate_topic_cards(
+        recheck_topics,
+        settings=settings,
+        research=True,
+        max_tokens=8_000,
+        timeout=900,
+        effort=effort,
+    )
+    rechecked_by_id = {card.topic_id: card for card in rechecked_cards}
+    diagnostics.update(recheck_inference)
+    return (
+        [rechecked_by_id.get(card.topic_id, card) for card in cards],
+        revised_evidence,
+        revised_selection,
+        diagnostics,
+    )
+
+
 def _research_date_window(evidence: Mapping[str, Any]) -> tuple[int, str | None]:
     raw_range = evidence.get("date_range")
     if not isinstance(raw_range, Mapping):
@@ -728,6 +852,18 @@ def _save_selected_cards(
         relation = str(topic.get("event_relation") or "new")
         if relation not in {"new", "update"}:
             raise ValueError(f"无效的事件关系：{relation!r}")
+        used_urls = {
+            source.url for source in card.research_sources or ()
+        }
+        if card.share is not None:
+            used_urls.add(card.share.url)
+        used_evidence = [
+            dict(item)
+            for field in ("evidence", "research_evidence")
+            for item in topic.get(field) or []
+            if isinstance(item, Mapping)
+            and _http_url(item.get("url")) in used_urls
+        ]
         event_results.append(
             {
                 "topic_id": card.topic_id,
@@ -738,6 +874,12 @@ def _save_selected_cards(
                 "chat_context": card.chat_context,
                 "latest_update": card.latest_update,
                 "share_score": card.share_score,
+                "share": (
+                    card.share.model_dump(mode="json")
+                    if card.share is not None
+                    else None
+                ),
+                "evidence": used_evidence,
             }
         )
 
@@ -952,6 +1094,45 @@ def generate_selected_hotlist_knowledge_cards(
         saving_evidence = final_result.pop("_saving_evidence", evidence)
     else:
         final_result = initial_result
+
+    from agentscroll.config import load_settings
+
+    settings = load_settings(config_path)
+    immediate_score = (
+        settings.sharing.policy.delivery.immediate_score
+        if settings.sharing.enabled
+        else None
+    )
+    if immediate_score is not None:
+        (
+            rechecked_cards,
+            saving_evidence,
+            enriched_selection,
+            recheck_inference,
+        ) = _recheck_immediate_history_matches(
+            final_result["cards"],
+            evidence=saving_evidence,
+            selection=enriched_selection,
+            settings=settings,
+            at=reference_time(hotlist),
+            immediate_score=immediate_score,
+            effort=supplement_effort,
+        )
+        if recheck_inference:
+            final_result = dict(final_result)
+            final_result["cards"] = rechecked_cards
+            final_result["complete_count"] = sum(
+                card.status == "complete" for card in rechecked_cards
+            )
+            final_result["needs_research_count"] = sum(
+                card.status == "needs_research" for card in rechecked_cards
+            )
+            final_result["rejected_count"] = sum(
+                card.status == "rejected" for card in rechecked_cards
+            )
+            inference = dict(final_result.get("inference") or {})
+            inference["immediate_history_recheck"] = recheck_inference
+            final_result["inference"] = inference
     files = _save_selected_cards(
         final_result["cards"],
         evidence=saving_evidence,

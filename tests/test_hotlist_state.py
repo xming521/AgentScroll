@@ -5,18 +5,23 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from agentscroll.storage import connect_database
 from agentscroll.workflows.hotlist_state import (
     active_exact_title_keys,
     load_history,
+    match_new_topics_from_evidence,
     recent_update_timeline,
     record_final_batch,
     record_first_pass,
 )
+from agentscroll.workflows.knowledge_card_models import KnowledgeCard, KnowledgeShare
 from agentscroll.workflows.knowledge_card import (
     _model_topic_payload,
     _prompt_payload,
+    _recheck_immediate_history_matches,
+    _save_selected_cards,
     _selection_with_update_contexts,
 )
 
@@ -248,3 +253,261 @@ def test_sqlite_schema_has_only_three_business_tables(tmp_path: Path) -> None:
         connection.close()
 
     assert tables == {"hotlist_topics", "hotlist_title_cache", "share_jobs"}
+
+
+def test_evidence_match_recalls_history_missing_from_hotlist_title() -> None:
+    at = datetime(2026, 9, 2, 4, 0, tzinfo=timezone.utc)
+    history = {
+        "events": [
+            {
+                "event_id": "jilong-event",
+                "label": "news",
+                "status": "complete",
+                "title": "吉隆口岸上游堰塞湖已完全泄洪",
+                "knowledge": (
+                    "尼泊尔山洪泥石流波及西藏吉隆口岸，抢险机械已抵达"
+                    "核心区，陆上通道正在抢通。"
+                ),
+                "latest_update": "抢险机械已进入吉隆口岸核心搜救区。",
+                "titles": [
+                    {
+                        "text": "吉隆口岸陆上通道即将打通",
+                        "last_seen_at": "2026-09-01T12:00:00+00:00",
+                    }
+                ],
+            },
+            {
+                "event_id": "unrelated-event",
+                "label": "news",
+                "status": "complete",
+                "title": "多所高校调整国庆假期",
+                "knowledge": "多所高校调整放假安排，学生需要提前规划行程。",
+                "latest_update": None,
+                "titles": [
+                    {
+                        "text": "高校公布国庆放假安排",
+                        "last_seen_at": "2026-09-01T12:00:00+00:00",
+                    }
+                ],
+            },
+        ]
+    }
+    topics = [
+        {
+            "topic_id": 10,
+            "title": "失联人员深埋巨石和淤泥之下",
+            "label": "news",
+            "event_relation": "new",
+            "evidence": [
+                {
+                    "source_title": "西藏吉隆救援现场",
+                    "content": (
+                        "尼泊尔山洪泥石流波及西藏吉隆口岸，失联人员深埋"
+                        "巨石和淤泥之下，抢险机械已进入核心搜救区，陆上"
+                        "通道仍在抢通。"
+                    ),
+                }
+            ],
+            "research_evidence": [],
+        },
+        {
+            "topic_id": 11,
+            "title": "张继科带课一个半小时25元",
+            "label": "fun",
+            "event_relation": "new",
+            "evidence": [{"content": "一场面向公众的乒乓球体验课。"}],
+            "research_evidence": [],
+        },
+    ]
+
+    matches = match_new_topics_from_evidence(topics, history, at=at)
+
+    assert set(matches) == {10}
+    assert matches[10]["event_id"] == "jilong-event"
+    assert matches[10]["coverage"] >= 0.65
+
+
+def test_immediate_new_card_is_rerun_once_as_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "agentscroll.sqlite3"
+    event_id = _seed_topic(database)
+    selection = {
+        "database_path": str(database),
+        "topics": [
+            {
+                "representative_id": 1,
+                "representative": {"title": "失联人员深埋巨石和淤泥之下"},
+                "related": [],
+                "label": "news",
+                "event_relation": "new",
+            }
+        ],
+    }
+    evidence = {
+        "topics": [
+            {
+                "topic_id": 1,
+                "title": "失联人员深埋巨石和淤泥之下",
+                "label": "news",
+                "event_relation": "new",
+                "evidence": [
+                    {
+                        "platform": "weibo",
+                        "title": "失联人员深埋巨石和淤泥之下",
+                        "url": "https://example.com/clue",
+                        "content": "大型机械进入受灾区域继续搜寻失联人员。",
+                        "comments": [{"text": "希望平安"}],
+                    }
+                ],
+                "research_evidence": [
+                    {
+                        "source_id": "r1",
+                        "platform": "wechat",
+                        "source_title": "尼泊尔泥石流救援仍在继续",
+                        "url": "https://example.com/rescue",
+                        "content": (
+                            "尼泊尔发生严重泥石流，已有人员伤亡和失联，"
+                            "救援人员正在灾区持续搜寻。"
+                        ),
+                        "comments": [],
+                    }
+                ],
+            }
+        ]
+    }
+    provisional = KnowledgeCard(
+        status="complete",
+        rejection_reason="",
+        knowledge="尼泊尔泥石流救援仍在继续。",
+        chat_context="可以聊现场救援。",
+        latest_update=None,
+        share_score=4,
+        share=KnowledgeShare(
+            text="尼泊尔泥石流救援现场",
+            source_id="e1",
+            url="https://example.com/rescue",
+            comment_id="e1c1",
+            comment_type="platform",
+            comment="希望平安",
+        ),
+        topic_id=1,
+    )
+    rerun = KnowledgeCard(
+        status="rejected",
+        rejection_reason="未找到新进展",
+        knowledge="",
+        chat_context="",
+        latest_update=None,
+        share_score=0,
+        share=None,
+        topic_id=1,
+        research_sources=(),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_generate(topics, **kwargs):
+        captured["topics"] = topics
+        captured["kwargs"] = kwargs
+        return [rerun], {"request_count": 1, "usage": {"input_tokens": 100}}
+
+    monkeypatch.setattr(
+        "agentscroll.workflows.knowledge_card._generate_topic_cards",
+        fake_generate,
+    )
+    cards, revised_evidence, revised_selection, diagnostics = (
+        _recheck_immediate_history_matches(
+            [provisional],
+            evidence=evidence,
+            selection=selection,
+            settings=SimpleNamespace(max_workers=1),
+            at=datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc),
+            immediate_score=4.0,
+            effort="xhigh",
+        )
+    )
+
+    rerun_topic = captured["topics"][0]
+    assert rerun_topic["event_relation"] == "update"
+    assert rerun_topic["matched_event_id"] == event_id
+    assert rerun_topic["previous_card"]["knowledge"] == (
+        "尼泊尔发生严重泥石流，已有人员伤亡和失联。"
+    )
+    assert captured["kwargs"]["research"] is True
+    assert rerun_topic["research_evidence"][0]["source_id"] == "r1"
+    assert cards == [rerun]
+    assert revised_evidence["topics"][0]["event_relation"] == "update"
+    assert revised_selection["topics"][0]["matched_event_id"] == event_id
+    assert diagnostics["history_match_count"] == 1
+    assert diagnostics["request_count"] == 1
+
+
+def test_selected_save_records_share_and_used_source_titles(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agentscroll.sqlite3"
+    topic = {
+        "topic_id": 1,
+        "title": "测试热点",
+        "label": "news",
+        "event_relation": "new",
+        "evidence": [
+            {
+                "title": "实际使用的来源标题",
+                "url": "https://example.com/used",
+            },
+            {
+                "title": "没有使用的来源标题",
+                "url": "https://example.com/unused",
+            },
+        ],
+    }
+    selection = {
+        "database_path": str(database),
+        "topics": [
+            {
+                "representative_id": 1,
+                "representative": {"title": "测试热点"},
+                "related": [],
+                "label": "news",
+                "event_relation": "new",
+            }
+        ],
+    }
+    card = KnowledgeCard(
+        status="complete",
+        rejection_reason="",
+        knowledge="热点知识。",
+        chat_context="聊天时可以提起。",
+        latest_update=None,
+        share_score=4,
+        share=KnowledgeShare(
+            text="最终分享文案",
+            source_id="e1",
+            url="https://example.com/used",
+            comment_id="",
+            comment_type="generated",
+            comment="确实值得聊聊",
+        ),
+        topic_id=1,
+    )
+
+    _save_selected_cards(
+        [card],
+        evidence={"topics": [topic]},
+        selection=selection,
+        inference={},
+        output_dir=tmp_path / "knowledge",
+        share_output_dir=tmp_path / "shares",
+        at=datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
+        record_history=True,
+    )
+
+    titles = {
+        item["text"]: item["origin"]
+        for item in load_history(database)["events"][0]["titles"]
+    }
+    assert titles["最终分享文案"] == "share"
+    assert titles["实际使用的来源标题"] == "evidence"
+    assert "没有使用的来源标题" not in titles

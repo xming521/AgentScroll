@@ -283,6 +283,8 @@ def test_public_generation_keeps_dict_contract(
     assert len(requests) == 1
     assert "$defs" not in requests[0].json_schema
     assert requests[0].json_schema["properties"]["cards"]["maxItems"] == 1
+    assert "不提供事件信息的讨论性问句" in requests[0].prompt
+    assert "问句本身承载核心事件信息时可以保留" in requests[0].prompt
     assert result["topic_count"] == result["complete_count"] == 1
     assert isinstance(result["cards"][0], dict)
     assert result["cards"][0]["topic_id"] == 1
