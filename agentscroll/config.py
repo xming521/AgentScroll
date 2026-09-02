@@ -88,6 +88,7 @@ class ShareDeliverySettings(BaseModel):
 
     min_interval_minutes: int = Field(default=10, ge=0)
     immediate_score: float | None = Field(default=4.0, ge=3, le=4)
+    immediate_interval_seconds: int = Field(default=3, ge=0)
 
 
 class ScoreOnlySharePolicySettings(BaseModel):

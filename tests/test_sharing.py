@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -87,19 +89,24 @@ def _dispatcher(
     *,
     targets=("room-one",),
     policy: SharePolicySettings | None = None,
+    transport: FakeTransport | None = None,
+    monotonic=None,
+    sleep=None,
 ):
     database = tmp_path / "agentscroll.sqlite3"
-    transport = FakeTransport()
+    selected_transport = transport or FakeTransport()
     dispatcher = ShareDispatcher(
         _settings(targets=targets, policy=policy),
-        transports={"fake": transport},
+        transports={"fake": selected_transport},
         database_path=database,
         sharing_output_dir=tmp_path / "sharing",
         now=lambda: current_time[0],
+        monotonic=monotonic,
+        sleep=sleep,
     )
     scheduler = BlockingScheduler(timezone=timezone.utc)
     dispatcher.attach_scheduler(scheduler)
-    return dispatcher, scheduler, database, transport
+    return dispatcher, scheduler, database, selected_transport
 
 
 def test_rolling_window_and_minimum_interval() -> None:
@@ -244,6 +251,105 @@ def test_immediate_share_does_not_consume_ordinary_limits(tmp_path: Path) -> Non
     assert result["normal_scheduled"] == 1
     assert ordinary["status"] == "waiting"
     assert ordinary["due_at"] == now[0].isoformat()
+
+
+def test_same_destination_sends_each_body_and_comment_as_one_group(
+    tmp_path: Path,
+) -> None:
+    class BlockingBodyTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_body_started = Event()
+            self.release_first_body = Event()
+            self.second_body_started = Event()
+
+        def send(self, target: str, message: str) -> SendResult:
+            self.messages.append((target, message))
+            if message.startswith("message-0\n"):
+                self.first_body_started.set()
+                self.release_first_body.wait(timeout=2)
+            elif message.startswith("message-1\n"):
+                self.second_body_started.set()
+            return SendResult("sent", "ok", 1)
+
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    policy = SharePolicySettings(
+        delivery=ShareDeliverySettings(
+            min_interval_minutes=10,
+            immediate_score=4.0,
+            immediate_interval_seconds=0,
+        )
+    )
+    transport = BlockingBodyTransport()
+    dispatcher, _scheduler, database, _transport = _dispatcher(
+        tmp_path,
+        now,
+        policy=policy,
+        transport=transport,
+    )
+    dispatcher.submit_shares("batch-1", now[0], [_share(4.0, 0), _share(4.0, 1)])
+    jobs = _jobs(database)
+    second_worker_started = Event()
+
+    def execute_second() -> None:
+        second_worker_started.set()
+        dispatcher._execute_job(str(jobs[1]["job_id"]))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(dispatcher._execute_job, str(jobs[0]["job_id"]))
+        assert transport.first_body_started.wait(timeout=1)
+        second = executor.submit(execute_second)
+        assert second_worker_started.wait(timeout=1)
+        try:
+            assert not transport.second_body_started.wait(timeout=0.2)
+        finally:
+            transport.release_first_body.set()
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert transport.messages == [
+        ("room-one", "message-0\nhttps://example.com/0"),
+        ("room-one", "comment-0"),
+        ("room-one", "message-1\nhttps://example.com/1"),
+        ("room-one", "comment-1"),
+    ]
+
+
+def test_immediate_interval_separates_adjacent_immediate_and_ordinary_shares(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    monotonic = [100.0]
+    waits: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+        monotonic[0] += seconds
+
+    dispatcher, _scheduler, database, transport = _dispatcher(
+        tmp_path,
+        now,
+        monotonic=lambda: monotonic[0],
+        sleep=fake_sleep,
+    )
+    dispatcher.submit_shares(
+        "batch-1",
+        now[0],
+        [_share(4.0, 0), _share(4.0, 1), _share(3.9, 2)],
+    )
+
+    for job in _jobs(database):
+        dispatcher._execute_job(str(job["job_id"]))
+
+    assert waits == [3.0, 3.0]
+    assert transport.messages == [
+        ("room-one", "message-0\nhttps://example.com/0"),
+        ("room-one", "comment-0"),
+        ("room-one", "message-1\nhttps://example.com/1"),
+        ("room-one", "comment-1"),
+        ("room-one", "message-2\nhttps://example.com/2"),
+        ("room-one", "comment-2"),
+    ]
 
 
 def test_destinations_are_independent_and_new_batch_supersedes_waiting_normal(

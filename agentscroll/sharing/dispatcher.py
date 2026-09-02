@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
+from time import monotonic as monotonic_time
+from time import sleep as sleep_time
 from typing import Any, Literal, Protocol
 
 from apscheduler.jobstores.base import JobLookupError
@@ -95,6 +97,8 @@ class ShareDispatcher:
         database_path: str | Path | None = None,
         sharing_output_dir: str | Path | None = None,
         now: Callable[[], datetime] | None = None,
+        monotonic: Callable[[], float] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         if not settings.enabled:
             raise ValueError("Instant sharing is not enabled")
@@ -118,11 +122,17 @@ class ShareDispatcher:
             else (Path.cwd() / "outputs" / "sharing").resolve()
         )
         self._now_factory = now or (lambda: datetime.now().astimezone())
+        self._monotonic = monotonic or monotonic_time
+        self._sleep = sleep or sleep_time
         self._window = timedelta(minutes=settings.policy.window.window_minutes)
         self._min_interval = timedelta(
             minutes=settings.policy.delivery.min_interval_minutes
         )
         self._lock = RLock()
+        self._destination_locks = {
+            destination_id: RLock() for destination_id in self._destinations
+        }
+        self._last_delivery: dict[str, tuple[float, bool]] = {}
         self._scheduler: BlockingScheduler | None = None
 
     @staticmethod
@@ -552,6 +562,21 @@ class ShareDispatcher:
             pass
 
     def _execute_job(self, job_id: str) -> None:
+        with self._lock:
+            with database_transaction(self.database_path) as connection:
+                row = connection.execute(
+                    "SELECT destination_id FROM share_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+        if row is None:
+            return
+        destination_id = str(row["destination_id"])
+        destination_lock = self._destination_locks.get(destination_id)
+        if destination_lock is None:
+            return
+        with destination_lock:
+            self._execute_serialized_job(job_id)
+
+    def _execute_serialized_job(self, job_id: str) -> None:
         rescheduled_at: str | None = None
         job: dict[str, Any] | None = None
         with self._lock:
@@ -692,6 +717,7 @@ class ShareDispatcher:
 
         transport = self.transports[str(job["transport"])]
         target = str(job["target"])
+        self._wait_for_immediate_interval(job)
         attempts = 0
         sent_count = 0
         for message in messages:
@@ -710,6 +736,25 @@ class ShareDispatcher:
         else:
             result = SendResult("sent", "ok", attempts)
         self._finish_job(job, result)
+        self._last_delivery[str(job["destination_id"])] = (
+            self._monotonic(),
+            bool(job["bypass"]),
+        )
+
+    def _wait_for_immediate_interval(self, job: Mapping[str, Any]) -> None:
+        interval = self.settings.policy.delivery.immediate_interval_seconds
+        if interval <= 0:
+            return
+        destination_id = str(job["destination_id"])
+        previous = self._last_delivery.get(destination_id)
+        if previous is None:
+            return
+        previous_at, previous_was_immediate = previous
+        if not (bool(job["bypass"]) or previous_was_immediate):
+            return
+        remaining = interval - (self._monotonic() - previous_at)
+        if remaining > 0:
+            self._sleep(remaining)
 
     def _finish_job(self, job: Mapping[str, Any], result: SendResult) -> None:
         job_id = str(job["job_id"])

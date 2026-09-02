@@ -42,9 +42,10 @@
     "policy": {
       "mode": "window",
       "delivery": {
-        // 普通分享遵守最小间隔；达到 immediate_score 的分享立即发送。
+        // 正文与评论整组串行；相邻分享含 immediate 时按秒级间隔。
         "min_interval_minutes": 10,
-        "immediate_score": 4.0
+        "immediate_score": 4.0,
+        "immediate_interval_seconds": 3
       },
       "window": {
         // 每个目标分别限制普通分享。

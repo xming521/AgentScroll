@@ -273,7 +273,8 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
     "mode": "window",
     "delivery": {
       "min_interval_minutes": 10,
-      "immediate_score": 4.0
+      "immediate_score": 4.0,
+      "immediate_interval_seconds": 3
     },
     "window": {
       "window_minutes": 60,
@@ -297,7 +298,7 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
 - `window`：参数位于 `policy.window`。普通消息每个目标在滚动 `window_minutes` 内最多发送 `max_messages_per_window` 条；一个批次只保留评分最高的指定条数，其余不排队。
 - `score_only`：参数位于 `policy.score_only`。只发送评分不低于 `min_score` 的消息，不计算窗口额度；低于门槛的消息直接丢弃。`min_score` 支持 3 至 4 分。
 
-`policy.delivery` 控制两种策略共用的发送节奏。未达到 `immediate_score` 的合格消息按目标遵守 `min_interval_minutes`；达到 `immediate_score` 的合格消息立即发送，不等待、不占窗口额度，也不会让后续普通消息重新等待。`immediate_score` 设为 `null` 可关闭即时豁免。只有 `mode` 选中的策略子配置参与资格和窗口额度判断。新批次会替换上一批尚未发送的普通消息，不形成跨批次积压；某个已选消息发送失败时也不会再用低分条目补位。
+`policy.delivery` 控制两种策略共用的发送节奏。未达到 `immediate_score` 的合格分享按目标遵守 `min_interval_minutes`；达到 `immediate_score` 的合格分享不等待该普通间隔，不占窗口额度，也不会让后续普通分享重新等待。同一目标的正文和评论会整组串行发送；两个相邻分享中至少一个为即时分享时，两组之间至少间隔 `immediate_interval_seconds`，避免同时到期的即时分享或普通分享把评论插到其他正文后面。`immediate_score` 设为 `null` 可关闭即时豁免，`immediate_interval_seconds` 设为 `0` 可关闭秒级间隔。只有 `mode` 选中的策略子配置参与资格和窗口额度判断。新批次会替换上一批尚未发送的普通分享，不形成跨批次积压；某个已选分享发送失败时也不会再用低分条目补位。
 
 只按分数发送时，策略可简写为：
 
@@ -306,7 +307,8 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
   "mode": "score_only",
   "delivery": {
     "min_interval_minutes": 10,
-    "immediate_score": 4.0
+    "immediate_score": 4.0,
+    "immediate_interval_seconds": 3
   },
   "score_only": {
     "min_score": 4.0
