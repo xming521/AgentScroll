@@ -7,6 +7,7 @@ HOTLIST_FIRST_PASS_PROMPT = """
 
 输入 JSON 字段：
 
+- interest.keywords：兴趣关键词；可以是具体词、人物、产品或领域，空数组表示不启用兴趣偏好。每个关键词都是语义锚点。
 - candidates：当前热榜条目数组；source 是平台；history 为当前标题召回的可能相关历史标题数组。数组中 history_id 是历史事件的本轮临时编号，last_seen_date 是出现日期。
 
 candidates 中，文本相似的当前标题会尽量相邻，方便比较；相邻不代表属于同一事件。
@@ -17,6 +18,12 @@ history 只表示可能相关，不代表一定是同一事件。输入中的标
 
 - news：可能影响较多人并具有现实公共价值的突发新闻；
 - fun：包含新词、固定表达、人物梗、反差、抽象、猎奇、荒诞感或其他即时分享价值的内容；影视宣传、明星宣传不属于 fun。
+
+兴趣不是第三种 label，若标题明确涉及 interest.keywords 中的关键词或其直接相关概念，可提高该话题的筛选优先级：
+
+- 对兴趣相关内容，可把用户视为熟悉关键词所代表的领域。即使受众较窄，也可按 news 进入后续材料核验；领域术语或圈内梗对熟悉该领域的人具有明确趣味时，也可按 fun 进入。
+- 标题不需要出现关键词原文，但必须能从标题本身判断与某个配置关键词直接相关。仅有同名词语、普通宣传、常规动态、旧闻、重复进展、语义不明或没有具体变化时，不得因为关键词而选入；不得依赖输入之外的事实牵强联想。
+- 重大 news 和高趣味 fun 不需要与兴趣关键词相关。兴趣相关内容不占固定名额；超过 15 个合格话题时，同时考虑内容本身价值和兴趣相关性。
 
 不要为了数量选择普通、重复或没有调研价值的标题，也不要因为某个标题信息完整、容易解释就优先选择它。数量由符合条件的话题数量决定，不符合上述 news 或 fun 价值标准的标题不得选入。
 
@@ -32,24 +39,25 @@ history 只表示可能相关，不代表一定是同一事件。输入中的标
 
 对本轮值得选入的话题，再与候选项 history 中的标题比较：
 
-- new：没有合理的同事件历史候选，或标题明确指向另一件事。放入 topics，relation 为 new，history_id 为 null；
+- new：没有合理的同事件历史候选，或标题明确指向另一件事。放入 topics，relation 为 new，不返回 history_id；
 - update：明确是同一事件且标题出现新的状态、结果、数字、处置或回应；或者“相同明确人物”的高疑似情况，需要进入后续材料核验。放入 topics，relation 为 update，history_id 填对应历史标题编号；
 - seen：明确是同一事件，但当前标题没有上述实质新进展。放入 seen，不再进入topics，history_id 填对应历史标题编号。
 
-只返回一个 JSON object，包含 topics 和 seen 两个字段：
+只返回一个 JSON object，必须包含 topics；存在确认重复的历史事件时再返回 seen：
 
 topics：选中的话题数组，最多 15 个；
 - representative_id：该话题的分组锚点 id；按上述当前类别的代表条目规则选择；
-- related_ids：与代表条目明确属于同一事件的其他输入编号，没有则为空数组；
+- related_ids：与代表条目明确属于同一事件的其他输入编号；有值时才返回；
 - label：该话题最主要的筛选类别，只能是 news、fun 之一；
+- candidate_interest_keywords：根据当前标题初步判断直接相关的兴趣关键词数组；只能原样返回 interest.keywords 中的值，有值时才返回；
 - relation：只能是 new 或 update；
-- history_id：update 对应的历史标题编号；new 必须为 null。
+- history_id：update 对应的历史标题编号；仅 relation=update 时返回。
 
 seen：确认是没有实质新进展的重复历史事件数组；
-- representative_id、related_ids、label：含义与 topics 相同；
+- representative_id、related_ids、label、candidate_interest_keywords：含义与 topics 相同；
 - history_id：对应的历史标题编号。
 
-不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。
+没有内容的可选字段直接省略，不要返回空数组或 null。不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。
 """
 
 ZHIHU_SEARCH_QUERY_PROMPT = """
