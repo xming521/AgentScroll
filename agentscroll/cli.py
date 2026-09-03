@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
 import click
+
+from agentscroll.runtime_logging import configure_runtime_logging
 
 _Result = TypeVar("_Result")
 _INTERVAL_PATTERN = re.compile(r"^([1-9]\d*)([mhd])$", re.IGNORECASE)
@@ -26,6 +29,7 @@ def _run(function: Callable[[], _Result]) -> _Result:
     try:
         return function()
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        logging.getLogger(__name__).exception("AgentScroll command failed")
         raise click.ClickException(str(exc)) from exc
 
 
@@ -37,19 +41,6 @@ def _comma_separated(value: str | None) -> tuple[str, ...] | None:
     if value is None:
         return None
     return tuple(part.strip() for part in value.split(",") if part.strip())
-
-
-def _interval_seconds(
-    _context: click.Context,
-    _parameter: click.Parameter,
-    value: str | None,
-) -> int | None:
-    if value is None:
-        return None
-    try:
-        return _parse_interval_seconds(value)
-    except ValueError as exc:
-        raise click.BadParameter(str(exc)) from exc
 
 
 def _parse_interval_seconds(value: str) -> int:
@@ -73,6 +64,7 @@ def _config_path(context: click.Context) -> Path | None:
 @click.pass_context
 def cli(context: click.Context, config_path: Path | None) -> None:
     """AgentScroll：搜索互联网并学习最新热点。"""
+    _run(configure_runtime_logging)
     context.ensure_object(dict)
     context.obj["config_path"] = config_path
 
@@ -249,15 +241,9 @@ def hotlist_learn(
 @click.option("--generation-effort", default="xhigh", show_default=True)
 @click.option("--supplement-effort", default="xhigh", show_default=True)
 @click.option(
-    "--every",
-    metavar="INTERVAL",
-    callback=_interval_seconds,
-    help="按间隔持续运行，例如 30m、4h、1d；不设置时只运行一次。",
-)
-@click.option(
     "--scheduled",
     is_flag=True,
-    help="按 settings.jsonc 的 schedule 规则定时运行。",
+    help="按 settings.jsonc 的 schedule 时间范围和间隔持续运行。",
 )
 @click.pass_context
 def hotlist_run(
@@ -275,7 +261,6 @@ def hotlist_run(
     no_supplement: bool,
     generation_effort: str,
     supplement_effort: str,
-    every: int | None,
     scheduled: bool,
 ) -> None:
     """拉取最新热榜并完成知识卡与分享生成，可按间隔持续运行。"""
@@ -299,10 +284,7 @@ def hotlist_run(
             supplement_effort=supplement_effort,
         )
 
-    if scheduled and every is not None:
-        raise click.UsageError("--scheduled 和 --every 不能同时使用")
-
-    if not scheduled and every is None:
+    if not scheduled:
         _print_json(_run(run_once))
         return
 
@@ -376,21 +358,11 @@ def hotlist_run(
         else None
     )
 
-    if every is not None:
-        _run(
-            lambda: run_at_interval(
-                scheduled_run,
-                interval_seconds=every,
-                configure_scheduler=configure_scheduler,
-            )
-        )
-        return
-
     schedule = settings.schedule
     interval_seconds = _run(lambda: _parse_interval_seconds(schedule.every))
     click.echo(
         f"定时运行：本地时间 {schedule.start_time} 至 {schedule.end_time}，"
-        f"间隔 {schedule.every}",
+        f"从启动时间起每隔 {schedule.every} 检查并执行",
         err=True,
     )
     _run(

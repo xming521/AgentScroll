@@ -43,6 +43,10 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 筛选、采集、知识卡和分享批次文件继续作为 review 产物保存，推理与分享审计继续写 JSONL；这些文件不作为生产状态读取。新版本不会导入、回读或双写旧的热榜历史 JSON 和分享 `state.json`。
 
+### 运行日志
+
+AgentScroll CLI 默认把运行日志写入 `outputs/logs/agentscroll-YYYY-MM-DD.log`，按本地日期每天一个文件，保留最近 14 个自然日。终端中的告警和异常仍会正常显示，因此前台运行和 `nohup` 后台运行使用同一套落盘日志，不需要额外重定向才能保留任务异常。
+
 ### 推理审计日志
 
 同步 LLM 调用默认写入 `outputs/logs/llm_audit/YYYY-MM-DD.jsonl`，文件权限为 `600`。每次逻辑调用使用一个 `call_id` 串联以下事件：
@@ -238,13 +242,13 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
   --share-output-dir outputs/shares
 ```
 
-使用 `--scheduled` 后，命令会读取 `settings.jsonc` 的 `schedule` 配置并在前台等待定时执行，按 `Ctrl+C` 停止：
+使用 `--scheduled` 后，命令会读取 `settings.jsonc` 的 `schedule` 配置，以进程启动时刻为间隔起点，并只在每日时间范围内执行。命令会在前台等待，按 `Ctrl+C` 停止：
 
 ```bash
 .venv/bin/agentscroll hotlist run --groups '综合' --scheduled
 ```
 
-默认配置使用运行机器的当地时间，每天从 `08:00` 到次日 `00:00` 每 4 小时执行一次，即 `08:00、12:00、16:00、20:00、00:00`。可在配置文件中修改：
+可在配置文件中修改执行间隔和每日时间范围：
 
 ```jsonc
 "schedule": {
@@ -254,13 +258,13 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
 }
 ```
 
-`every` 由正整数和单位组成，支持分钟 `m`、小时 `h` 和天 `d`，配置的每日规则最长为 `1d`。结束时间早于或等于开始时间时按跨越午夜处理；只有按间隔恰好落在结束时间上的任务才会在该时刻执行。若需要不受每日时间范围限制、并在启动后立即执行，可继续使用 `--every 4h`。
+`every` 由正整数和单位组成，支持分钟 `m`、小时 `h` 和天 `d`，最长为 `1d`。例如时间范围为 `08:00` 至次日 `00:00`，进程在 `10:13` 启动且配置为 `1h`，会在 `10:13` 立即执行，之后于 `11:13、12:13……23:13` 执行；落在时间范围外的轮次会跳过。结束时间早于或等于开始时间时按跨越午夜处理。
 
 同一进程最多同时执行一轮。某轮执行时间超过间隔时不会并发启动下一轮；程序停止期间错过的任务不会在重启后回放。服务部署时直接以前台方式运行该命令，由 Docker、systemd 等运行环境负责进程保活。
 
 ### AstrBot IM 自动分享
 
-即时分享只随 `hotlist run --scheduled` 或 `hotlist run --every ...` 的常驻进程启用；不带定时参数的一次性 `hotlist run` 和 `hotlist learn` 仍只生成文件，不自动发送。平台无关的分享分发器负责批次选择、限流、延迟调度和持久状态，AstrBot transport 只请求 `POST /api/v1/im/message`，再由 AstrBot 按 UMO 将纯文本消息转发到 QQ、Telegram 等已连接平台，不需要安装 AgentScroll 专用的 AstrBot 插件。
+即时分享只随 `hotlist run --scheduled` 的常驻进程启用；不带定时参数的一次性 `hotlist run` 和 `hotlist learn` 仍只生成文件，不自动发送。平台无关的分享分发器负责批次选择、限流、延迟调度和持久状态，AstrBot transport 只请求 `POST /api/v1/im/message`，再由 AstrBot 按 UMO 将纯文本消息转发到 QQ、Telegram 等已连接平台，不需要安装 AgentScroll 专用的 AstrBot 插件。
 
 先在 AstrBot 中创建带 `im` scope 的 API Key，并取得目标会话的 UMO。UMO 格式为 `platform:message_type:session_id`；也可以在目标会话中使用 AstrBot 的 `/sid` 命令确认。API Key 只写入环境变量：
 

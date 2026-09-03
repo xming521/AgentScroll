@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import signal
 from collections.abc import Callable
-from datetime import datetime, tzinfo
+from datetime import datetime
 from threading import Event, Thread
 from types import FrameType
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.combining import OrTrigger
-from apscheduler.triggers.cron import CronTrigger
 
 
 def _minutes_since_midnight(value: str) -> int:
@@ -18,67 +16,36 @@ def _minutes_since_midnight(value: str) -> int:
     return hour * 60 + minute
 
 
-def _daily_window_slots(
-    *,
-    interval_seconds: int,
-    start_time: str,
-    end_time: str,
-) -> tuple[tuple[int, int], ...]:
-    if interval_seconds <= 0:
-        raise ValueError("interval_seconds 必须大于 0")
-    if interval_seconds % 60:
-        raise ValueError("时间窗口内的执行间隔必须是整分钟")
-
+def _is_within_daily_window(now: datetime, start_time: str, end_time: str) -> bool:
+    current = now.hour * 60 + now.minute
     start = _minutes_since_midnight(start_time)
     end = _minutes_since_midnight(end_time)
-    if end <= start:
-        end += 24 * 60
-
-    interval_minutes = interval_seconds // 60
-    slots: list[tuple[int, int]] = []
-    current = start
-    while current <= end:
-        local_minute = current % (24 * 60)
-        slot = divmod(local_minute, 60)
-        if slot not in slots:
-            slots.append(slot)
-        current += interval_minutes
-    return tuple(slots)
-
-
-def _daily_window_trigger(
-    *,
-    interval_seconds: int,
-    start_time: str,
-    end_time: str,
-    timezone: tzinfo,
-) -> OrTrigger:
-    slots = _daily_window_slots(
-        interval_seconds=interval_seconds,
-        start_time=start_time,
-        end_time=end_time,
-    )
-    return OrTrigger(
-        [
-            CronTrigger(hour=hour, minute=minute, second=0, timezone=timezone)
-            for hour, minute in slots
-        ]
-    )
+    if start == end:
+        return True
+    if start < end:
+        return start <= current <= end
+    return current >= start or current <= end
 
 
 def run_at_interval(
     job: Callable[[], None],
     *,
     interval_seconds: int,
-    start_time: str | None = None,
-    end_time: str | None = None,
+    start_time: str,
+    end_time: str,
     configure_scheduler: Callable[[BlockingScheduler], None] | None = None,
 ) -> None:
-    """Run a job continuously, optionally at fixed local-time slots."""
+    """Run from process start at a fixed interval within a daily window."""
     if interval_seconds <= 0:
         raise ValueError("interval_seconds 必须大于 0")
-    if (start_time is None) != (end_time is None):
-        raise ValueError("start_time 和 end_time 必须同时设置")
+
+    def run_in_window() -> None:
+        if _is_within_daily_window(
+            datetime.now().astimezone(),
+            start_time,
+            end_time,
+        ):
+            job()
 
     scheduler = BlockingScheduler()
     job_options = {
@@ -86,25 +53,13 @@ def run_at_interval(
         "max_instances": 1,
         "misfire_grace_time": None,
     }
-    if start_time is None or end_time is None:
-        scheduler.add_job(
-            job,
-            "interval",
-            seconds=interval_seconds,
-            next_run_time=datetime.now().astimezone(),
-            **job_options,
-        )
-    else:
-        scheduler.add_job(
-            job,
-            _daily_window_trigger(
-                interval_seconds=interval_seconds,
-                start_time=start_time,
-                end_time=end_time,
-                timezone=scheduler.timezone,
-            ),
-            **job_options,
-        )
+    scheduler.add_job(
+        run_in_window,
+        "interval",
+        seconds=interval_seconds,
+        next_run_time=datetime.now().astimezone(),
+        **job_options,
+    )
 
     if configure_scheduler is not None:
         configure_scheduler(scheduler)

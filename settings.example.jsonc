@@ -27,7 +27,7 @@
   },
 
   "schedule": {
-    // 在每日执行时间范围内，每隔多久拉取并学习一次。
+    // 在每日执行时间范围内，从进程启动时刻起按此间隔检查并执行。
     "every": "2h",
 
     // 使用运行机器的当地时间；跨越午夜时，结束时间属于次日。
@@ -41,7 +41,7 @@
   },
 
   "sharing": {
-    // 只在 hotlist run --scheduled 或 --every 的常驻进程中自动分享。
+    // 只在 hotlist run --scheduled 的常驻进程中自动分享。
     "enabled": false,
     "destinations": [],
     "policy": {

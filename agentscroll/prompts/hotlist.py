@@ -39,25 +39,25 @@ history 只表示可能相关，不代表一定是同一事件。输入中的标
 
 对本轮值得选入的话题，再与候选项 history 中的标题比较：
 
-- new：没有合理的同事件历史候选，或标题明确指向另一件事。放入 topics，relation 为 new，不返回 history_id；
+- new：没有合理的同事件历史候选，或标题明确指向另一件事。放入 topics，relation 为 new，history_id 返回 null；
 - update：明确是同一事件且标题出现新的状态、结果、数字、处置或回应；或者“相同明确人物”的高疑似情况，需要进入后续材料核验。放入 topics，relation 为 update，history_id 填对应历史标题编号；
 - seen：明确是同一事件，但当前标题没有上述实质新进展。放入 seen，不再进入topics，history_id 填对应历史标题编号。
 
-只返回一个 JSON object，必须包含 topics；存在确认重复的历史事件时再返回 seen：
+只返回一个 JSON object，必须包含 topics 和 seen：
 
 topics：选中的话题数组，最多 15 个；
 - representative_id：该话题的分组锚点 id；按上述当前类别的代表条目规则选择；
-- related_ids：与代表条目明确属于同一事件的其他输入编号；有值时才返回；
+- related_ids：与代表条目明确属于同一事件的其他输入编号；没有时返回空数组；
 - label：该话题最主要的筛选类别，只能是 news、fun 之一；
-- candidate_interest_keywords：根据当前标题初步判断直接相关的兴趣关键词数组；只能原样返回 interest.keywords 中的值，有值时才返回；
+- candidate_interest_keywords：根据当前标题初步判断直接相关的兴趣关键词数组；只能原样返回 interest.keywords 中的值，没有时返回空数组；
 - relation：只能是 new 或 update；
-- history_id：update 对应的历史标题编号；仅 relation=update 时返回。
+- history_id：update 对应的历史标题编号；relation=new 时返回 null。
 
 seen：确认是没有实质新进展的重复历史事件数组；
 - representative_id、related_ids、label、candidate_interest_keywords：含义与 topics 相同；
 - history_id：对应的历史标题编号。
 
-没有内容的可选字段直接省略，不要返回空数组或 null。不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。
+topics 和 seen 没有内容时返回空数组。其中的每个对象都必须返回各自上面定义的全部字段。不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。
 """
 
 ZHIHU_SEARCH_QUERY_PROMPT = """

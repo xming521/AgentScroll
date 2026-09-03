@@ -33,12 +33,17 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "string"},
                     },
                     "relation": {"type": "string", "enum": ["new", "update"]},
-                    "history_id": {"type": "integer"},
+                    "history_id": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                    },
                 },
                 "required": [
                     "representative_id",
+                    "related_ids",
                     "label",
+                    "candidate_interest_keywords",
                     "relation",
+                    "history_id",
                 ],
                 "additionalProperties": False,
             },
@@ -62,14 +67,16 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                 },
                 "required": [
                     "representative_id",
+                    "related_ids",
                     "label",
+                    "candidate_interest_keywords",
                     "history_id",
                 ],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["topics"],
+    "required": ["topics", "seen"],
     "additionalProperties": False,
 }
 
@@ -191,7 +198,9 @@ def select_hotlist_first_pass(
     raw_topics = response.parsed_json.get("topics")
     if not isinstance(raw_topics, list):
         raise ValueError("模型返回值缺少 topics 数组")
-    raw_seen_topics = response.parsed_json.get("seen", [])
+    raw_seen_topics = response.parsed_json.get("seen")
+    if raw_seen_topics is None:
+        raw_seen_topics = []
     if not isinstance(raw_seen_topics, list):
         raise ValueError("模型返回值缺少 seen 数组")
     raw_topics = raw_topics[:_FIRST_PASS_MAX_TOPICS]
@@ -212,11 +221,13 @@ def select_hotlist_first_pass(
         if not isinstance(raw_topic, Mapping):
             raise ValueError("模型返回了无效的话题对象")
         representative_id = raw_topic.get("representative_id")
-        related_ids = raw_topic.get("related_ids", [])
+        related_ids = raw_topic.get("related_ids")
+        if related_ids is None:
+            related_ids = []
         label = raw_topic.get("label")
-        candidate_interest_keywords = raw_topic.get(
-            "candidate_interest_keywords", []
-        )
+        candidate_interest_keywords = raw_topic.get("candidate_interest_keywords")
+        if candidate_interest_keywords is None:
+            candidate_interest_keywords = []
         if (
             isinstance(representative_id, bool)
             or not isinstance(representative_id, int)

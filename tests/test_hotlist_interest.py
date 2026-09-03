@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.parametrize("include_empty_fields", [True, False])
 def test_first_pass_propagates_semantic_interest_keywords(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    include_empty_fields: bool,
 ) -> None:
     from agentscroll import config
     from agentscroll.workflows.hotlist import select_hotlist_first_pass
@@ -27,23 +29,33 @@ def test_first_pass_propagates_semantic_interest_keywords(
 
     class FakeClient:
         def generate(self, _request: SimpleNamespace) -> SimpleNamespace:
+            topics = [
+                {
+                    "representative_id": 1,
+                    "label": "news",
+                    "candidate_interest_keywords": ["MCP"],
+                    "relation": "new",
+                },
+                {
+                    "representative_id": 2,
+                    "label": "news",
+                    "relation": "new",
+                },
+            ]
+            parsed_json = {"topics": topics}
+            if include_empty_fields:
+                for topic in topics:
+                    topic.update(
+                        related_ids=[],
+                        candidate_interest_keywords=topic.get(
+                            "candidate_interest_keywords", []
+                        ),
+                        history_id=None,
+                    )
+                parsed_json["seen"] = None
             return SimpleNamespace(
                 ok=True,
-                parsed_json={
-                    "topics": [
-                        {
-                            "representative_id": 1,
-                            "label": "news",
-                            "candidate_interest_keywords": ["MCP"],
-                            "relation": "new",
-                        },
-                        {
-                            "representative_id": 2,
-                            "label": "news",
-                            "relation": "new",
-                        }
-                    ],
-                },
+                parsed_json=parsed_json,
                 provider="fake",
                 model="fake-model",
                 elapsed_s=0.1,
@@ -83,8 +95,13 @@ def test_first_pass_propagates_semantic_interest_keywords(
     assert payload["interest"] == {"keywords": ["MCP", "机器人"]}
     assert "exact_interest_keywords" not in payload["candidates"][0]
     schema = requests[0].json_schema
-    topic_required = schema["properties"]["topics"]["items"]["required"]
-    assert "related_ids" not in topic_required
-    assert "candidate_interest_keywords" not in topic_required
-    assert "history_id" not in topic_required
-    assert "seen" not in schema["required"]
+    topic_schema = schema["properties"]["topics"]["items"]
+    seen_schema = schema["properties"]["seen"]["items"]
+    assert set(topic_schema["required"]) == set(topic_schema["properties"])
+    assert set(seen_schema["required"]) == set(seen_schema["properties"])
+    assert set(schema["required"]) == set(schema["properties"])
+    history_types = {
+        variant["type"]
+        for variant in topic_schema["properties"]["history_id"]["anyOf"]
+    }
+    assert history_types == {"integer", "null"}
