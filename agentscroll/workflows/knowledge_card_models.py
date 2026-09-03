@@ -13,6 +13,7 @@ from pydantic import (
     SkipValidation,
     WithJsonSchema,
     field_validator,
+    model_validator,
 )
 
 CardStatus = Literal["complete", "needs_research", "rejected"]
@@ -60,8 +61,22 @@ ShareScore = Annotated[
         }
     ),
 ]
-
-
+InterestShareScore = Annotated[
+    SkipValidation[Any],
+    WithJsonSchema(
+        {
+            "anyOf": [
+                {"type": "number", "const": 0},
+                {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 3.9,
+                    "multipleOf": 0.1,
+                },
+            ]
+        }
+    ),
+]
 class ShareDraft(BaseModel):
     """Share fields returned directly by the model."""
 
@@ -94,7 +109,8 @@ class KnowledgeCardDraft(BaseModel):
     knowledge: Text260
     chat_context: Text180
     latest_update: Text260 | None
-    share_score: ShareScore
+    general_share_score: ShareScore
+    interest_share_score: InterestShareScore
     share: SkipValidation[ShareDraft | None]
 
     @field_validator("rejection_reason", "knowledge", "chat_context", mode="before")
@@ -172,9 +188,30 @@ class KnowledgeCard(BaseModel):
     chat_context: str
     latest_update: str | None
     share_score: int | float
+    general_share_score: int | float
+    interest_share_score: int | float = 0
+    candidate_interest_keywords: tuple[str, ...] = ()
     share: KnowledgeShare | None
     topic_id: int
     research_sources: tuple[ResearchSource, ...] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_score_components(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        normalized.setdefault(
+            "general_share_score", normalized.get("share_score", 0)
+        )
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_final_share_score(self) -> KnowledgeCard:
+        expected = max(self.general_share_score, self.interest_share_score)
+        if self.share_score != expected:
+            raise ValueError("share_score 必须等于大众分与兴趣分的较高值")
+        return self
 
     @classmethod
     def needs_research(
@@ -182,6 +219,7 @@ class KnowledgeCard(BaseModel):
         topic_id: int,
         *,
         research: bool = False,
+        candidate_interest_keywords: tuple[str, ...] = (),
     ) -> KnowledgeCard:
         return cls(
             status="needs_research",
@@ -190,14 +228,21 @@ class KnowledgeCard(BaseModel):
             chat_context="",
             latest_update=None,
             share_score=0,
+            general_share_score=0,
+            interest_share_score=0,
+            candidate_interest_keywords=candidate_interest_keywords,
             share=None,
             topic_id=topic_id,
             research_sources=() if research else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        exclude = {"research_sources"} if self.research_sources is None else None
-        return self.model_dump(mode="json", exclude=exclude)
+        exclude = set()
+        if self.research_sources is None:
+            exclude.add("research_sources")
+        if not self.candidate_interest_keywords:
+            exclude.add("candidate_interest_keywords")
+        return self.model_dump(mode="json", exclude=exclude or None)
 
 
 def http_url(value: Any) -> str:
@@ -374,19 +419,74 @@ def _validate_share(
     )
 
 
+def _validated_score(
+    value: Any,
+    *,
+    topic_id: int,
+    field: str,
+    maximum: float,
+) -> int | float:
+    valid_range = isinstance(value, (int, float)) and (
+        value == 0 or 1 <= value <= maximum
+    )
+    has_at_most_one_decimal = valid_range and abs(
+        value * 10 - round(value * 10)
+    ) < 1e-9
+    if isinstance(value, bool) or not has_at_most_one_decimal:
+        raise ValueError(
+            f"话题 {topic_id} 的 {field} 必须为 0 或 1 至 {maximum:g} "
+            "且最多保留一位小数"
+        )
+    return value
+
+
+def _topic_interest_keywords(
+    topic: Mapping[str, Any], *, topic_id: int
+) -> tuple[str, ...]:
+    value = topic.get("candidate_interest_keywords") or []
+    if not isinstance(value, list) or any(
+        not isinstance(keyword, str) for keyword in value
+    ):
+        raise ValueError(
+            f"话题 {topic_id} 的 candidate_interest_keywords 必须是字符串数组"
+        )
+    normalized = tuple(keyword.strip() for keyword in value)
+    if any(not keyword for keyword in normalized) or len(normalized) != len(
+        set(normalized)
+    ):
+        raise ValueError(
+            f"话题 {topic_id} 的 candidate_interest_keywords 包含空值或重复值"
+        )
+    return normalized
+
+
 def _draft_from_mapping(
     raw_card: Mapping[str, Any],
     *,
     topic_id: int,
     research: bool,
 ) -> KnowledgeCardDraft:
+    uses_score_components = any(
+        field in raw_card
+        for field in (
+            "general_share_score",
+            "interest_share_score",
+        )
+    )
     payload = {
         "status": raw_card.get("status"),
         "rejection_reason": raw_card.get("rejection_reason"),
         "knowledge": raw_card.get("knowledge"),
         "chat_context": raw_card.get("chat_context"),
         "latest_update": raw_card.get("latest_update"),
-        "share_score": raw_card.get("share_score"),
+        "general_share_score": (
+            raw_card.get("general_share_score")
+            if uses_score_components
+            else raw_card.get("share_score")
+        ),
+        "interest_share_score": (
+            raw_card.get("interest_share_score") if uses_score_components else 0
+        ),
         "share": raw_card.get("share"),
     }
     if research:
@@ -407,6 +507,26 @@ def _validate_draft(
 ) -> KnowledgeCard:
     status = draft.status
     relation = str(topic.get("event_relation") or "new")
+    general_share_score = _validated_score(
+        draft.general_share_score,
+        topic_id=topic_id,
+        field="general_share_score",
+        maximum=4,
+    )
+    interest_share_score = _validated_score(
+        draft.interest_share_score,
+        topic_id=topic_id,
+        field="interest_share_score",
+        maximum=3.9,
+    )
+    candidate_interest_keywords = _topic_interest_keywords(
+        topic, topic_id=topic_id
+    )
+    if interest_share_score > 0 and not candidate_interest_keywords:
+        raise ValueError(
+            f"话题 {topic_id} 的 interest_share_score 大于 0 时必须有候选兴趣关键词"
+        )
+    share_score = max(general_share_score, interest_share_score)
     if status == "complete":
         if not draft.knowledge or not draft.chat_context or draft.rejection_reason:
             raise ValueError(f"完整知识卡 {topic_id} 的字段状态不一致")
@@ -432,7 +552,7 @@ def _validate_draft(
 
     share = _validate_share(
         draft.share,
-        score=draft.share_score,
+        score=share_score,
         status=status,
         topic=topic,
     )
@@ -474,7 +594,10 @@ def _validate_draft(
         knowledge=draft.knowledge,
         chat_context=draft.chat_context,
         latest_update=draft.latest_update,
-        share_score=draft.share_score,
+        share_score=share_score,
+        general_share_score=general_share_score,
+        interest_share_score=interest_share_score,
+        candidate_interest_keywords=candidate_interest_keywords,
         share=share,
         topic_id=topic_id,
         research_sources=research_sources,

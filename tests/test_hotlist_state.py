@@ -443,6 +443,56 @@ def test_immediate_new_card_is_rerun_once_as_update(
     assert diagnostics["request_count"] == 1
 
 
+def test_interest_only_score_does_not_trigger_immediate_history_recheck() -> None:
+    card = KnowledgeCard(
+        status="complete",
+        rejection_reason="",
+        knowledge="MCP 出现一项领域内更新。",
+        chat_context="聊到 Agent 工具时可以提起。",
+        latest_update=None,
+        share_score=3.9,
+        general_share_score=2.7,
+        interest_share_score=3.9,
+        candidate_interest_keywords=("MCP",),
+        share=KnowledgeShare(
+            text="MCP 出现一项领域内更新",
+            source_id="e1",
+            url="https://example.com/mcp",
+            comment_id="",
+            comment_type="generated",
+            comment="这个值得看看",
+        ),
+        topic_id=1,
+    )
+    evidence = {
+        "topics": [
+            {
+                "topic_id": 1,
+                "title": "MCP 出现一项领域内更新",
+                "label": "news",
+                "candidate_interest_keywords": ["MCP"],
+                "event_relation": "new",
+                "evidence": [],
+            }
+        ]
+    }
+
+    cards, _evidence, _selection, diagnostics = (
+        _recheck_immediate_history_matches(
+            [card],
+            evidence=evidence,
+            selection={"topics": []},
+            settings=SimpleNamespace(),
+            at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
+            immediate_score=3.5,
+            effort="xhigh",
+        )
+    )
+
+    assert cards == [card]
+    assert diagnostics == {}
+
+
 def test_selected_save_records_share_and_used_source_titles(
     tmp_path: Path,
 ) -> None:

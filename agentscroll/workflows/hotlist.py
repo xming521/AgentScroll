@@ -28,17 +28,17 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "integer"},
                     },
                     "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
-                    "relation": {"type": "string", "enum": ["new", "update"]},
-                    "history_id": {
-                        "anyOf": [{"type": "integer"}, {"type": "null"}]
+                    "candidate_interest_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
                     },
+                    "relation": {"type": "string", "enum": ["new", "update"]},
+                    "history_id": {"type": "integer"},
                 },
                 "required": [
                     "representative_id",
-                    "related_ids",
                     "label",
                     "relation",
-                    "history_id",
                 ],
                 "additionalProperties": False,
             },
@@ -54,11 +54,14 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "integer"},
                     },
                     "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
+                    "candidate_interest_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "history_id": {"type": "integer"},
                 },
                 "required": [
                     "representative_id",
-                    "related_ids",
                     "label",
                     "history_id",
                 ],
@@ -66,14 +69,20 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["topics", "seen"],
+    "required": ["topics"],
     "additionalProperties": False,
 }
 
 
-def _first_pass_prompt(candidates: list[dict[str, Any]]) -> str:
+def _first_pass_prompt(
+    candidates: list[dict[str, Any]],
+    interest_keywords: tuple[str, ...],
+) -> str:
     payload = json.dumps(
-        {"candidates": candidates},
+        {
+            "interest": {"keywords": list(interest_keywords)},
+            "candidates": candidates,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -108,6 +117,7 @@ def select_hotlist_first_pass(
     )
 
     settings = load_settings(config_path)
+    interest_keywords = settings.interest.keywords
     entries = list_hotlist_entries(hotlist)
     state_path = resolve_database_path(settings.storage.database_path)
     evaluated_at = reference_time(hotlist)
@@ -163,7 +173,7 @@ def select_hotlist_first_pass(
     )
     candidate_payloads = order_candidates_by_similarity(candidate_payloads)
     request = make_configured_request(
-        _first_pass_prompt(candidate_payloads),
+        _first_pass_prompt(candidate_payloads, interest_keywords),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
         timeout=300,
@@ -181,13 +191,16 @@ def select_hotlist_first_pass(
     raw_topics = response.parsed_json.get("topics")
     if not isinstance(raw_topics, list):
         raise ValueError("模型返回值缺少 topics 数组")
-    raw_seen_topics = response.parsed_json.get("seen")
+    raw_seen_topics = response.parsed_json.get("seen", [])
     if not isinstance(raw_seen_topics, list):
         raise ValueError("模型返回值缺少 seen 数组")
     raw_topics = raw_topics[:_FIRST_PASS_MAX_TOPICS]
 
     candidate_ids = {candidate["id"] for candidate in candidates}
-    candidates_by_id = {candidate["id"]: candidate for candidate in candidate_payloads}
+    candidates_by_id = {
+        candidate["id"]: candidate for candidate in candidate_payloads
+    }
+    configured_interest_keywords = set(interest_keywords)
     selected_ids: set[int] = set()
     matched_event_ids: set[str] = set()
     topics: list[dict[str, Any]] = []
@@ -195,12 +208,15 @@ def select_hotlist_first_pass(
 
     def validated_identity(
         raw_topic: Any,
-    ) -> tuple[int, list[int], str, list[int]]:
+    ) -> tuple[int, list[int], str, list[int], list[str]]:
         if not isinstance(raw_topic, Mapping):
             raise ValueError("模型返回了无效的话题对象")
         representative_id = raw_topic.get("representative_id")
-        related_ids = raw_topic.get("related_ids")
+        related_ids = raw_topic.get("related_ids", [])
         label = raw_topic.get("label")
+        candidate_interest_keywords = raw_topic.get(
+            "candidate_interest_keywords", []
+        )
         if (
             isinstance(representative_id, bool)
             or not isinstance(representative_id, int)
@@ -221,8 +237,28 @@ def select_hotlist_first_pass(
             raise ValueError(f"模型重复使用了热榜 ID：{topic_ids!r}")
         if not isinstance(label, str) or label not in _FIRST_PASS_LABELS:
             raise ValueError(f"模型返回了无效的 label：{label!r}")
+        if (
+            not isinstance(candidate_interest_keywords, list)
+            or any(
+                not isinstance(keyword, str)
+                or keyword not in configured_interest_keywords
+                for keyword in candidate_interest_keywords
+            )
+            or len(candidate_interest_keywords)
+            != len(set(candidate_interest_keywords))
+        ):
+            raise ValueError(
+                "模型返回了无效的 candidate_interest_keywords："
+                f"{candidate_interest_keywords!r}"
+            )
         selected_ids.update(topic_ids)
-        return representative_id, list(related_ids), label, topic_ids
+        return (
+            representative_id,
+            list(related_ids),
+            label,
+            topic_ids,
+            list(candidate_interest_keywords),
+        )
 
     def validated_history(
         raw_history_id: Any,
@@ -264,6 +300,7 @@ def select_hotlist_first_pass(
         representative_id: int,
         related_ids: list[int],
         label: str,
+        candidate_interest_keywords: list[str],
         *,
         relation: str,
         matched: Mapping[str, Any] | None,
@@ -276,13 +313,21 @@ def select_hotlist_first_pass(
             "label": label,
             "event_relation": relation,
         }
+        if candidate_interest_keywords:
+            topic["candidate_interest_keywords"] = candidate_interest_keywords
         if matched is not None:
             topic["matched_event_id"] = matched["event_id"]
             topic["matched_history_title"] = matched["title"]
         return topic
 
     for raw_topic in raw_topics:
-        representative_id, related_ids, label, topic_ids = validated_identity(raw_topic)
+        (
+            representative_id,
+            related_ids,
+            label,
+            topic_ids,
+            candidate_interest_keywords,
+        ) = validated_identity(raw_topic)
         relation = raw_topic.get("relation")
         raw_history_id = raw_topic.get("history_id")
         if relation == "new":
@@ -302,13 +347,20 @@ def select_hotlist_first_pass(
                 representative_id,
                 related_ids,
                 label,
+                candidate_interest_keywords,
                 relation=relation,
                 matched=matched,
             )
         )
 
     for raw_topic in raw_seen_topics:
-        representative_id, related_ids, label, topic_ids = validated_identity(raw_topic)
+        (
+            representative_id,
+            related_ids,
+            label,
+            topic_ids,
+            candidate_interest_keywords,
+        ) = validated_identity(raw_topic)
         matched = validated_history(
             raw_topic.get("history_id"),
             topic_ids=topic_ids,
@@ -319,6 +371,7 @@ def select_hotlist_first_pass(
                 representative_id,
                 related_ids,
                 label,
+                candidate_interest_keywords,
                 relation="seen",
                 matched=matched,
             )
@@ -374,22 +427,26 @@ def _save_first_pass_selection(
         related = topic.get("related") or []
         if not isinstance(representative, Mapping):
             continue
-        items.append(
-            {
-                "title": str(representative.get("title") or ""),
-                "source": str(representative.get("source_id") or ""),
-                "label": str(topic.get("label") or ""),
-                "relation": str(topic.get("event_relation") or "new"),
-                "matched_history_title": str(
-                    topic.get("matched_history_title") or ""
-                ),
-                "related_titles": [
-                    str(item.get("title") or "")
-                    for item in related
-                    if isinstance(item, Mapping)
-                ],
-            }
+        item = {
+            "title": str(representative.get("title") or ""),
+            "source": str(representative.get("source_id") or ""),
+            "label": str(topic.get("label") or ""),
+            "relation": str(topic.get("event_relation") or "new"),
+            "matched_history_title": str(
+                topic.get("matched_history_title") or ""
+            ),
+            "related_titles": [
+                str(item.get("title") or "")
+                for item in related
+                if isinstance(item, Mapping)
+            ],
+        }
+        candidate_keywords = list(
+            topic.get("candidate_interest_keywords") or []
         )
+        if candidate_keywords:
+            item["candidate_interest_keywords"] = candidate_keywords
+        items.append(item)
 
     seen_items = []
     for topic in selection.get("seen_topics") or []:
@@ -398,21 +455,25 @@ def _save_first_pass_selection(
         representative = topic.get("representative")
         if not isinstance(representative, Mapping):
             continue
-        seen_items.append(
-            {
-                "title": str(representative.get("title") or ""),
-                "source": str(representative.get("source_id") or ""),
-                "label": str(topic.get("label") or ""),
-                "matched_history_title": str(
-                    topic.get("matched_history_title") or ""
-                ),
-                "related_titles": [
-                    str(item.get("title") or "")
-                    for item in topic.get("related") or []
-                    if isinstance(item, Mapping)
-                ],
-            }
+        item = {
+            "title": str(representative.get("title") or ""),
+            "source": str(representative.get("source_id") or ""),
+            "label": str(topic.get("label") or ""),
+            "matched_history_title": str(
+                topic.get("matched_history_title") or ""
+            ),
+            "related_titles": [
+                str(item.get("title") or "")
+                for item in topic.get("related") or []
+                if isinstance(item, Mapping)
+            ],
+        }
+        candidate_keywords = list(
+            topic.get("candidate_interest_keywords") or []
         )
+        if candidate_keywords:
+            item["candidate_interest_keywords"] = candidate_keywords
+        seen_items.append(item)
 
     snapshot_file = None
     if isinstance(hotlist, (str, Path)):

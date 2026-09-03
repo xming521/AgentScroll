@@ -489,22 +489,26 @@ def collect_selected_hotlist_evidence(
             else:
                 attempt["generated_search"] = True
             attempts.append(attempt)
-        topics.append(
-            {
-                "topic_id": representative_id,
-                "title": display_title,
-                "label": str(raw_topic.get("label") or ""),
-                "event_relation": str(raw_topic.get("event_relation") or "new"),
-                "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
-                "related_titles": [
-                    str(entries[entry_id - 1].get("title") or "")
-                    for entry_id in raw_topic.get("related_ids") or []
-                    if entries[entry_id - 1].get("source_id") != "zhihu"
-                ],
-                "attempts": attempts,
-                "evidence": compact["items"],
-            }
+        topic = {
+            "topic_id": representative_id,
+            "title": display_title,
+            "label": str(raw_topic.get("label") or ""),
+            "event_relation": str(raw_topic.get("event_relation") or "new"),
+            "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
+            "related_titles": [
+                str(entries[entry_id - 1].get("title") or "")
+                for entry_id in raw_topic.get("related_ids") or []
+                if entries[entry_id - 1].get("source_id") != "zhihu"
+            ],
+            "attempts": attempts,
+            "evidence": compact["items"],
+        }
+        candidate_keywords = list(
+            raw_topic.get("candidate_interest_keywords") or []
         )
+        if candidate_keywords:
+            topic["candidate_interest_keywords"] = candidate_keywords
+        topics.append(topic)
 
     return {
         "provider": "agentscroll-hotlist-evidence",

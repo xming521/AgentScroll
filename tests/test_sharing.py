@@ -58,8 +58,13 @@ def _settings(
     )
 
 
-def _share(score: float, index: int) -> dict[str, object]:
-    return {
+def _share(
+    score: float,
+    index: int,
+    *,
+    general_score: float | None = None,
+) -> dict[str, object]:
+    share: dict[str, object] = {
         "topic_id": f"topic-{index}",
         "title": f"title-{index}",
         "score": score,
@@ -68,6 +73,9 @@ def _share(score: float, index: int) -> dict[str, object]:
         "comment": f"comment-{index}",
         "comment_type": "platform",
     }
+    if general_score is not None:
+        share["general_score"] = general_score
+    return share
 
 
 def _jobs(database: Path) -> list[dict[str, object]]:
@@ -251,6 +259,35 @@ def test_immediate_share_does_not_consume_ordinary_limits(tmp_path: Path) -> Non
     assert result["normal_scheduled"] == 1
     assert ordinary["status"] == "waiting"
     assert ordinary["due_at"] == now[0].isoformat()
+
+
+def test_interest_score_is_eligible_but_does_not_grant_immediate_bypass(
+    tmp_path: Path,
+) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    policy = SharePolicySettings(
+        delivery=ShareDeliverySettings(
+            min_interval_minutes=10,
+            immediate_score=3.5,
+        ),
+        window=WindowSharePolicySettings(
+            window_minutes=60,
+            max_messages_per_window=1,
+        ),
+    )
+    dispatcher, _scheduler, database, _transport = _dispatcher(
+        tmp_path, now, policy=policy
+    )
+
+    result = dispatcher.submit_shares(
+        "batch-1",
+        now[0],
+        [_share(3.9, 0, general_score=2.7)],
+    )
+
+    assert result["normal_scheduled"] == 1
+    assert result["bypass_scheduled"] == 0
+    assert _jobs(database)[0]["bypass"] == 0
 
 
 def test_same_destination_sends_each_body_and_comment_as_one_group(

@@ -190,12 +190,19 @@ def _selection_from_artifact(
         title = str(raw_topic.get("title") or "").strip()
         label = str(raw_topic.get("label") or "")
         related_titles = raw_topic.get("related_titles")
+        candidate_interest_keywords = (
+            raw_topic.get("candidate_interest_keywords") or []
+        )
         if label not in {"news", "fun"} or not title:
             raise ValueError(f"标题筛选结果包含无效类别或标题：{raw_topic!r}")
         if not isinstance(related_titles, list) or any(
             not isinstance(value, str) for value in related_titles
         ):
             raise ValueError(f"话题 {title!r} 的 related_titles 无效")
+        if not isinstance(candidate_interest_keywords, list) or any(
+            not isinstance(value, str) for value in candidate_interest_keywords
+        ):
+            raise ValueError(f"话题 {title!r} 的兴趣关键词无效")
 
         topic_titles = [title, *related_titles]
         missing_titles = [
@@ -219,6 +226,9 @@ def _selection_from_artifact(
                 "related_ids": related_ids,
                 "related": [dict(entries[value - 1]) for value in related_ids],
                 "label": label,
+                "candidate_interest_keywords": list(
+                    candidate_interest_keywords
+                ),
             }
         )
 

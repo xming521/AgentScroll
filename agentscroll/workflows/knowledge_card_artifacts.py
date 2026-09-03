@@ -25,7 +25,16 @@ def _render_card_text(card: Mapping[str, Any]) -> str:
         f"类别: {card['label']}",
         f"状态: {card['status']}",
         f"分享评分: {card.get('share_score', 0)}/4",
+        f"大众分享评分: {card.get('general_share_score', 0)}/4",
+        f"兴趣分享评分: {card.get('interest_share_score', 0)}/3.9",
     ]
+    if card.get("candidate_interest_keywords"):
+        lines.append(
+            "兴趣关键词: "
+            + "、".join(
+                str(value) for value in card["candidate_interest_keywords"]
+            )
+        )
     if card.get("knowledge"):
         lines.extend(("", str(card["knowledge"])))
     if card.get("chat_context"):
@@ -67,20 +76,25 @@ def _share_documents(
         if share is None:
             continue
         topic = evidence_by_id[card.topic_id]
-        shares.append(
-            {
-                "topic_id": card.topic_id,
-                "title": str(topic.get("title") or ""),
-                "label": normalize_label(topic.get("label")),
-                "score": card.share_score,
-                "text": share.text,
-                "url": share.url,
-                "comment": share.comment,
-                "comment_type": share.comment_type,
-                "source_id": share.source_id,
-                "comment_id": share.comment_id,
-            }
-        )
+        document = {
+            "topic_id": card.topic_id,
+            "title": str(topic.get("title") or ""),
+            "label": normalize_label(topic.get("label")),
+            "score": card.share_score,
+            "general_score": card.general_share_score,
+            "interest_score": card.interest_share_score,
+            "text": share.text,
+            "url": share.url,
+            "comment": share.comment,
+            "comment_type": share.comment_type,
+            "source_id": share.source_id,
+            "comment_id": share.comment_id,
+        }
+        if card.candidate_interest_keywords:
+            document["candidate_interest_keywords"] = list(
+                card.candidate_interest_keywords
+            )
+        shares.append(document)
     shares.sort(key=lambda item: item["score"], reverse=True)
     return shares
 
@@ -184,6 +198,8 @@ def save_card_batch(
             "chat_context": card.chat_context,
             "latest_update": card.latest_update,
             "share_score": card.share_score,
+            "general_share_score": card.general_share_score,
+            "interest_share_score": card.interest_share_score,
             "share": (
                 card.share.model_dump(mode="json") if card.share is not None else None
             ),
@@ -196,6 +212,10 @@ def save_card_batch(
             "research_evidence": topic.get("research_evidence") or [],
             "collection_attempts": topic.get("attempts") or [],
         }
+        if card.candidate_interest_keywords:
+            document["candidate_interest_keywords"] = list(
+                card.candidate_interest_keywords
+            )
         documents.append(document)
         batch_text.append(_render_card_text(document).rstrip())
 

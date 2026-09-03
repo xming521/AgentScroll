@@ -20,12 +20,17 @@ from agentscroll.workflows.knowledge_card_models import (
 from agentscroll.workflows.hotlist_state import load_history
 
 
-def _topic(*, relation: str = "new") -> dict[str, object]:
+def _topic(
+    *,
+    relation: str = "new",
+    candidate_interest_keywords: tuple[str, ...] = (),
+) -> dict[str, object]:
     return {
         "topic_id": 1,
         "title": "测试热点",
         "label": "news",
         "event_relation": relation,
+        "candidate_interest_keywords": list(candidate_interest_keywords),
         "evidence": [
             {
                 "source_id": "e1",
@@ -58,7 +63,8 @@ def _raw_card(**overrides: object) -> dict[str, object]:
         "knowledge": "热点知识",
         "chat_context": "聊天时可以提起。",
         "latest_update": None,
-        "share_score": 3.0,
+        "general_share_score": 3.0,
+        "interest_share_score": 0,
         "share": {
             "text": "分享正文",
             "source_id": "e1",
@@ -81,6 +87,8 @@ def test_validate_cards_normalizes_topic_and_platform_comment() -> None:
             "chat_context": "聊天时可以提起。",
             "latest_update": None,
             "share_score": 3.0,
+            "general_share_score": 3.0,
+            "interest_share_score": 0,
             "share": {
                 "text": "分享正文",
                 "source_id": "e1",
@@ -98,7 +106,7 @@ def test_validate_research_cards_resolves_source_ids() -> None:
     cards = validate_research_cards(
         [
             _raw_card(
-                share_score=0,
+                general_share_score=0,
                 share=None,
                 research_sources=["r1"],
             )
@@ -117,10 +125,39 @@ def test_validate_update_card_requires_latest_update() -> None:
 
 
 @pytest.mark.parametrize("score", [True, 0.5, 3.14, 4.1])
-def test_validate_cards_rejects_invalid_share_scores(score: object) -> None:
-    with pytest.raises(ValueError, match="share_score"):
+def test_validate_cards_rejects_invalid_general_share_scores(score: object) -> None:
+    with pytest.raises(ValueError, match="general_share_score"):
         validate_cards(
-            [_raw_card(share_score=score, share=None)],
+            [_raw_card(general_share_score=score, share=None)],
+            [_topic()],
+        )
+
+
+def test_interest_score_can_raise_final_score_without_changing_general_score() -> None:
+    cards = validate_cards(
+        [
+            _raw_card(
+                general_share_score=2.7,
+                interest_share_score=3.6,
+            )
+        ],
+        [_topic(candidate_interest_keywords=("MCP",))],
+    )
+
+    assert cards[0].general_share_score == 2.7
+    assert cards[0].interest_share_score == 3.6
+    assert cards[0].share_score == 3.6
+    assert cards[0].candidate_interest_keywords == ("MCP",)
+
+
+def test_validate_cards_rejects_interest_score_without_candidate_keyword() -> None:
+    with pytest.raises(ValueError, match="必须有候选兴趣关键词"):
+        validate_cards(
+            [
+                _raw_card(
+                    interest_share_score=3.6,
+                )
+            ],
             [_topic()],
         )
 
@@ -152,7 +189,7 @@ def test_validate_cards_preserves_needs_research_state() -> None:
                 status="needs_research",
                 knowledge="",
                 chat_context="",
-                share_score=0,
+                general_share_score=0,
                 share=None,
             )
         ],
@@ -166,6 +203,8 @@ def test_validate_cards_preserves_needs_research_state() -> None:
         "chat_context": "",
         "latest_update": None,
         "share_score": 0,
+        "general_share_score": 0,
+        "interest_share_score": 0,
         "share": None,
         "topic_id": 1,
     }
@@ -211,6 +250,8 @@ def test_save_cards_preserves_batch_and_share_contract(tmp_path: Path) -> None:
             "title": "测试热点",
             "label": "news",
             "score": 3.0,
+            "general_score": 3.0,
+            "interest_score": 0,
             "text": "分享正文",
             "url": "https://example.com/post/1",
             "comment": "真实评论",
@@ -283,8 +324,16 @@ def test_public_generation_keeps_dict_contract(
     assert len(requests) == 1
     assert "$defs" not in requests[0].json_schema
     assert requests[0].json_schema["properties"]["cards"]["maxItems"] == 1
+    card_schema = requests[0].json_schema["properties"]["cards"]["items"]
+    assert "general_share_score" in card_schema["properties"]
+    assert "interest_share_score" in card_schema["properties"]
+    assert "matched_interest_keywords" not in card_schema["properties"]
+    assert "share_score" not in card_schema["properties"]
     assert "不提供事件信息的讨论性问句" in requests[0].prompt
     assert "问句本身承载核心事件信息时可以保留" in requests[0].prompt
+    assert "interest.candidate_keywords" in requests[0].prompt
+    prompt_payload = json.loads(requests[0].prompt.rsplit("\n", 1)[-1])
+    assert "interest" not in prompt_payload
     assert result["topic_count"] == result["complete_count"] == 1
     assert isinstance(result["cards"][0], dict)
     assert result["cards"][0]["topic_id"] == 1
@@ -373,7 +422,7 @@ def test_supplement_workflow_keeps_dict_contract(
         cards = validate_research_cards(
             [
                 _raw_card(
-                    share_score=0,
+                    general_share_score=0,
                     share=None,
                     research_sources=["r1"],
                 )

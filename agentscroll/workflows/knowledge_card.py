@@ -13,6 +13,7 @@ from typing import Any
 
 from agentscroll.prompts.knowledge_card import (
     KNOWLEDGE_CARD_LABEL_PROMPTS,
+    KNOWLEDGE_CARD_INTEREST_PROMPT,
     KNOWLEDGE_CARD_PROMPT,
     KNOWLEDGE_CARD_RESEARCH_PROMPT,
 )
@@ -240,6 +241,23 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
         event_relation = str(raw_topic.get("event_relation") or "new")
         if event_relation not in {"new", "update"}:
             raise ValueError(f"话题 {topic_id} 的事件关系无效：{event_relation!r}")
+        raw_interest_keywords = raw_topic.get("candidate_interest_keywords") or []
+        if not isinstance(raw_interest_keywords, list) or any(
+            not isinstance(keyword, str) or not keyword.strip()
+            for keyword in raw_interest_keywords
+        ):
+            raise ValueError(
+                f"话题 {topic_id} 的 candidate_interest_keywords 无效"
+            )
+        candidate_interest_keywords = [
+            keyword.strip() for keyword in raw_interest_keywords
+        ]
+        if len(candidate_interest_keywords) != len(
+            set(candidate_interest_keywords)
+        ):
+            raise ValueError(
+                f"话题 {topic_id} 的 candidate_interest_keywords 包含重复值"
+            )
 
         compact_evidence: list[dict[str, Any]] = []
         for evidence_index, raw_item in enumerate(
@@ -274,26 +292,27 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "comments": comments,
                 }
             )
-        topics.append(
-            {
-                "topic_id": topic_id,
-                "title": str(raw_topic.get("title") or ""),
-                "label": label,
-                "event_relation": event_relation,
-                "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
-                "previous_card": (
-                    dict(raw_topic["previous_card"])
-                    if isinstance(raw_topic.get("previous_card"), Mapping)
-                    else None
-                ),
-                "timeline": [
-                    str(title)
-                    for title in raw_topic.get("timeline") or []
-                    if str(title).strip()
-                ],
-                "evidence": compact_evidence,
-            }
-        )
+        topic = {
+            "topic_id": topic_id,
+            "title": str(raw_topic.get("title") or ""),
+            "label": label,
+            "event_relation": event_relation,
+            "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
+            "previous_card": (
+                dict(raw_topic["previous_card"])
+                if isinstance(raw_topic.get("previous_card"), Mapping)
+                else None
+            ),
+            "timeline": [
+                str(title)
+                for title in raw_topic.get("timeline") or []
+                if str(title).strip()
+            ],
+            "evidence": compact_evidence,
+        }
+        if candidate_interest_keywords:
+            topic["candidate_interest_keywords"] = candidate_interest_keywords
+        topics.append(topic)
     if not topics:
         raise ValueError("evidence 中没有 news 或 fun 话题")
     return topics
@@ -421,6 +440,9 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
         "relation": str(topic.get("event_relation") or "new"),
         "evidence": compact_items(topic.get("evidence")),
     }
+    candidate_keywords = list(topic.get("candidate_interest_keywords") or [])
+    if candidate_keywords:
+        payload["interest"] = {"candidate_keywords": candidate_keywords}
     if payload["relation"] == "update":
         payload["previous_card"] = dict(topic.get("previous_card") or {})
         payload["timeline"] = list(topic.get("timeline") or [])
@@ -442,6 +464,7 @@ def _knowledge_card_prompt(topic: Mapping[str, Any]) -> str:
     return (
         f"{KNOWLEDGE_CARD_PROMPT.strip()}\n\n"
         f"{label_prompt.strip()}\n\n"
+        f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
         f"当前评估时间：{evaluated_at}\n"
         f"待生成知识卡的证据（JSON）：\n{payload}"
     )
@@ -458,6 +481,7 @@ def _knowledge_card_research_prompt(topic: Mapping[str, Any]) -> str:
     return (
         f"{KNOWLEDGE_CARD_RESEARCH_PROMPT.strip()}\n\n"
         f"{label_prompt.strip()}\n\n"
+        f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
         f"当前评估时间：{evaluated_at}\n"
         f"待补搜材料（JSON）：\n{payload}"
     )
@@ -480,7 +504,40 @@ def _needs_research_card(
     *,
     research: bool = False,
 ) -> KnowledgeCard:
-    return KnowledgeCard.needs_research(topic["topic_id"], research=research)
+    return KnowledgeCard.needs_research(
+        topic["topic_id"],
+        research=research,
+        candidate_interest_keywords=tuple(
+            topic.get("candidate_interest_keywords") or []
+        ),
+    )
+
+
+def _validated_interest_topics(
+    topics: list[dict[str, Any]],
+    settings: Any,
+) -> list[dict[str, Any]]:
+    interest = getattr(settings, "interest", None)
+    configured_keywords = tuple(getattr(interest, "keywords", ()) or ())
+    allowed = set(configured_keywords)
+    validated: list[dict[str, Any]] = []
+    for raw_topic in topics:
+        topic = dict(raw_topic)
+        candidate_keywords = list(
+            topic.get("candidate_interest_keywords") or []
+        )
+        unknown = set(candidate_keywords) - allowed
+        if unknown:
+            raise ValueError(
+                f"话题 {topic['topic_id']} 包含未配置的兴趣关键词："
+                f"{sorted(unknown)!r}"
+            )
+        if candidate_keywords:
+            topic["candidate_interest_keywords"] = candidate_keywords
+        else:
+            topic.pop("candidate_interest_keywords", None)
+        validated.append(topic)
+    return validated
 
 
 def _generate_topic_cards(
@@ -493,6 +550,7 @@ def _generate_topic_cards(
     effort: str,
     minimum_evidence_count: int = 1,
 ) -> tuple[list[KnowledgeCard], dict[str, Any]]:
+    topics = _validated_interest_topics(topics, settings)
     cards_by_id: dict[int, KnowledgeCard] = {}
     failures: list[dict[str, Any]] = []
     model_topics = topics
@@ -636,7 +694,7 @@ def _recheck_immediate_history_matches(
         and (card := cards_by_id.get(topic["topic_id"])) is not None
         and card.status == "complete"
         and card.share is not None
-        and card.share_score >= immediate_score
+        and card.general_share_score >= immediate_score
     ]
     if not triggered_topics:
         return cards, dict(evidence), dict(selection), {}

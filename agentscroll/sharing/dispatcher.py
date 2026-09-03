@@ -255,7 +255,18 @@ class ShareDispatcher:
                 score = float(share["score"])
                 if score < 3 or score > 4:
                     raise ValueError
+                raw_general_score = share.get("general_score", score)
+                if isinstance(raw_general_score, bool):
+                    raise TypeError
+                general_score = float(raw_general_score)
+                if not (
+                    general_score == 0 or 1 <= general_score <= 4
+                ) or abs(
+                    general_score * 10 - round(general_score * 10)
+                ) >= 1e-9:
+                    raise ValueError
                 share["score"] = score
+                share["general_score"] = general_score
                 render_share_messages(share)
                 normalized_shares.append((index, share))
         except (KeyError, TypeError, ValueError) as exc:
@@ -326,6 +337,7 @@ class ShareDispatcher:
                     ordinary_count = 0
                     for share_index, share in normalized_shares:
                         score = float(share["score"])
+                        general_score = float(share["general_score"])
                         eligible = (
                             not score_only or score >= policy.score_only.min_score
                         )
@@ -333,7 +345,7 @@ class ShareDispatcher:
                         immediate = (
                             eligible
                             and immediate_score is not None
-                            and score >= immediate_score
+                            and general_score >= immediate_score
                         )
                         bypass = immediate
                         status = "waiting"

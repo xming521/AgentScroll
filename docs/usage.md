@@ -17,13 +17,23 @@ uv pip install --python .venv/bin/python -e .
 cp settings.example.jsonc settings.jsonc
 ```
 
-`settings.example.jsonc` 是分发模板，`settings.jsonc` 是被 Git 忽略的本地真实配置。配置包含推理参数和热榜定时规则。`max_workers` 控制逐话题知识卡请求和补搜请求的最大并发数。API Key 只从 `api_key_env` 指定的环境变量读取，例如：
+`settings.example.jsonc` 是分发模板，`settings.jsonc` 是被 Git 忽略的本地真实配置。配置包含推理参数、兴趣关键词、热榜定时和分享规则。`max_workers` 控制逐话题知识卡请求和补搜请求的最大并发数。API Key 只从 `api_key_env` 指定的环境变量读取，例如：
 
 ```bash
 export AGENTSCROLL_LLM_API_KEY='your-api-key'
 ```
 
 可通过 `AGENTSCROLL_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
+
+`interest.keywords` 配置兴趣关键词，可以是具体词、人物、产品或领域：
+
+```jsonc
+"interest": {
+  "keywords": ["AI Agent", "MCP", "机器人"]
+}
+```
+
+缺失或使用空数组时不启用兴趣偏好。程序会去除首尾空白，并按 Unicode 兼容字符、大小写和连续空白规范化去重；用户原始写法保留在模型输入和 review 产物中。模型根据标题判断与兴趣关键词的直接语义相关性，不需要另配 ID、描述或权重。修改配置只影响后续未命中标题缓存的条目，近 7 天内已经分析过的相同标题不会自动重筛。
 
 `storage.database_path` 指定跨轮次状态数据库，默认是 `outputs/agentscroll.sqlite3`。数据库只包含三张业务表：
 
@@ -298,7 +308,7 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
 - `window`：参数位于 `policy.window`。普通消息每个目标在滚动 `window_minutes` 内最多发送 `max_messages_per_window` 条；一个批次只保留评分最高的指定条数，其余不排队。
 - `score_only`：参数位于 `policy.score_only`。只发送评分不低于 `min_score` 的消息，不计算窗口额度；低于门槛的消息直接丢弃。`min_score` 支持 3 至 4 分。
 
-`policy.delivery` 控制两种策略共用的发送节奏。未达到 `immediate_score` 的合格分享按目标遵守 `min_interval_minutes`；达到 `immediate_score` 的合格分享不等待该普通间隔，不占窗口额度，也不会让后续普通分享重新等待。同一目标的正文和评论会整组串行发送；两个相邻分享中至少一个为即时分享时，两组之间至少间隔 `immediate_interval_seconds`，避免同时到期的即时分享或普通分享把评论插到其他正文后面。`immediate_score` 设为 `null` 可关闭即时豁免，`immediate_interval_seconds` 设为 `0` 可关闭秒级间隔。只有 `mode` 选中的策略子配置参与资格和窗口额度判断。新批次会替换上一批尚未发送的普通分享，不形成跨批次积压；某个已选分享发送失败时也不会再用低分条目补位。
+`policy.delivery` 控制两种策略共用的发送节奏。分享资格、排序和 `score_only.min_score` 使用最终 `share_score`；`immediate_score` 只与 `general_share_score` 比较，兴趣评分不能取得即时豁免。未达到 `immediate_score` 的合格分享按目标遵守 `min_interval_minutes`；达到 `immediate_score` 的合格分享不等待该普通间隔，不占窗口额度，也不会让后续普通分享重新等待。同一目标的正文和评论会整组串行发送；两个相邻分享中至少一个为即时分享时，两组之间至少间隔 `immediate_interval_seconds`，避免同时到期的即时分享或普通分享把评论插到其他正文后面。`immediate_score` 设为 `null` 可关闭即时豁免，`immediate_interval_seconds` 设为 `0` 可关闭秒级间隔。只有 `mode` 选中的策略子配置参与资格和窗口额度判断。新批次会替换上一批尚未发送的普通分享，不形成跨批次积压；某个已选分享发送失败时也不会再用低分条目补位。
 
 只按分数发送时，策略可简写为：
 
@@ -372,10 +382,10 @@ docker compose down
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享 review 产物目录。
-- 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
+- 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；模型初步判断存在兴趣关键词时才记录 `candidate_interest_keywords`。`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
 - 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 会同步改写 `hotlist_topics` 的当前 `knowledge` 和 `latest_update`，并向 `payload_json` 的 `updates` 追加记录；证据不足或被淘汰的更新不改变当前有效知识，也不进入更新链。
-- 每张卡片用顶层 `share_score` 记录 0 分或 1 至 4 分的分享评分，最多保留一位小数；低于 3 分时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
-- 启用自动分享且暂定为 `new` 的卡片达到 `sharing.policy.delivery.immediate_score` 时，保存前会用现有正文和来源标题复核近期历史。命中后只重评对应话题一次，并以 `update` 结果替换暂定结果。批次 `inference.immediate_history_recheck` 记录触发数、命中事件、匹配分数、重评请求数和独立 Token 用量；没有达到即时分数的卡片不会触发该步骤。
+- 每张卡片用 `general_share_score` 记录现有大众标准评分，用 `interest_share_score` 记录候选兴趣关键词对应用户的分享价值；后者最高为 3.9。程序取两项评分的较高值写入最终 `share_score`，并直接保留标题阶段的 `candidate_interest_keywords`。三项分数均为 0 或最多一位小数的合法范围；最终分低于 3 时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
+- 启用自动分享且暂定为 `new` 的卡片，其 `general_share_score` 达到 `sharing.policy.delivery.immediate_score` 时，保存前会用现有正文和来源标题复核近期历史。命中后只重评对应话题一次，并以 `update` 结果替换暂定结果。批次 `inference.immediate_history_recheck` 记录触发数、命中事件、匹配分数、重评请求数和独立 Token 用量；只有兴趣分达到即时阈值的卡片不会触发该步骤。
 - 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`skipped_empty_evidence_count` 和 `skipped_empty_evidence_topics` 记录第一轮与补搜都没有可读正文、因而跳过模型请求的话题数和话题 ID；`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。

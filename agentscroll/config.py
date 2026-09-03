@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -74,6 +75,34 @@ class StorageSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     database_path: Path = Path("outputs/agentscroll.sqlite3")
+
+
+class InterestSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    keywords: tuple[str, ...] = ()
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def normalize_keywords(cls, value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError("interest.keywords 必须是字符串数组")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_keyword in value:
+            if not isinstance(raw_keyword, str):
+                raise ValueError("interest.keywords 只能包含字符串")
+            keyword = " ".join(raw_keyword.split())
+            if not keyword:
+                raise ValueError("interest.keywords 不能包含空字符串")
+            key = unicodedata.normalize("NFKC", keyword).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(keyword)
+        return tuple(normalized)
 
 
 class WindowSharePolicySettings(BaseModel):
@@ -187,6 +216,7 @@ class AgentScrollSettings(BaseModel):
     codex_exec: CodexExecSettings = Field(default_factory=CodexExecSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
+    interest: InterestSettings = Field(default_factory=InterestSettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
     integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
 
@@ -270,6 +300,7 @@ __all__ = [
     "CONFIG_ENV",
     "DEFAULT_CONFIG_PATH",
     "IntegrationsSettings",
+    "InterestSettings",
     "ScheduleSettings",
     "ScoreOnlySharePolicySettings",
     "ShareDeliverySettings",
