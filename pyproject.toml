@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Let AI agents browse the internet like humans do."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "agentscroll/collector/ACKNOWLEDGEMENTS.md"]
 dependencies = [
   "APScheduler>=3.11.3,<4",
   "click>=8.0.0",
@@ -30,6 +32,9 @@ chinese = ["jieba"]
 
 [tool.setuptools.packages.find]
 include = ["agentscroll*"]
+
+[tool.setuptools.package-data]
+agentscroll = ["inference.upstream.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

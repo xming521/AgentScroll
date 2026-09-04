@@ -10,7 +10,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends gosu tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY agentscroll ./agentscroll
 
 RUN uv pip install --system --no-cache . \

@@ -2,6 +2,7 @@
 !Dockerfile
 !pyproject.toml
 !README.md
+!LICENSE
 !agentscroll/
 !agentscroll/**
 !docker/
