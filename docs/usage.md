@@ -35,11 +35,15 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 缺失或使用空数组时不启用兴趣偏好。程序会去除首尾空白，并按 Unicode 兼容字符、大小写和连续空白规范化去重；用户原始写法保留在模型输入和 review 产物中。模型根据标题判断与兴趣关键词的直接语义相关性，不需要另配 ID、描述或权重。修改配置只影响后续未命中标题缓存的条目，近 7 天内已经分析过的相同标题不会自动重筛。
 
+`hotlist.force_share_title_count` 配置本轮同一事件达到多少个热榜标题时强制分享，默认是 `3`。数量只包含当前热榜快照中第一轮合并的代表标题与 `related_ids` 标题，不包含本地历史召回、已有事件时间线或后续主动搜索结果；达到门槛且存在可用分享来源时，大众分享评分固定为 4 分。
+
 `storage.database_path` 指定跨轮次状态数据库，默认是 `outputs/agentscroll.sqlite3`。数据库只包含三张业务表：
 
 - `hotlist_topics`：热点稳定 ID 和当前有效知识；常用的类别、状态、时间、标题、知识、聊天语境、最新进展和分享评分是独立字段，标题链和更新链放在 `payload_json`。
 - `hotlist_title_cache`：第一轮成功判断过的全部标题缓存，包括入选、未入选、`seen` 和精确命中的标题；按规范化标题去重并刷新最近出现时间，只用于 7 天窗口内避免重复分析。
-- `share_jobs`：每个分享目标的等待、发送中和最终任务状态，以及冻结的发送 `payload_json`，用于限流和重启恢复。
+- `share_jobs`：每个分享目标的等待、发送中和最终任务状态，以及 `normal`、`llm_major`、`hotlist_title_count` 三类 `share_trigger` 和冻结的发送 `payload_json`，用于限流和重启恢复。
+
+数据库还提供 `shared_content_review` 视图，只列出最终状态为 `sent` 的真实投递，并将当时冻结的标题、正文、链接、评论、评分和目标展开为独立列，方便直接 review。一次内容发往多个目标时，每个成功目标各占一行。
 
 筛选、采集、知识卡和分享批次文件继续作为 review 产物保存，推理与分享审计继续写 JSONL；这些文件不作为生产状态读取。新版本不会导入、回读或双写旧的热榜历史 JSON 和分享 `state.json`。
 
@@ -90,7 +94,7 @@ AgentScroll CLI 默认把运行日志写入 `outputs/logs/agentscroll-YYYY-MM-DD
 | `default` | 10 条 | 中等 |
 | `deep` | 20 条 | 最高 |
 
-`quick` 不会跳过小红书或其他平台。平台实际返回数量可能低于对应上限；候选越多，后续详情与评论请求也越多。各档使用的采集路径见[搜索规模](design.md#搜索规模)。
+小红书当前不进入默认场景路由；需要单独验证或使用时，可通过 `--sources xiaohongshu` 显式指定。显式指定后，`quick` 仍会采集小红书，只改变候选发现路径。平台实际返回数量可能低于对应上限；候选越多，后续详情与评论请求也越多。各档使用的采集路径见[搜索规模](design.md#搜索规模)。
 
 各场景的选择规则见[主动搜索](design.md#主动搜索)。
 
@@ -207,7 +211,7 @@ AgentScroll 定义了 27 个固定分组，共覆盖 50 个唯一 Source ID。�
   --per-source-limit 10
 ```
 
-默认连接 `http://127.0.0.1:4444`，可通过 `AGENTSCROLL_NEWSNOW_BASE_URL` 或 `--base-url` 修改。`--latest` 请求 NewsNow 刷新，但实际刷新时间仍由上游刷新间隔和缓存策略决定。`--output-dir` 修改快照目录，`--no-save` 只返回数据而不保存文件。
+默认连接 `http://127.0.0.1:4444`，可通过 `AGENTSCROLL_NEWSNOW_BASE_URL` 或 `--base-url` 修改。每个榜单源遇到连接超时或可重试的服务端错误时最多尝试 3 次；`--timeout` 是每次请求的超时时间。`--latest` 请求 NewsNow 刷新，但实际刷新时间仍由上游刷新间隔和缓存策略决定。`--output-dir` 修改快照目录，`--no-save` 只返回数据而不保存文件。
 
 拉榜阶段只保存索引，不读取正文或评论。默认生成：
 
@@ -330,7 +334,7 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
 }
 ```
 
-分享任务和普通额度保存在 `storage.database_path` 指定数据库的 `share_jobs`，逐日审计写入 `outputs/sharing/YYYY-MM-DD.jsonl`。审计日志只保存目标摘要、任务结果和错误类型，不保存 API Key 或消息正文；`outputs/shares/` 下的批次 JSON/TXT 仅供 review，分发器不会扫描它们恢复任务。AstrBot transport 只有建立连接失败时才分别等待 1 秒、3 秒重试；服务返回错误或读取响应时结果不确定均不重试，后者按可能已发送处理以防重复。
+分享任务和普通额度保存在 `storage.database_path` 指定数据库的 `share_jobs`；只查看已确认发送的内容时可查询 `shared_content_review` 视图。逐日审计写入 `outputs/sharing/YYYY-MM-DD.jsonl`。审计日志只保存目标摘要、任务结果和错误类型，不保存 API Key 或消息正文；`outputs/shares/` 下的批次 JSON/TXT 仅供 review，分发器不会扫描它们恢复任务。AstrBot transport 只有建立连接失败时才分别等待 1 秒、3 秒重试；服务返回错误或读取响应时结果不确定均不重试，后者按可能已发送处理以防重复。
 
 ### Docker 后台运行
 
@@ -375,7 +379,7 @@ docker compose down
   --share-output-dir outputs/shares
 ```
 
-两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。模型选出的代表标题保持不变，正文采集独立优先使用同话题的非知乎入口；只有整组标题都来自知乎时，才批量生成检索词并只到微博补采。最后的主动搜索复用 `agentscroll search` 的采集入口：`news` 搜微博、微信公众号和今日头条，`fun` 搜微博和小红书，每个话题最多保留 3 条实际读到正文的内容。第一轮证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子；主动搜索沿用同一查询日期范围，并过滤已知日期超出范围的内容。
+两个命令都会做话题级粗筛，再采集正文和评论、生成知识卡，并只对证据不足的话题补搜。模型选出的代表标题保持不变，正文采集独立优先使用同话题的非知乎入口；只有整组标题都来自知乎时，才批量生成检索词并只到微博补采。最后的主动搜索复用 `agentscroll search` 的采集入口：`news` 搜微博、微信公众号和今日头条，`fun` 只搜微博，每个话题最多保留 3 条实际读到正文的内容。小红书当前不参与自动补搜。第一轮证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子；主动搜索沿用同一查询日期范围，并过滤已知日期超出范围的内容。
 
 常用参数与产物：
 
@@ -386,7 +390,7 @@ docker compose down
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享 review 产物目录。
-- 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title` 和同话题标题 `related_titles`；模型初步判断存在兴趣关键词时才记录 `candidate_interest_keywords`。`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
+- 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title`、本轮同事件标题数 `hotlist_title_count` 和同话题标题 `related_titles`；模型初步判断存在兴趣关键词时才记录 `candidate_interest_keywords`。`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
 - 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 会同步改写 `hotlist_topics` 的当前 `knowledge` 和 `latest_update`，并向 `payload_json` 的 `updates` 追加记录；证据不足或被淘汰的更新不改变当前有效知识，也不进入更新链。
 - 每张卡片用 `general_share_score` 记录现有大众标准评分，用 `interest_share_score` 记录候选兴趣关键词对应用户的分享价值；后者最高为 3.9。程序取两项评分的较高值写入最终 `share_score`，并直接保留标题阶段的 `candidate_interest_keywords`。三项分数均为 0 或最多一位小数的合法范围；最终分低于 3 时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
 - 启用自动分享且暂定为 `new` 的卡片，其 `general_share_score` 达到 `sharing.policy.delivery.immediate_score` 时，保存前会用现有正文和来源标题复核近期历史。命中后只重评对应话题一次，并以 `update` 结果替换暂定结果。批次 `inference.immediate_history_recheck` 记录触发数、命中事件、匹配分数、重评请求数和独立 Token 用量；只有兴趣分达到即时阈值的卡片不会触发该步骤。

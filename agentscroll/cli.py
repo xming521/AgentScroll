@@ -310,6 +310,7 @@ def hotlist_run(
                 settings.sharing,
                 transports=transports,
                 database_path=settings.storage.database_path,
+                force_share_title_count=settings.hotlist.force_share_title_count,
             )
         )
         policy = settings.sharing.policy

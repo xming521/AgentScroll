@@ -16,7 +16,7 @@ RequestedScene = Literal["auto", "formal", "informal"]
 
 SCENE_SOURCES: dict[Scene, tuple[str, ...]] = {
     "formal": ("zhihu", "wechat", "toutiao"),
-    "informal": ("weibo", "xiaohongshu", "bilibili", "douyin"),
+    "informal": ("weibo", "bilibili", "douyin"),
 }
 
 # These are intent signals rather than topic-specific entities. In particular,

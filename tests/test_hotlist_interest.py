@@ -105,3 +105,111 @@ def test_first_pass_propagates_semantic_interest_keywords(
         for variant in topic_schema["properties"]["history_id"]["anyOf"]
     }
     assert history_types == {"integer", "null"}
+
+
+def test_invalid_local_history_is_downgraded_without_failing_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentscroll import config
+    from agentscroll.workflows import hotlist_state
+    from agentscroll.workflows.hotlist import select_hotlist_first_pass
+
+    class FakeClient:
+        def generate(self, _request: SimpleNamespace) -> SimpleNamespace:
+            return SimpleNamespace(
+                ok=True,
+                parsed_json={
+                    "topics": [
+                        {
+                            "representative_id": 1,
+                            "related_ids": [],
+                            "label": "news",
+                            "candidate_interest_keywords": [],
+                            "relation": "update",
+                            "history_id": 31,
+                        },
+                        {
+                            "representative_id": 2,
+                            "related_ids": [],
+                            "label": "news",
+                            "candidate_interest_keywords": [],
+                            "relation": "new",
+                            "history_id": None,
+                        },
+                    ],
+                    "seen": [],
+                },
+                provider="fake",
+                model="fake-model",
+                elapsed_s=0.1,
+                error=None,
+            )
+
+        def close(self) -> None:
+            pass
+
+    def fake_attach(candidates, _history, *, at):
+        del at
+        payloads = [dict(candidate) for candidate in candidates]
+        payloads[1]["history"] = [
+            {
+                "history_id": 31,
+                "title": "家长投诉老师婚姻状况",
+                "last_seen_date": "2026-09-02",
+            }
+        ]
+        return (
+            payloads,
+            {31: {"event_id": "teacher-event", "score": 0.45}},
+            {
+                "active_event_count": 1,
+                "history_match_count": 1,
+                "history_prompt_chars": 80,
+            },
+        )
+
+    settings = SimpleNamespace(
+        storage=SimpleNamespace(database_path=tmp_path / "state.sqlite3"),
+        interest=SimpleNamespace(keywords=()),
+    )
+    monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
+    monkeypatch.setattr(
+        config,
+        "make_configured_request",
+        lambda prompt, _settings, **kwargs: SimpleNamespace(
+            prompt=prompt,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(config, "build_configured_client", lambda _settings: FakeClient())
+    monkeypatch.setattr(hotlist_state, "attach_history_matches", fake_attach)
+
+    result = select_hotlist_first_pass(
+        {
+            "collected_at": "2026-09-03T11:04:28+08:00",
+            "sources": {
+                "zhihu": {
+                    "items": [
+                        {"title": "家长因老师不婚主义向学校投诉"},
+                        {"title": "另一条值得关注的公共事件"},
+                    ]
+                }
+            },
+        }
+    )
+
+    assert [topic["event_relation"] for topic in result["topics"]] == [
+        "new",
+        "new",
+    ]
+    assert "matched_event_id" not in result["topics"][0]
+    assert result["inference"]["history_fallbacks"] == [
+        {
+            "representative_id": 1,
+            "requested_relation": "update",
+            "history_id": 31,
+            "reason": "history_id 31 不属于当前话题的本地召回结果",
+            "action": "downgraded_to_new",
+        }
+    ]

@@ -495,6 +495,7 @@ def collect_selected_hotlist_evidence(
             "label": str(raw_topic.get("label") or ""),
             "event_relation": str(raw_topic.get("event_relation") or "new"),
             "matched_event_id": str(raw_topic.get("matched_event_id") or ""),
+            "hotlist_title_count": 1 + len(raw_topic.get("related_ids") or []),
             "related_titles": [
                 str(entries[entry_id - 1].get("title") or "")
                 for entry_id in raw_topic.get("related_ids") or []

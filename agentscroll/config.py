@@ -105,6 +105,12 @@ class InterestSettings(BaseModel):
         return tuple(normalized)
 
 
+class HotlistSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    force_share_title_count: int = Field(default=3, ge=1)
+
+
 class WindowSharePolicySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -217,6 +223,7 @@ class AgentScrollSettings(BaseModel):
     storage: StorageSettings = Field(default_factory=StorageSettings)
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     interest: InterestSettings = Field(default_factory=InterestSettings)
+    hotlist: HotlistSettings = Field(default_factory=HotlistSettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
     integrations: IntegrationsSettings = Field(default_factory=IntegrationsSettings)
 

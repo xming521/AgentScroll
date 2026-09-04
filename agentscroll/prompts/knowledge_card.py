@@ -77,6 +77,8 @@ KNOWLEDGE_CARD_PROMPT = """
 
 relation=new 时生成一张新卡。relation=update 时，必须把现有证据与 previous_card、timeline 比较：只有证据明确支持旧卡和时间线中均未包含的新状态、新结果、新数字、新处置或新回应，才能设为 complete；若当前证据只重复旧卡或时间线中的已有进展，或不能支持标题声称的进展，设为 rejected。
 
+hotlist.force_share=true 且存在可用 source_id 时，必须令 status=complete、general_share_score=4 并填写 share；此规则优先于其他评分限制。
+
 更新成功时，knowledge 必须写成合并后的当前状态：以 previous_card.knowledge 为底稿，保留其中仍然成立且对理解核心事件有用的信息；已被本轮新状态替代的数字或结果直接更新，不同时保留新旧版本；局部细节只有仍具核心价值时才保留。
 
 relation=update 时，general_share_score 只评价相对于 previous_card 的新增进展，不评价整件事本身的绝对重要性，默认最高为 2.9。只有新增材料足以明显改变对事件核心状态、结果或影响的理解，并且值得再次主动告诉已经知道该事件的人时，才可达到 3 分；4 分只用于新增进展本身构成重大转折或产生广泛影响的情况。普通数字变化、原因或背景补充、现场细节和重复回应不得达到 3 分。
@@ -92,6 +94,7 @@ general_share_score 与 interest_share_score 的较高值达到 3 分时按类�
 - previous_card：仅在 relation=update 时提供的原知识卡，其中 title 是原卡标题，status 是原卡状态，knowledge 是原有知识，chat_context 是原有聊天语境，latest_update 是上一次更新或 null；非空的 latest_update 中，updated_at 是更新时间，title 是当时的新标题，summary 是当时的进展摘要；
 - timeline：当前事件最近 7 天内已确认更新的标题时间线，按更新时间从旧到新排列；只用于判断进展是否重复，不能作为事实证据；
 - interest.candidate_keywords：标题阶段根据标题判断直接相关的用户兴趣关键词；字段不存在时表示没有候选兴趣关键词；
+- hotlist.force_share：是否必须按 4 分强制分享；
 - evidence：已取得的真实帖子材料。每项包含平台 platform、原帖标题 source_title、发布时间 published_at、正文 content 和评论 comments；有可用地址时包含本地帖子编号 source_id，每条评论包含当前话题内唯一的 comment_id 和网友原文 text。
 
 只返回一个 JSON object，其中 cards 是只包含该话题一张卡的数组。卡片字段含义：
@@ -120,12 +123,13 @@ KNOWLEDGE_CARD_RESEARCH_PROMPT = """
 
 使用原则：
 
-- research_evidence 是主动搜索微博、微信公众号、今日头条或小红书后，实际打开并读取到的候选正文和评论；不保证每项都相关，必须忽略明显跑题的结果。
+- research_evidence 是主动搜索微博、微信公众号或今日头条后，实际打开并读取到的候选正文和评论；不保证每项都相关，必须忽略明显跑题的结果。
 - 第一轮材料与主动搜索材料使用同一证据标准；理解和分享都必须以实际正文为依据，不能把标题或摘要当成正文。
 - 新闻报道、平台帖子、赛事资料、行业文章和讨论帖都可用于理解，不强求官方来源。
 - 不为追求精确继续深挖日期、金额、责任归属等枝节；如果不同来源说法略有出入，采用各来源都能支持的保守表述，不要强行确定冲突细节。
 - 只有第一轮证据和主动搜索证据仍无法辨认话题对象时，才保留 needs_research。不得凭空补充输入中没有的搜索结果。
 - relation=update 时还要把材料与 previous_card、timeline 比较。若两轮材料仍只重复旧卡或时间线中的已有进展，或不能支持标题声称的进展，设为 rejected 并说明“未找到新进展”。若证据支持进展，knowledge 必须以 previous_card.knowledge 为底稿合并为当前状态：保留仍然成立且对理解核心事件有用的旧信息；已被替代的数字或结果直接更新，不同时保留新旧版本；局部现场细节只有仍具核心价值时才保留。latest_update 只描述本轮新增内容。
+hotlist.force_share=true 且存在可用 source_id 时，必须令 status=complete、general_share_score=4 并填写 share；此规则优先于其他评分限制。
 - relation=update 时，general_share_score 只评价相对于 previous_card 的新增进展，不评价整件事本身的绝对重要性，默认最高为 2.9。只有新增材料足以明显改变对事件核心状态、结果或影响的理解，并且值得再次主动告诉已经知道该事件的人时，才可达到 3 分；4 分只用于新增进展本身构成重大转折或产生广泛影响的情况。普通数字变化、原因或背景补充、现场细节和重复回应不得达到 3 分。
 - 按现有材料生成 general_share_score：0 分表示材料不足或没有可用来源；正常评分为 1 至 4 分，最多保留一位小数。1、2、3、4 分分别对应当前类别专用规则中的四档，小数只用于表示相邻档位之间的程度。它与 interest_share_score 的较高值达到 3 分时，按当前类别专用规则填写即时分享内容，是否保留或改写原标题也以类别专用规则为准；不得使用材料不支持的夸张表达、伪造悬念或故意隐去改变内容性质的关键事实。分享依据可以是第一轮材料或主动搜索材料，但必须选择带 source_id 且确实支持分享内容的一项。
 - 第一轮材料和主动搜索材料中的真实评论都可以按当前类别专用规则选择；comment_id 可来自该话题任一帖子，不要求属于分享来源。只要存在能独立表达、不明显跑题且有真人口语感的真实评论，就必须选择 comment_id；以真人感和拟人度给真实候选排序，不要因为评论短、口语化或信息量少就改为自拟。只有所有真实评论都无法独立成句、明显跑题、表达不明或像 AI 回答时，才改用 generated_comment 写一句简短、口语化、自然的真人反应，且不得伪装成网友原话或补充材料中没有的事实。
@@ -138,6 +142,7 @@ KNOWLEDGE_CARD_RESEARCH_PROMPT = """
 - previous_card：update 事件的原知识卡，子字段含义与第一轮相同；
 - timeline：当前事件最近 7 天内已确认更新的标题时间线，按更新时间从旧到新排列；只用于判断进展是否重复，不能作为事实证据；
 - interest.candidate_keywords：标题阶段根据标题判断直接相关的用户兴趣关键词；字段不存在时表示没有候选兴趣关键词；
+- hotlist.force_share：是否必须按 4 分强制分享；
 - evidence：第一轮已取得的帖子正文和评论，字段规则与第一轮相同；
 - research_evidence：主动搜索取得的真实平台材料，最多 3 项；每项包含平台 platform、原帖标题 source_title、发布时间 published_at、正文 content 和评论 comments，有可用地址时还包含本地 source_id，地址本身不会提供给你。
 

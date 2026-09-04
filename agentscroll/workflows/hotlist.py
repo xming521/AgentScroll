@@ -214,6 +214,8 @@ def select_hotlist_first_pass(
     matched_event_ids: set[str] = set()
     topics: list[dict[str, Any]] = []
     seen_topics: list[dict[str, Any]] = []
+    history_fallbacks: list[dict[str, Any]] = []
+    retry_candidate_ids: set[int] = set()
 
     def validated_identity(
         raw_topic: Any,
@@ -307,6 +309,24 @@ def select_hotlist_first_pass(
             raise ValueError(f"模型把同一历史事件拆成了多个话题：{event_id}")
         matched_event_ids.add(event_id)
 
+    def record_history_fallback(
+        *,
+        representative_id: int,
+        requested_relation: str,
+        raw_history_id: Any,
+        reason: str,
+        action: str,
+    ) -> None:
+        history_fallbacks.append(
+            {
+                "representative_id": representative_id,
+                "requested_relation": requested_relation,
+                "history_id": raw_history_id,
+                "reason": reason,
+                "action": action,
+            }
+        )
+
     def mapped_topic(
         representative_id: int,
         related_ids: list[int],
@@ -343,14 +363,32 @@ def select_hotlist_first_pass(
         raw_history_id = raw_topic.get("history_id")
         if relation == "new":
             if raw_history_id is not None:
-                raise ValueError("new 话题的 history_id 必须为 null")
+                record_history_fallback(
+                    representative_id=representative_id,
+                    requested_relation=relation,
+                    raw_history_id=raw_history_id,
+                    reason="new 话题的 history_id 必须为 null",
+                    action="ignored_history_id",
+                )
             matched = None
         elif relation == "update":
-            matched = validated_history(
-                raw_history_id,
-                topic_ids=topic_ids,
-            )
-            claim_matched_event(matched)
+            try:
+                matched = validated_history(
+                    raw_history_id,
+                    topic_ids=topic_ids,
+                )
+            except ValueError as exc:
+                record_history_fallback(
+                    representative_id=representative_id,
+                    requested_relation=relation,
+                    raw_history_id=raw_history_id,
+                    reason=str(exc),
+                    action="downgraded_to_new",
+                )
+                relation = "new"
+                matched = None
+            else:
+                claim_matched_event(matched)
         else:
             raise ValueError(f"模型返回了无效的 relation：{relation!r}")
         topics.append(
@@ -372,10 +410,36 @@ def select_hotlist_first_pass(
             topic_ids,
             candidate_interest_keywords,
         ) = validated_identity(raw_topic)
-        matched = validated_history(
-            raw_topic.get("history_id"),
-            topic_ids=topic_ids,
-        )
+        raw_history_id = raw_topic.get("history_id")
+        try:
+            matched = validated_history(
+                raw_history_id,
+                topic_ids=topic_ids,
+            )
+        except ValueError as exc:
+            if len(topics) < _FIRST_PASS_MAX_TOPICS:
+                topics.append(
+                    mapped_topic(
+                        representative_id,
+                        related_ids,
+                        label,
+                        candidate_interest_keywords,
+                        relation="new",
+                        matched=None,
+                    )
+                )
+                action = "downgraded_to_new"
+            else:
+                retry_candidate_ids.update(topic_ids)
+                action = "deferred_to_next_run"
+            record_history_fallback(
+                representative_id=representative_id,
+                requested_relation="seen",
+                raw_history_id=raw_history_id,
+                reason=str(exc),
+                action=action,
+            )
+            continue
         claim_matched_event(matched)
         seen_topics.append(
             mapped_topic(
@@ -391,10 +455,22 @@ def select_hotlist_first_pass(
     record_first_pass(
         state_path,
         exact_titles=exact_titles,
-        analyzed_titles=[str(candidate["title"]) for candidate in candidates],
+        analyzed_titles=[
+            str(candidate["title"])
+            for candidate in candidates
+            if candidate["id"] not in retry_candidate_ids
+        ],
         seen_topics=seen_topics,
         at=evaluated_at,
     )
+
+    inference: dict[str, Any] = {
+        "provider": response.provider,
+        "model": response.model,
+        "elapsed_s": response.elapsed_s,
+    }
+    if history_fallbacks:
+        inference["history_fallbacks"] = history_fallbacks
 
     return {
         "input_count": len(entries),
@@ -408,11 +484,7 @@ def select_hotlist_first_pass(
         "history_event_count": history_stats["active_event_count"],
         "history_match_count": history_stats["history_match_count"],
         "history_prompt_chars": history_stats["history_prompt_chars"],
-        "inference": {
-            "provider": response.provider,
-            "model": response.model,
-            "elapsed_s": response.elapsed_s,
-        },
+        "inference": inference,
     }
 
 
@@ -446,6 +518,7 @@ def _save_first_pass_selection(
             "matched_history_title": str(
                 topic.get("matched_history_title") or ""
             ),
+            "hotlist_title_count": 1 + len(related),
             "related_titles": [
                 str(item.get("title") or "")
                 for item in related
@@ -473,6 +546,7 @@ def _save_first_pass_selection(
             "matched_history_title": str(
                 topic.get("matched_history_title") or ""
             ),
+            "hotlist_title_count": 1 + len(topic.get("related") or []),
             "related_titles": [
                 str(item.get("title") or "")
                 for item in topic.get("related") or []

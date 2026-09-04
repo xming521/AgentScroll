@@ -289,7 +289,9 @@ def _inline_schema_refs(value: Any, definitions: Mapping[str, Any]) -> Any:
     }
 
 
-def card_response_schema(*, research: bool) -> dict[str, Any]:
+def card_response_schema(
+    *, research: bool, force_share: bool = False
+) -> dict[str, Any]:
     model = ResearchKnowledgeCardResponse if research else KnowledgeCardResponse
     schema = model.model_json_schema()
     definitions = schema.get("$defs") or {}
@@ -297,6 +299,15 @@ def card_response_schema(*, research: bool) -> dict[str, Any]:
     cards_schema = normalized["properties"]["cards"]
     cards_schema["minItems"] = 1
     cards_schema["maxItems"] = 1
+    if force_share:
+        card_properties = cards_schema["items"]["properties"]
+        card_properties["status"] = {"type": "string", "const": "complete"}
+        card_properties["general_share_score"] = {"type": "number", "const": 4}
+        card_properties["share"] = next(
+            option
+            for option in card_properties["share"]["anyOf"]
+            if option.get("type") == "object"
+        )
     return normalized
 
 
@@ -513,6 +524,8 @@ def _validate_draft(
         field="general_share_score",
         maximum=4,
     )
+    if bool(topic.get("force_share")) and status == "complete":
+        general_share_score = 4
     interest_share_score = _validated_score(
         draft.interest_share_score,
         topic_id=topic_id,

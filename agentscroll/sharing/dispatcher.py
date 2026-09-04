@@ -96,6 +96,7 @@ class ShareDispatcher:
         transports: Mapping[str, ShareTransport],
         database_path: str | Path | None = None,
         sharing_output_dir: str | Path | None = None,
+        force_share_title_count: int = 3,
         now: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -116,6 +117,9 @@ class ShareDispatcher:
             self._destinations[self._destination_id(destination)] = destination
 
         self.database_path = resolve_database_path(database_path)
+        if force_share_title_count < 1:
+            raise ValueError("force_share_title_count 必须是正整数")
+        self.force_share_title_count = force_share_title_count
         self.sharing_output_dir = (
             Path(sharing_output_dir).expanduser().resolve()
             if sharing_output_dir is not None
@@ -244,7 +248,7 @@ class ShareDispatcher:
         if generated.tzinfo is None:
             generated = generated.replace(tzinfo=self._now().tzinfo)
         expires_at = generated + self._window
-        normalized_shares: list[tuple[int, dict[str, Any]]] = []
+        normalized_shares: list[tuple[int, dict[str, Any], str]] = []
         try:
             for index, raw_share in enumerate(shares):
                 if not isinstance(raw_share, Mapping) or isinstance(
@@ -267,8 +271,21 @@ class ShareDispatcher:
                     raise ValueError
                 share["score"] = score
                 share["general_score"] = general_score
+                raw_hotlist_title_count = share.get("hotlist_title_count", 1)
+                if (
+                    isinstance(raw_hotlist_title_count, bool)
+                    or not isinstance(raw_hotlist_title_count, int)
+                    or raw_hotlist_title_count < 1
+                ):
+                    raise ValueError
+                if raw_hotlist_title_count >= self.force_share_title_count:
+                    share_trigger = "hotlist_title_count"
+                elif general_score == 4:
+                    share_trigger = "llm_major"
+                else:
+                    share_trigger = "normal"
                 render_share_messages(share)
-                normalized_shares.append((index, share))
+                normalized_shares.append((index, share, share_trigger))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("即时分享批次字段错误") from exc
         normalized_shares.sort(key=lambda item: (-item[1]["score"], item[0]))
@@ -335,7 +352,7 @@ class ShareDispatcher:
                         connection, destination_id, include_waiting=True
                     )
                     ordinary_count = 0
-                    for share_index, share in normalized_shares:
+                    for share_index, share, share_trigger in normalized_shares:
                         score = float(share["score"])
                         general_score = float(share["general_score"])
                         eligible = (
@@ -395,10 +412,11 @@ class ShareDispatcher:
                             """
                             INSERT INTO share_jobs(
                                 job_id, share_group_id, topic_id, destination_id,
-                                transport, target, share_index, score, due_at,
+                                transport, target, share_index, score,
+                                share_trigger, due_at,
                                 expires_at, bypass, status, reserved_at, finished_at,
                                 result_detail, payload_json, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
                             """,
                             (
                                 job_id,
@@ -409,6 +427,7 @@ class ShareDispatcher:
                                 destination.target,
                                 share_index,
                                 score,
+                                share_trigger,
                                 _isoformat(due_at),
                                 expires_text,
                                 int(bypass),

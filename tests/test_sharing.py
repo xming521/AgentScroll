@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +64,7 @@ def _share(
     index: int,
     *,
     general_score: float | None = None,
+    hotlist_title_count: int | None = None,
 ) -> dict[str, object]:
     share: dict[str, object] = {
         "topic_id": f"topic-{index}",
@@ -75,6 +77,8 @@ def _share(
     }
     if general_score is not None:
         share["general_score"] = general_score
+    if hotlist_title_count is not None:
+        share["hotlist_title_count"] = hotlist_title_count
     return share
 
 
@@ -85,6 +89,19 @@ def _jobs(database: Path) -> list[dict[str, object]]:
             dict(row)
             for row in connection.execute(
                 "SELECT * FROM share_jobs ORDER BY destination_id, share_group_id, share_index"
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def _shared_content(database: Path) -> list[dict[str, object]]:
+    connection = connect_database(database)
+    try:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM shared_content_review ORDER BY shared_at, job_id"
             )
         ]
     finally:
@@ -173,6 +190,81 @@ def test_batch_is_persisted_and_bounded_without_reading_review_files(
     ]
     immediate = next(job for job in jobs if job["bypass"])
     assert immediate["due_at"] == now[0].isoformat()
+
+
+def test_share_jobs_record_why_each_share_was_selected(tmp_path: Path) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    dispatcher, _scheduler, database, _transport = _dispatcher(tmp_path, now)
+
+    dispatcher.submit_shares(
+        "batch-1",
+        now[0],
+        [
+            _share(3.5, 0),
+            _share(4.0, 1),
+            _share(4.0, 2, hotlist_title_count=3),
+        ],
+    )
+
+    assert [job["share_trigger"] for job in _jobs(database)] == [
+        "normal",
+        "llm_major",
+        "hotlist_title_count",
+    ]
+
+
+def test_v1_database_migrates_share_trigger_column(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE share_jobs (
+            job_id TEXT PRIMARY KEY,
+            share_group_id TEXT,
+            topic_id TEXT,
+            destination_id TEXT,
+            transport TEXT,
+            target TEXT,
+            share_index INTEGER,
+            score REAL,
+            due_at TEXT,
+            expires_at TEXT,
+            bypass INTEGER,
+            status TEXT,
+            reserved_at TEXT,
+            finished_at TEXT,
+            result_detail TEXT,
+            payload_json TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.executemany(
+        "INSERT INTO share_jobs(job_id, payload_json) VALUES (?, ?)",
+        [
+            ("ordinary", '{"general_score":3.5}'),
+            ("major", '{"general_score":4}'),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = connect_database(database)
+    try:
+        rows = migrated.execute(
+            "SELECT job_id, share_trigger FROM share_jobs ORDER BY job_id"
+        ).fetchall()
+        version = migrated.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        migrated.close()
+
+    assert version == 2
+    assert [(row["job_id"], row["share_trigger"]) for row in rows] == [
+        ("major", "llm_major"),
+        ("ordinary", "normal"),
+    ]
 
 
 def test_score_only_sends_every_share_at_or_above_threshold_without_time_limits(
@@ -424,6 +516,7 @@ def test_dispatcher_sends_frozen_payload_and_records_quota(tmp_path: Path) -> No
     dispatcher, _scheduler, database, transport = _dispatcher(tmp_path, now)
     dispatcher.submit_shares("batch-1", now[0], [_share(3.9, 0)])
     job = _jobs(database)[0]
+    assert _shared_content(database) == []
 
     dispatcher._execute_job(str(job["job_id"]))
 
@@ -434,6 +527,28 @@ def test_dispatcher_sends_frozen_payload_and_records_quota(tmp_path: Path) -> No
         ("room-one", "message-0\nhttps://example.com/0"),
         ("room-one", "comment-0"),
     ]
+    review = _shared_content(database)
+    assert len(review) == 1
+    assert review[0] == {
+        "shared_at": now[0].isoformat(timespec="seconds"),
+        "title": "title-0",
+        "label": None,
+        "share_score": 3.9,
+        "general_share_score": 3.9,
+        "interest_share_score": None,
+        "share_text": "message-0",
+        "source_url": "https://example.com/0",
+        "comment": "comment-0",
+        "comment_type": "platform",
+        "source_id": None,
+        "comment_id": None,
+        "transport": "fake",
+        "target": "room-one",
+        "destination_id": sent["destination_id"],
+        "topic_id": "topic-0",
+        "share_group_id": "batch-1",
+        "job_id": sent["job_id"],
+    }
 
 
 def test_restart_marks_inflight_as_unknown_without_resending(tmp_path: Path) -> None:

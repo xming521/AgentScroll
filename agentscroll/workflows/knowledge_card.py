@@ -33,7 +33,7 @@ from .knowledge_card_models import (
 
 _RESEARCH_SOURCES = {
     "news": ("weibo", "wechat", "toutiao"),
-    "fun": ("weibo", "xiaohongshu"),
+    "fun": ("weibo",),
 }
 _RESEARCH_ITEM_LIMIT = 3
 _COMMENT_REPLY_PREFIX_RE = re.compile(r"^回复\s*@[^:：]+[:：]\s*")
@@ -258,6 +258,15 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(
                 f"话题 {topic_id} 的 candidate_interest_keywords 包含重复值"
             )
+        hotlist_title_count = raw_topic.get("hotlist_title_count", 1)
+        if (
+            isinstance(hotlist_title_count, bool)
+            or not isinstance(hotlist_title_count, int)
+            or hotlist_title_count < 1
+        ):
+            raise ValueError(
+                f"话题 {topic_id} 的 hotlist_title_count 必须是正整数"
+            )
 
         compact_evidence: list[dict[str, Any]] = []
         for evidence_index, raw_item in enumerate(
@@ -308,6 +317,7 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
                 for title in raw_topic.get("timeline") or []
                 if str(title).strip()
             ],
+            "hotlist_title_count": hotlist_title_count,
             "evidence": compact_evidence,
         }
         if candidate_interest_keywords:
@@ -438,6 +448,9 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
         "title": str(topic.get("title") or ""),
         "label": str(topic.get("label") or ""),
         "relation": str(topic.get("event_relation") or "new"),
+        "hotlist": {
+            "force_share": bool(topic.get("force_share")),
+        },
         "evidence": compact_items(topic.get("evidence")),
     }
     candidate_keywords = list(topic.get("candidate_interest_keywords") or [])
@@ -519,6 +532,10 @@ def _validated_interest_topics(
 ) -> list[dict[str, Any]]:
     interest = getattr(settings, "interest", None)
     configured_keywords = tuple(getattr(interest, "keywords", ()) or ())
+    hotlist = getattr(settings, "hotlist", None)
+    force_share_title_count = int(
+        getattr(hotlist, "force_share_title_count", 3)
+    )
     allowed = set(configured_keywords)
     validated: list[dict[str, Any]] = []
     for raw_topic in topics:
@@ -536,6 +553,18 @@ def _validated_interest_topics(
             topic["candidate_interest_keywords"] = candidate_keywords
         else:
             topic.pop("candidate_interest_keywords", None)
+        sources = [
+            *list(topic.get("evidence") or []),
+            *list(topic.get("research_evidence") or []),
+        ]
+        topic["force_share"] = (
+            int(topic.get("hotlist_title_count") or 1)
+            >= force_share_title_count
+            and any(
+                isinstance(source, Mapping) and _http_url(source.get("url"))
+                for source in sources
+            )
+        )
         validated.append(topic)
     return validated
 
@@ -589,7 +618,10 @@ def _generate_topic_cards(
         make_configured_request(
             prompt,
             settings,
-            json_schema=card_response_schema(research=research),
+            json_schema=card_response_schema(
+                research=research,
+                force_share=bool(topic.get("force_share")),
+            ),
             max_tokens=max_tokens,
             timeout=timeout,
             effort=effort,
@@ -1237,6 +1269,7 @@ def supplement_hotlist_knowledge_cards(
                 "matched_event_id": topic["matched_event_id"],
                 "previous_card": topic["previous_card"],
                 "timeline": topic["timeline"],
+                "hotlist_title_count": topic["hotlist_title_count"],
                 "evidence": topic["evidence"],
             }
         )

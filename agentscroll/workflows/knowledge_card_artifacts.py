@@ -83,6 +83,7 @@ def _share_documents(
             "score": card.share_score,
             "general_score": card.general_share_score,
             "interest_score": card.interest_share_score,
+            "hotlist_title_count": int(topic.get("hotlist_title_count") or 1),
             "text": share.text,
             "url": share.url,
             "comment": share.comment,
@@ -200,6 +201,7 @@ def save_card_batch(
             "share_score": card.share_score,
             "general_share_score": card.general_share_score,
             "interest_share_score": card.interest_share_score,
+            "hotlist_title_count": int(topic.get("hotlist_title_count") or 1),
             "share": (
                 card.share.model_dump(mode="json") if card.share is not None else None
             ),

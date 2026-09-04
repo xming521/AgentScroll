@@ -40,6 +40,11 @@
     "keywords": []
   },
 
+  "hotlist": {
+    // 本轮同一事件达到这个热榜标题数时，强制按 4 分进入即时分享。
+    "force_share_title_count": 3
+  },
+
   "sharing": {
     // 只在 hotlist run --scheduled 的常驻进程中自动分享。
     "enabled": false,

@@ -252,6 +252,7 @@ def test_save_cards_preserves_batch_and_share_contract(tmp_path: Path) -> None:
             "score": 3.0,
             "general_score": 3.0,
             "interest_score": 0,
+            "hotlist_title_count": 1,
             "text": "分享正文",
             "url": "https://example.com/post/1",
             "comment": "真实评论",
@@ -305,7 +306,12 @@ def test_public_generation_keeps_dict_contract(
             nonlocal client_closed
             client_closed = True
 
-    settings = SimpleNamespace(provider="fake", model="fake-model", max_workers=2)
+    settings = SimpleNamespace(
+        provider="fake",
+        model="fake-model",
+        max_workers=2,
+        hotlist=SimpleNamespace(force_share_title_count=3),
+    )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
     monkeypatch.setattr(config, "make_configured_request", make_request)
     monkeypatch.setattr(
@@ -314,8 +320,10 @@ def test_public_generation_keeps_dict_contract(
         lambda _settings: FakeClient(),
     )
 
+    topic = _topic()
+    topic["hotlist_title_count"] = 3
     result = generate_hotlist_knowledge_cards(
-        {"topics": [_topic()], "max_entries_per_topic": 1},
+        {"topics": [topic], "max_entries_per_topic": 1},
         output_dir=tmp_path / "knowledge",
         share_output_dir=tmp_path / "shares",
     )
@@ -325,7 +333,15 @@ def test_public_generation_keeps_dict_contract(
     assert "$defs" not in requests[0].json_schema
     assert requests[0].json_schema["properties"]["cards"]["maxItems"] == 1
     card_schema = requests[0].json_schema["properties"]["cards"]["items"]
-    assert "general_share_score" in card_schema["properties"]
+    assert card_schema["properties"]["status"] == {
+        "type": "string",
+        "const": "complete",
+    }
+    assert card_schema["properties"]["general_share_score"] == {
+        "type": "number",
+        "const": 4,
+    }
+    assert card_schema["properties"]["share"]["type"] == "object"
     assert "interest_share_score" in card_schema["properties"]
     assert "matched_interest_keywords" not in card_schema["properties"]
     assert "share_score" not in card_schema["properties"]
@@ -334,11 +350,99 @@ def test_public_generation_keeps_dict_contract(
     assert "interest.candidate_keywords" in requests[0].prompt
     prompt_payload = json.loads(requests[0].prompt.rsplit("\n", 1)[-1])
     assert "interest" not in prompt_payload
+    assert prompt_payload["hotlist"] == {"force_share": True}
     assert result["topic_count"] == result["complete_count"] == 1
     assert isinstance(result["cards"][0], dict)
     assert result["cards"][0]["topic_id"] == 1
+    assert result["cards"][0]["general_share_score"] == 4
+    assert result["cards"][0]["share_score"] == 4
     assert Path(result["batch_json_file"]).is_file()
     assert Path(result["share_review_file"]).is_file()
+
+
+def test_current_hotlist_related_ids_set_title_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentscroll.collector import hotlist as collector
+
+    hotlist = {
+        "collected_at": "2026-09-03T12:00:00+08:00",
+        "sources": {
+            "weibo": {
+                "items": [
+                    {"title": "同一事件标题一"},
+                    {"title": "同一事件标题二"},
+                    {"title": "同一事件标题三"},
+                ]
+            }
+        },
+    }
+    selection = {
+        "topics": [
+            {
+                "representative_id": 1,
+                "related_ids": [2, 3],
+                "label": "news",
+                "event_relation": "new",
+            }
+        ]
+    }
+
+    def collect_details(entries: list[tuple[str, object]], **_kwargs: object):
+        return (
+            [
+                {
+                    "status": "readable",
+                    "posts": [
+                        {
+                            "title": item["title"],
+                            "published_at": "2026-09-03",
+                            "url": f"https://example.com/{index}",
+                            "content": "同一事件正文",
+                            "comments": [],
+                        }
+                    ],
+                    "error": "",
+                }
+                for index, (_source, item) in enumerate(entries, start=1)
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(collector, "_collect_hotlist_details", collect_details)
+
+    evidence = collector.collect_selected_hotlist_evidence(hotlist, selection)
+
+    assert evidence["topics"][0]["hotlist_title_count"] == 3
+
+
+def test_force_share_respects_configured_hotlist_title_count() -> None:
+    from agentscroll.workflows.knowledge_card import (
+        _prompt_payload,
+        _validated_interest_topics,
+    )
+
+    raw_topic = _topic()
+    raw_topic["hotlist_title_count"] = 3
+    topic = _prompt_payload({"topics": [raw_topic]})[0]
+
+    below_threshold = _validated_interest_topics(
+        [topic],
+        SimpleNamespace(
+            hotlist=SimpleNamespace(force_share_title_count=4),
+            interest=SimpleNamespace(keywords=()),
+        ),
+    )
+    at_threshold = _validated_interest_topics(
+        [topic],
+        SimpleNamespace(
+            hotlist=SimpleNamespace(force_share_title_count=3),
+            interest=SimpleNamespace(keywords=()),
+        ),
+    )
+
+    assert below_threshold[0]["force_share"] is False
+    assert at_threshold[0]["force_share"] is True
 
 
 def test_selected_save_records_state_and_rewrites_share_topic_id(

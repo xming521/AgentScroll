@@ -75,6 +75,7 @@ NEWSNOW_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 _write_lock = threading.Lock()
+_NEWSNOW_REQUEST_ATTEMPTS = 3
 
 
 def list_newsnow_groups() -> dict[str, tuple[str, ...]]:
@@ -315,7 +316,11 @@ def fetch_newsnow_hotlists(
             "error": None,
         }
         try:
-            payload = get(url, timeout=timeout, retries=1)
+            payload = get(
+                url,
+                timeout=timeout,
+                retries=_NEWSNOW_REQUEST_ATTEMPTS,
+            )
             if not isinstance(payload, Mapping):
                 raise ValueError("NewsNow 返回值不是 JSON object")
             upstream_status = str(payload.get("status") or "").strip()
