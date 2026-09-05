@@ -58,6 +58,7 @@
         "immediate_interval_seconds": 3
       },
       "window": {
+        "min_score": 3.0,
         // 每个目标分别限制普通分享。
         "window_minutes": 60,
         "max_messages_per_window": 2

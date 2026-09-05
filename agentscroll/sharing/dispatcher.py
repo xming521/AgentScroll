@@ -355,9 +355,12 @@ class ShareDispatcher:
                     for share_index, share, share_trigger in normalized_shares:
                         score = float(share["score"])
                         general_score = float(share["general_score"])
-                        eligible = (
-                            not score_only or score >= policy.score_only.min_score
+                        min_score = (
+                            policy.score_only.min_score
+                            if score_only
+                            else policy.window.min_score
                         )
+                        eligible = score >= min_score
                         immediate_score = policy.delivery.immediate_score
                         immediate = (
                             eligible
@@ -640,11 +643,12 @@ class ShareDispatcher:
                         {"destination_id": row["destination_id"], "job_id": job_id},
                     )
                 else:
-                    if (
-                        policy.mode == "score_only"
-                        and float(row["score"])
-                        < policy.score_only.min_score
-                    ):
+                    min_score = (
+                        policy.score_only.min_score
+                        if policy.mode == "score_only"
+                        else policy.window.min_score
+                    )
+                    if float(row["score"]) < min_score:
                         connection.execute(
                             """
                             UPDATE share_jobs

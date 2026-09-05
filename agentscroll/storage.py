@@ -79,6 +79,7 @@ SELECT
     json_extract(jobs.payload_json, '$.title') AS title,
     json_extract(jobs.payload_json, '$.label') AS label,
     jobs.score AS share_score,
+    jobs.share_trigger,
     json_extract(jobs.payload_json, '$.general_score') AS general_share_score,
     json_extract(jobs.payload_json, '$.interest_score') AS interest_share_score,
     json_extract(jobs.payload_json, '$.text') AS share_text,
@@ -138,6 +139,12 @@ def connect_database(path: str | Path | None = None) -> sqlite3.Connection:
             WHERE CAST(json_extract(payload_json, '$.general_score') AS REAL) = 4
             """
         )
+    review_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(shared_content_review)")
+    }
+    if review_columns and "share_trigger" not in review_columns:
+        connection.execute("DROP VIEW shared_content_review")
     connection.executescript(_SCHEMA)
     if version < SCHEMA_VERSION:
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

@@ -212,6 +212,23 @@ def test_share_jobs_record_why_each_share_was_selected(tmp_path: Path) -> None:
         "hotlist_title_count",
     ]
 
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        DROP VIEW shared_content_review;
+        CREATE VIEW shared_content_review AS
+            SELECT job_id FROM share_jobs WHERE status = 'sent';
+        UPDATE share_jobs SET status = 'sent';
+        """
+    )
+    connection.close()
+
+    review = {row["job_id"]: row for row in _shared_content(database)}
+    assert {
+        job["share_index"]: review[job["job_id"]]["share_trigger"]
+        for job in _jobs(database)
+    } == {0: "normal", 1: "llm_major", 2: "hotlist_title_count"}
+
 
 def test_v1_database_migrates_share_trigger_column(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
@@ -265,6 +282,46 @@ def test_v1_database_migrates_share_trigger_column(tmp_path: Path) -> None:
         ("major", "llm_major"),
         ("ordinary", "normal"),
     ]
+
+
+def test_window_filters_by_final_score_before_scheduling(tmp_path: Path) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    policy = SharePolicySettings(
+        window=WindowSharePolicySettings(min_score=3.3),
+        score_only=ScoreOnlySharePolicySettings(min_score=4.0),
+    )
+    dispatcher, _scheduler, database, _transport = _dispatcher(
+        tmp_path, now, policy=policy
+    )
+
+    result = dispatcher.submit_shares(
+        "batch-1", now[0],
+        [_share(3.2, 0), _share(3.3, 1, general_score=3.0), _share(4.0, 2)],
+    )
+
+    assert result["dropped"] == 1
+    assert result["normal_scheduled"] == 1
+    assert result["bypass_scheduled"] == 1
+    jobs = _jobs(database)
+    assert jobs[0]["result_detail"] == "score_below_threshold"
+    assert jobs[1]["status"] == "waiting"
+    assert jobs[1]["due_at"] == now[0].isoformat()
+    assert jobs[2]["bypass"] == 1
+
+
+def test_window_rechecks_minimum_score_before_send(tmp_path: Path) -> None:
+    now = [datetime(2026, 8, 31, 4, 0, tzinfo=timezone.utc)]
+    dispatcher, _scheduler, database, transport = _dispatcher(tmp_path, now)
+    dispatcher.submit_shares("batch-1", now[0], [_share(3.2, 0)])
+    job = _jobs(database)[0]
+    assert job["status"] == "waiting"
+
+    dispatcher.settings.policy.window.min_score = 3.3
+    dispatcher._execute_job(str(job["job_id"]))
+
+    assert _jobs(database)[0]["status"] == "dropped"
+    assert _jobs(database)[0]["result_detail"] == "score_below_threshold"
+    assert transport.messages == []
 
 
 def test_score_only_sends_every_share_at_or_above_threshold_without_time_limits(
@@ -534,6 +591,7 @@ def test_dispatcher_sends_frozen_payload_and_records_quota(tmp_path: Path) -> No
         "title": "title-0",
         "label": None,
         "share_score": 3.9,
+        "share_trigger": "normal",
         "general_share_score": 3.9,
         "interest_share_score": None,
         "share_text": "message-0",

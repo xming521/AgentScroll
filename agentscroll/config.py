@@ -114,6 +114,7 @@ class HotlistSettings(BaseModel):
 class WindowSharePolicySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    min_score: float = Field(default=3.0, ge=3, le=4)
     window_minutes: int = Field(default=60, gt=0)
     max_messages_per_window: int = Field(default=2, gt=0)
 

@@ -320,6 +320,7 @@ def hotlist_run(
             )
         else:
             policy_summary = (
+                f"仅发送评分不低于 {policy.window.min_score:g} 的消息，"
                 f"普通消息每 {policy.window.window_minutes} 分钟最多 "
                 f"{policy.window.max_messages_per_window} 条"
             )
