@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from agentscroll.sharing.policy import HOTLIST_SCORES, decide_share
+
 CardStatus = Literal["complete", "needs_research", "rejected"]
 CARD_STATUSES = ("complete", "needs_research", "rejected")
 
@@ -29,6 +31,7 @@ _LABEL_ALIASES = {
 REMOVED_LABELS = frozenset({"conversation", "discussion"})
 _SHARE_LABELS = frozenset({"news", "fun"})
 _SHARE_SCORE_THRESHOLD = 3
+RESEARCH_ITEM_LIMIT = 3
 
 
 def _limited_text(max_length: int) -> Any:
@@ -132,7 +135,7 @@ class ResearchKnowledgeCardDraft(KnowledgeCardDraft):
         WithJsonSchema(
             {
                 "type": "array",
-                "maxItems": 3,
+                "maxItems": RESEARCH_ITEM_LIMIT,
                 "items": {"type": "string", "maxLength": 20},
             }
         ),
@@ -190,10 +193,19 @@ class KnowledgeCard(BaseModel):
     share_score: int | float
     general_share_score: int | float
     interest_share_score: int | float = 0
+    hotlist_share_score: int | float = 0
+    share_rules: tuple[str, ...] = ()
     candidate_interest_keywords: tuple[str, ...] = ()
     share: KnowledgeShare | None
     topic_id: int
     research_sources: tuple[ResearchSource, ...] | None = None
+
+    @field_validator("hotlist_share_score")
+    @classmethod
+    def validate_hotlist_share_score(cls, value: int | float) -> int | float:
+        if value not in HOTLIST_SCORES:
+            raise ValueError("hotlist_share_score 必须为 0、3、3.5 或 4")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -208,9 +220,11 @@ class KnowledgeCard(BaseModel):
 
     @model_validator(mode="after")
     def validate_final_share_score(self) -> KnowledgeCard:
-        expected = max(self.general_share_score, self.interest_share_score)
+        expected = max(
+            self.general_share_score, self.interest_share_score, self.hotlist_share_score
+        )
         if self.share_score != expected:
-            raise ValueError("share_score 必须等于大众分与兴趣分的较高值")
+            raise ValueError("share_score 必须等于大众分、兴趣分与热度保底分的最高值")
         return self
 
     @classmethod
@@ -289,9 +303,7 @@ def _inline_schema_refs(value: Any, definitions: Mapping[str, Any]) -> Any:
     }
 
 
-def card_response_schema(
-    *, research: bool, force_share: bool = False
-) -> dict[str, Any]:
+def card_response_schema(*, research: bool) -> dict[str, Any]:
     model = ResearchKnowledgeCardResponse if research else KnowledgeCardResponse
     schema = model.model_json_schema()
     definitions = schema.get("$defs") or {}
@@ -299,15 +311,6 @@ def card_response_schema(
     cards_schema = normalized["properties"]["cards"]
     cards_schema["minItems"] = 1
     cards_schema["maxItems"] = 1
-    if force_share:
-        card_properties = cards_schema["items"]["properties"]
-        card_properties["status"] = {"type": "string", "const": "complete"}
-        card_properties["general_share_score"] = {"type": "number", "const": 4}
-        card_properties["share"] = next(
-            option
-            for option in card_properties["share"]["anyOf"]
-            if option.get("type") == "object"
-        )
     return normalized
 
 
@@ -346,7 +349,8 @@ def _validate_share(
             f"话题 {topic_id} 的 share_score 必须为 0 或 1 至 4 "
             "且最多保留一位小数"
         )
-    ready = score >= _SHARE_SCORE_THRESHOLD
+    min_score = topic.get("share_min_score", _SHARE_SCORE_THRESHOLD)
+    ready = score >= min_score
 
     sources = [
         *list(topic.get("evidence") or []),
@@ -367,7 +371,7 @@ def _validate_share(
         if raw_share is not None:
             raise ValueError(
                 f"话题 {topic_id} 的 share_score 低于 "
-                f"{_SHARE_SCORE_THRESHOLD} 时 share 必须为 null"
+                f"{min_score} 时 share 必须为 null"
             )
         return None
 
@@ -524,8 +528,6 @@ def _validate_draft(
         field="general_share_score",
         maximum=4,
     )
-    if bool(topic.get("force_share")) and status == "complete":
-        general_share_score = 4
     interest_share_score = _validated_score(
         draft.interest_share_score,
         topic_id=topic_id,
@@ -539,7 +541,31 @@ def _validate_draft(
         raise ValueError(
             f"话题 {topic_id} 的 interest_share_score 大于 0 时必须有候选兴趣关键词"
         )
-    share_score = max(general_share_score, interest_share_score)
+    sources = [
+        *list(topic.get("evidence") or []),
+        *list(topic.get("research_evidence") or []),
+    ]
+    has_source = any(
+        isinstance(source, Mapping)
+        and source.get("source_id")
+        and http_url(source.get("url"))
+        for source in sources
+    )
+    if status != "complete" or not has_source:
+        if general_share_score or interest_share_score:
+            raise ValueError(
+                f"话题 {topic_id} 未完成或没有来源，"
+                "评分必须为 0"
+            )
+    decision = decide_share(
+        status=status,
+        relation=relation,
+        has_source=bool(has_source),
+        hotlist_floor_score=topic.get("hotlist_floor_score", 0),
+        general_score=general_share_score,
+        interest_score=interest_share_score,
+    )
+    share_score = decision.score
     if status == "complete":
         if not draft.knowledge or not draft.chat_context or draft.rejection_reason:
             raise ValueError(f"完整知识卡 {topic_id} 的字段状态不一致")
@@ -563,8 +589,15 @@ def _validate_draft(
     ):
         raise ValueError(f"已淘汰知识卡 {topic_id} 的字段状态不一致")
 
+    share_draft = draft.share
+    if (
+        topic.get("hotlist_floor_score")
+        and status == "complete"
+        and share_score < topic.get("share_min_score", _SHARE_SCORE_THRESHOLD)
+    ):
+        share_draft = None
     share = _validate_share(
-        draft.share,
+        share_draft,
         score=share_score,
         status=status,
         topic=topic,
@@ -610,6 +643,8 @@ def _validate_draft(
         share_score=share_score,
         general_share_score=general_share_score,
         interest_share_score=interest_share_score,
+        hotlist_share_score=decision.hotlist_score,
+        share_rules=decision.rules,
         candidate_interest_keywords=candidate_interest_keywords,
         share=share,
         topic_id=topic_id,

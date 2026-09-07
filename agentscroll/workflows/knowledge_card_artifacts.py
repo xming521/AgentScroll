@@ -27,6 +27,7 @@ def _render_card_text(card: Mapping[str, Any]) -> str:
         f"分享评分: {card.get('share_score', 0)}/4",
         f"大众分享评分: {card.get('general_share_score', 0)}/4",
         f"兴趣分享评分: {card.get('interest_share_score', 0)}/3.9",
+        f"热度保底分: {card.get('hotlist_share_score', 0)}/4",
     ]
     if card.get("candidate_interest_keywords"):
         lines.append(
@@ -83,6 +84,9 @@ def _share_documents(
             "score": card.share_score,
             "general_score": card.general_share_score,
             "interest_score": card.interest_share_score,
+            "hotlist_score": card.hotlist_share_score,
+            "share_rules": list(card.share_rules),
+            "relation": str(topic.get("event_relation") or "new"),
             "hotlist_title_count": int(topic.get("hotlist_title_count") or 1),
             "text": share.text,
             "url": share.url,
@@ -201,6 +205,9 @@ def save_card_batch(
             "share_score": card.share_score,
             "general_share_score": card.general_share_score,
             "interest_share_score": card.interest_share_score,
+            "hotlist_share_score": card.hotlist_share_score,
+            "share_rules": list(card.share_rules),
+            "relation": str(topic.get("event_relation") or "new"),
             "hotlist_title_count": int(topic.get("hotlist_title_count") or 1),
             "share": (
                 card.share.model_dump(mode="json") if card.share is not None else None

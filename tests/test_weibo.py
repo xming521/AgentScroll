@@ -272,6 +272,31 @@ def test_hotflow_comments_keep_likes_and_reply_counts(monkeypatch) -> None:
     }
 
 
+def test_comments_exclude_specified_user_before_normalization(monkeypatch) -> None:
+    async def fake_hotflow_comments(_crawler, _feed_id, *, limit):
+        return [
+            {"id": 1, "text": "排除整数 ID", "user": {"id": 5606716867}},
+            {"id": 2, "text": "排除字符串 ID", "user": {"id": "5606716867"}},
+            {
+                "id": 3,
+                "text": "保留其他用户",
+                "user": {"id": 123, "screen_name": "吃瓜罗伯特"},
+            },
+            {"id": 4, "text": "保留没有作者字段的评论"},
+        ]
+
+    monkeypatch.setattr(weibo, "_get_hotflow_comments", fake_hotflow_comments)
+    monkeypatch.setattr(weibo.throttle, "wait_for_detail_request", lambda _: None)
+    item = {"platform_id": "123", "engagement": {"comments": 4}}
+
+    asyncio.run(weibo._enrich_post_comments([item], crawler=object()))
+
+    assert [comment["text"] for comment in item["comments"]] == [
+        "保留其他用户",
+        "保留没有作者字段的评论",
+    ]
+
+
 def test_hotflow_comments_keep_first_batch_when_next_cursor_redirects() -> None:
     requested_max_ids: list[str | None] = []
 

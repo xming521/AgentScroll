@@ -35,7 +35,7 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 缺失或使用空数组时不启用兴趣偏好。程序会去除首尾空白，并按 Unicode 兼容字符、大小写和连续空白规范化去重；用户原始写法保留在模型输入和 review 产物中。模型根据标题判断与兴趣关键词的直接语义相关性，不需要另配 ID、描述或权重。修改配置只影响后续未命中标题缓存的条目，近 7 天内已经分析过的相同标题不会自动重筛。
 
-`hotlist.force_share_title_count` 配置本轮同一事件达到多少个热榜标题时强制分享，默认是 `3`。数量只包含当前热榜快照中第一轮合并的代表标题与 `related_ids` 标题，不包含本地历史召回、已有事件时间线或后续主动搜索结果；达到门槛且存在可用分享来源时，大众分享评分固定为 4 分。
+`hotlist.force_share_title_count` 同时配置第一轮热度入选和后续新事件热度保底最高档（4 分）的标题数门槛，默认是 `3`，必须为正整数。第一轮通过提示词占位符填入该值，不增加 JSON 输入字段；热度入选仍遵守话题容量和 seen 去重。较低档分数、计数范围与适用条件见[热度保底与最终分](design.md#热度保底与最终分)。
 
 `storage.database_path` 指定跨轮次状态数据库，默认是 `outputs/agentscroll.sqlite3`。数据库只包含三张业务表：
 
@@ -46,6 +46,18 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 数据库还提供 `shared_content_review` 视图，只列出最终状态为 `sent` 的真实投递，并将当时冻结的标题、正文、链接、评论、评分、分享触发原因 `share_trigger` 和目标展开为独立列，方便直接 review。一次内容发往多个目标时，每个成功目标各占一行。
 
 筛选、采集、知识卡和分享批次文件继续作为 review 产物保存，推理与分享审计继续写 JSONL；这些文件不作为生产状态读取。新版本不会导入、回读或双写旧的热榜历史 JSON 和分享 `state.json`。
+
+### 运行产物
+
+| 路径 | 内容 |
+| --- | --- |
+| `outputs/agentscroll.sqlite3` | 热点、标题缓存和分享任务状态 |
+| `outputs/hotlists/` | 热榜 JSON 快照和标题 TXT |
+| `outputs/knowledge/` | 搜索知识文件和热点知识卡 |
+| `outputs/shares/` | 即时分享 review 产物 |
+| `outputs/sharing/` | 分享调度与发送审计 |
+| `outputs/logs/` | 运行与推理日志 |
+| `outputs/test_artifacts/` | 测试与固定材料重评产物 |
 
 ### 运行日志
 
@@ -312,12 +324,24 @@ export AGENTSCROLL_ASTRBOT_API_KEY='your-astrbot-api-key'
 }
 ```
 
-每个 `sharing.destinations` 项选择一个 transport，并独立计算限额；`target` 的格式由对应 transport 校验。`policy.mode` 支持以下策略：
+每个 `sharing.destinations` 项选择一个 transport，`target` 格式由对应 transport 校验。`policy.mode` 为 `window` 或 `score_only`，只使用选中策略的子配置；普通限流、即时豁免、批次替换和恢复规则统一见[发送策略与队列](design.md#发送策略与队列)及[消息交付与恢复](design.md#消息交付与恢复)。
 
-- `window`：参数位于 `policy.window`。只发送评分不低于 `min_score` 的消息，支持 3 至 4 分，默认 3.0；低于门槛的消息直接丢弃，不占窗口额度。普通消息每个目标在滚动 `window_minutes` 内最多发送 `max_messages_per_window` 条；一个批次只保留评分最高的指定条数，其余不排队。
-- `score_only`：参数位于 `policy.score_only`。只发送评分不低于 `min_score` 的消息，不计算窗口额度；低于门槛的消息直接丢弃。`min_score` 支持 3 至 4 分。
+| 配置项（相对 `sharing.policy`） | 默认值 | 含义与合法范围 |
+| --- | --- | --- |
+| `mode` | `window` | 选择 `window` 或 `score_only` |
+| `window.min_score` | `3.0` | 窗口策略的最低最终分，范围 3 至 4 |
+| `window.window_minutes` | `60` | 滚动窗口与该策略的批次有效期，正整数分钟 |
+| `window.max_messages_per_window` | `2` | 每目标普通分享的窗口上限及每批候选上限，正整数 |
+| `score_only.min_score` | `4.0` | 分数策略的最低最终分，范围 3 至 4 |
+| `delivery.min_interval_minutes` | `10` | 普通分享的最小间隔，非负整数分钟 |
+| `delivery.immediate_score` | `4.0` | 即时待遇阈值，范围 3 至 4；`null` 关闭即时待遇 |
+| `delivery.immediate_interval_seconds` | `3` | 相邻两组含即时分享时的最小间隔，非负整数秒；`0` 关闭此间隔 |
 
-`policy.delivery` 控制两种策略共用的发送节奏。分享资格、排序和当前策略的 `min_score` 使用最终 `share_score`；`immediate_score` 只与 `general_share_score` 比较，兴趣评分不能取得即时豁免。未达到 `immediate_score` 的合格分享按目标遵守 `min_interval_minutes`；达到 `immediate_score` 的合格分享不等待该普通间隔，不占窗口额度，也不会让后续普通分享重新等待。同一目标的正文和评论会整组串行发送；两个相邻分享中至少一个为即时分享时，两组之间至少间隔 `immediate_interval_seconds`，避免同时到期的即时分享或普通分享把评论插到其他正文后面。`immediate_score` 设为 `null` 可关闭即时豁免，`immediate_interval_seconds` 设为 `0` 可关闭秒级间隔。只有 `mode` 选中的策略子配置参与资格和窗口额度判断。新批次会替换上一批尚未发送的普通分享，不形成跨批次积压；某个已选分享发送失败时也不会再用低分条目补位。
+`delivery.immediate_score` 非 `null` 时不得低于当前 `mode` 对应的最低分，否则配置加载报错。分数门槛和即时待遇使用哪些分数见[热度保底与最终分](design.md#热度保底与最终分)。
+
+分享 review JSON 使用 `general_score`、`interest_score`、`hotlist_score` 分别保存大众分、兴趣分与热度保底分，`score` 为最终分。`share_rules` 是达到分享候选门槛的规则数组：`general_score` 表示大众分达到 3，`interest_score` 表示兴趣分达到 3，`hotlist_title_count` 表示热度保底实际生效；可以同时包含多个值。知识卡中对应字段为 `general_share_score`、`interest_share_score`、`hotlist_share_score`、`share_score`、`share_rules`。
+
+发送任务的 `payload_json` 另外保存 `delivery_mode`（`normal` 或 `immediate`）和 `delivery_reasons`；后者仅记录触发即时待遇的 `general_score`、`hotlist_title_count`，普通待遇为空数组。`shared_content_review` 同时展开热度保底分、规则数组和发送待遇；旧任务缺失的字段显示为 `NULL`。既有 `share_trigger` 单值列继续保留兼容显示：热度保底生效显示 `hotlist_title_count`，否则大众分为 4 显示 `llm_major`，其余显示 `normal`；完整重叠原因以 `share_rules` 为准。
 
 只按分数发送时，策略可简写为：
 
@@ -380,21 +404,21 @@ docker compose down
   --share-output-dir outputs/shares
 ```
 
-两个命令都会做话题级粗筛，再采集正文以及支持平台的评论、生成知识卡，并只对证据不足的话题补搜。模型选出的代表标题保持不变，正文采集独立优先使用同话题的非知乎入口；只有整组标题都来自知乎时，才批量生成检索词并只到微博补采。最后的主动搜索复用 `agentscroll search` 的采集入口：`news` 搜微博、微信公众号和今日头条，`fun` 只搜微博，每个话题最多保留 3 条实际读到正文的内容。小红书当前不参与自动补搜。第一轮证据只接受热榜快照日期及其之前连续 7 个自然日内、发布时间可确认的非知乎帖子；主动搜索沿用同一查询日期范围，并过滤已知日期超出范围的内容。
+两个命令都执行热榜学习，并保存筛选、知识卡和分享 review 产物。采集入口、日期过滤、有限补搜和最终分享判断见[热榜学习](design.md#热榜学习)与[即时分享](design.md#即时分享)。
 
 常用参数与产物：
 
 - 第一轮最多选择 15 个话题。
-- `hotlist_title_cache` 保存第一轮成功判断过的全部标题。后续筛选先按 Unicode 兼容字符、大小写和连续空白规范化后跳过完全相同的标题，再在本地为每个新标题召回最多 3 个相似热点；没有新标题时不调用筛选模型。缓存窗口为快照日期及其之前连续 7 个自然日。
-- `hotlist_topics` 的每一行同时表示热点稳定身份和当前有效知识；本轮标题、最终分享文案、实际使用的来源标题和成功更新链保存在 `payload_json`。最终分享文案与来源标题只作为后续本地召回别名，不进入成功更新时间线。旧热点可以长期保留，但只有窗口内标题参与匹配。
-- 第一轮模型在原有一次请求中同时返回 `new`、`update` 和 `seen`。`seen` 不再采集；`new` 创建热点，`update` 读取同一行中的当前知识，并把 7 天窗口内成功更新的代表标题和同话题标题按更新时间从旧到新放入 `timeline`，供知识卡模型判断是否确有新进展。每个当前标题最多召回 3 个热点，不限制所有召回标题的合计字符数，也不生成摘要或 signature。
+- `hotlist_title_cache` 保存规范化标题、原始标题和最后出现时间；缓存处理见[拉取与去重](design.md#拉取与去重)。
+- `hotlist_topics` 保存热点身份和当前知识；`payload_json.titles` 保存历史标题及召回别名，`payload_json.updates` 保存成功更新。状态写入规则见[运行产物](design.md#运行产物)。
+- 第一轮关系为 `new`、`update` 或 `seen`；含义与历史上下文范围见[历史召回与事件关系](design.md#历史召回与事件关系)。
 - 主轮和补搜轮默认 `effort="xhigh"`，可分别通过 `--generation-effort` 和 `--supplement-effort` 调整，不修改全局配置。
 - `--no-supplement` 关闭自动补搜。
 - `--share-output-dir` 可以单独指定分享 review 产物目录。
 - 一次运行先保存一份标题筛选 JSON，再保存包含本轮全部新建和更新结果的知识卡 JSON/TXT，以及最终分享 review JSON/TXT。标题筛选文件中的 `items` 记录代表标题 `title`、代表平台 `source`、类别 `label`、热点关系 `relation`、命中的历史标题 `matched_history_title`、本轮同事件标题数 `hotlist_title_count` 和同话题标题 `related_titles`；模型初步判断存在兴趣关键词时才记录 `candidate_interest_keywords`。`seen_items` 单独记录跳过的话题。文件还记录输入标题数、完全相同标题命中数、实际发送数、数据库路径、召回数量、历史上下文字符数、所用快照与筛选模型信息；返回值通过 `selection_file` 给出路径。
-- 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。成功的 `update` 会同步改写 `hotlist_topics` 的当前 `knowledge` 和 `latest_update`，并向 `payload_json` 的 `updates` 追加记录；证据不足或被淘汰的更新不改变当前有效知识，也不进入更新链。
-- 每张卡片用 `general_share_score` 记录现有大众标准评分，用 `interest_share_score` 记录候选兴趣关键词对应用户的分享价值；后者最高为 3.9。程序取两项评分的较高值写入最终 `share_score`，并直接保留标题阶段的 `candidate_interest_keywords`。三项分数均为 0 或最多一位小数的合法范围；最终分低于 3 时 `share` 为 `null`，达到 3 分时 `share` 才包含分享文字、来源和评论选择。
-- 启用自动分享且暂定为 `new` 的卡片，其 `general_share_score` 达到 `sharing.policy.delivery.immediate_score` 时，保存前会用现有正文和来源标题复核近期历史。命中后只重评对应话题一次，并以 `update` 结果替换暂定结果。批次 `inference.immediate_history_recheck` 记录触发数、命中事件、匹配分数、重评请求数和独立 Token 用量；只有兴趣分达到即时阈值的卡片不会触发该步骤。
+- 知识卡批次 JSON 记录 `complete`、`needs_research`、`rejected` 状态，以及第一轮 `evidence` 和主动搜索 `research_evidence`。状态处理见[知识卡与补搜](design.md#知识卡与补搜)，知识合并见[更新知识的边界](design.md#更新知识的边界)。
+- 知识卡评分和分享 review 的对应字段见[自动分享参考](#astrbot-im-自动分享)。卡片另有 `candidate_interest_keywords`（非空时保留的候选兴趣词）和 `relation`（本轮事件关系）。`share` 为 `null` 或包含文案、来源与评论的对象；产生条件见[热度保底与最终分](design.md#热度保底与最终分)。
+- `inference.immediate_history_recheck` 记录保存前历史复核的触发数、匹配结果、重评请求数和独立 Token 用量；触发范围与重评方式见[保存前的历史复核](design.md#保存前的历史复核)。
 - 返回值中的 `complete_count`、`needs_research_count` 和 `rejected_count` 分别统计三种状态；批次 JSON 还记录模型、逐话题模型请求数、实际并发上限、耗时、实际 Token 使用量、失败话题及原因，以及主动搜索的话题数、平台请求数、有效条目数和失败记录。`skipped_empty_evidence_count` 和 `skipped_empty_evidence_topics` 记录第一轮与补搜都没有可读正文、因而跳过模型请求的话题数和话题 ID；`web_search_calls` 固定为 0，表示该流程没有启用 Codex 原生 Web Search。单个话题请求或结果校验失败时保留为 `needs_research`，不会中断其他话题和批次产物。
 
 内部筛选、证据补充和评论回填规则见[热榜学习](design.md#热榜学习)。

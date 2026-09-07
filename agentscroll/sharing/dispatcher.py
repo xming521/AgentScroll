@@ -21,6 +21,7 @@ from agentscroll.config import ShareDestinationSettings, SharingSettings
 from agentscroll.storage import database_transaction, resolve_database_path
 
 from .message import render_share_messages
+from .policy import HOTLIST_SCORES, DeliveryDecision, decide_delivery, legacy_share_trigger, score_rules
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +97,6 @@ class ShareDispatcher:
         transports: Mapping[str, ShareTransport],
         database_path: str | Path | None = None,
         sharing_output_dir: str | Path | None = None,
-        force_share_title_count: int = 3,
         now: Callable[[], datetime] | None = None,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -117,9 +117,6 @@ class ShareDispatcher:
             self._destinations[self._destination_id(destination)] = destination
 
         self.database_path = resolve_database_path(database_path)
-        if force_share_title_count < 1:
-            raise ValueError("force_share_title_count 必须是正整数")
-        self.force_share_title_count = force_share_title_count
         self.sharing_output_dir = (
             Path(sharing_output_dir).expanduser().resolve()
             if sharing_output_dir is not None
@@ -248,7 +245,9 @@ class ShareDispatcher:
         if generated.tzinfo is None:
             generated = generated.replace(tzinfo=self._now().tzinfo)
         expires_at = generated + self._window
-        normalized_shares: list[tuple[int, dict[str, Any], str]] = []
+        normalized_shares: list[
+            tuple[int, dict[str, Any], str, DeliveryDecision]
+        ] = []
         try:
             for index, raw_share in enumerate(shares):
                 if not isinstance(raw_share, Mapping) or isinstance(
@@ -278,14 +277,33 @@ class ShareDispatcher:
                     or raw_hotlist_title_count < 1
                 ):
                     raise ValueError
-                if raw_hotlist_title_count >= self.force_share_title_count:
-                    share_trigger = "hotlist_title_count"
-                elif general_score == 4:
-                    share_trigger = "llm_major"
-                else:
-                    share_trigger = "normal"
+                hotlist_score = share.get("hotlist_score", 0)
+                if isinstance(hotlist_score, bool) or hotlist_score not in HOTLIST_SCORES:
+                    raise ValueError
+                if hotlist_score and share.get("relation") != "new":
+                    raise ValueError
+                interest_score = float(share.get("interest_score", 0))
+                if not (interest_score == 0 or 1 <= interest_score <= 3.9):
+                    raise ValueError
+                rules = score_rules(general_score, interest_score, hotlist_score)
+                if "share_rules" in share and tuple(share["share_rules"]) != rules:
+                    raise ValueError
+                if "hotlist_score" in share and score != max(
+                    general_score, interest_score, hotlist_score
+                ):
+                    raise ValueError
+                share["share_rules"] = list(rules)
+                delivery = decide_delivery(
+                    score=score,
+                    general_score=general_score,
+                    hotlist_score=hotlist_score,
+                    policy=self.settings.policy,
+                )
+                share["delivery_mode"] = delivery.mode
+                share["delivery_reasons"] = list(delivery.reasons)
+                share_trigger = legacy_share_trigger(rules, general_score)
                 render_share_messages(share)
-                normalized_shares.append((index, share, share_trigger))
+                normalized_shares.append((index, share, share_trigger, delivery))
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("即时分享批次字段错误") from exc
         normalized_shares.sort(key=lambda item: (-item[1]["score"], item[0]))
@@ -352,21 +370,10 @@ class ShareDispatcher:
                         connection, destination_id, include_waiting=True
                     )
                     ordinary_count = 0
-                    for share_index, share, share_trigger in normalized_shares:
+                    for share_index, share, share_trigger, delivery in normalized_shares:
                         score = float(share["score"])
-                        general_score = float(share["general_score"])
-                        min_score = (
-                            policy.score_only.min_score
-                            if score_only
-                            else policy.window.min_score
-                        )
-                        eligible = score >= min_score
-                        immediate_score = policy.delivery.immediate_score
-                        immediate = (
-                            eligible
-                            and immediate_score is not None
-                            and general_score >= immediate_score
-                        )
+                        eligible = delivery.eligible
+                        immediate = delivery.mode == "immediate"
                         bypass = immediate
                         status = "waiting"
                         detail: str | None = None
@@ -643,12 +650,7 @@ class ShareDispatcher:
                         {"destination_id": row["destination_id"], "job_id": job_id},
                     )
                 else:
-                    min_score = (
-                        policy.score_only.min_score
-                        if policy.mode == "score_only"
-                        else policy.window.min_score
-                    )
-                    if float(row["score"]) < min_score:
+                    if float(row["score"]) < policy.minimum_score:
                         connection.execute(
                             """
                             UPDATE share_jobs

@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agentscroll.storage import connect_database
 from agentscroll.workflows.hotlist_state import (
     active_exact_title_keys,
@@ -327,9 +329,11 @@ def test_evidence_match_recalls_history_missing_from_hotlist_title() -> None:
     assert matches[10]["coverage"] >= 0.65
 
 
+@pytest.mark.parametrize("hotlist_score", [0, 4])
 def test_immediate_new_card_is_rerun_once_as_update(
     tmp_path: Path,
     monkeypatch,
+    hotlist_score: int,
 ) -> None:
     database = tmp_path / "agentscroll.sqlite3"
     event_id = _seed_topic(database)
@@ -384,6 +388,8 @@ def test_immediate_new_card_is_rerun_once_as_update(
         chat_context="可以聊现场救援。",
         latest_update=None,
         share_score=4,
+        general_share_score=2.8 if hotlist_score else 4,
+        hotlist_share_score=hotlist_score,
         share=KnowledgeShare(
             text="尼泊尔泥石流救援现场",
             source_id="e1",

@@ -15,14 +15,19 @@ from agentscroll.prompts.knowledge_card import (
     KNOWLEDGE_CARD_LABEL_PROMPTS,
     KNOWLEDGE_CARD_INTEREST_PROMPT,
     KNOWLEDGE_CARD_PROMPT,
+    KNOWLEDGE_CARD_SHARE_POLICY_PROMPT,
+    KNOWLEDGE_CARD_SHARE_SCORE_CONDITION,
     KNOWLEDGE_CARD_RESEARCH_PROMPT,
 )
 from agentscroll.prompts.hotlist import ZHIHU_SEARCH_QUERY_PROMPT
+from agentscroll.sharing.policy import hotlist_floor_score
 
+from .hotlist_state import ACTIVE_DAYS
 from .knowledge_card_artifacts import save_card_batch, save_share_batch
 from .knowledge_card_models import (
     KnowledgeCard,
     REMOVED_LABELS as _REMOVED_LABELS,
+    RESEARCH_ITEM_LIMIT as _RESEARCH_ITEM_LIMIT,
     card_response_schema,
     cards_to_dicts,
     http_url as _http_url,
@@ -35,7 +40,8 @@ _RESEARCH_SOURCES = {
     "news": ("weibo", "wechat", "toutiao"),
     "fun": ("weibo",),
 }
-_RESEARCH_ITEM_LIMIT = 3
+_ZHIHU_QUERY_MIN_COUNT = 2
+_ZHIHU_QUERY_MAX_COUNT = 3
 _COMMENT_REPLY_PREFIX_RE = re.compile(r"^回复\s*@[^:：]+[:：]\s*")
 
 _ZHIHU_SEARCH_QUERY_SCHEMA: dict[str, Any] = {
@@ -50,8 +56,8 @@ _ZHIHU_SEARCH_QUERY_SCHEMA: dict[str, Any] = {
                     "topic_index": {"type": "integer", "minimum": 1},
                     "search_queries": {
                         "type": "array",
-                        "minItems": 2,
-                        "maxItems": 3,
+                        "minItems": _ZHIHU_QUERY_MIN_COUNT,
+                        "maxItems": _ZHIHU_QUERY_MAX_COUNT,
                         "items": {"type": "string", "maxLength": 30},
                     },
                 },
@@ -140,8 +146,12 @@ def _selection_with_zhihu_search_queries(
         return enriched_selection, {}
 
     payload = json.dumps(query_inputs, ensure_ascii=False, separators=(",", ":"))
+    instruction = ZHIHU_SEARCH_QUERY_PROMPT.format(
+        min_queries=_ZHIHU_QUERY_MIN_COUNT,
+        max_queries=_ZHIHU_QUERY_MAX_COUNT,
+    ).strip()
     prompt = (
-        f"{ZHIHU_SEARCH_QUERY_PROMPT.strip()}\n\n"
+        f"{instruction}\n\n"
         f"待转换的知乎线索（JSON）：\n{payload}"
     )
     settings = load_settings(config_path)
@@ -190,8 +200,11 @@ def _selection_with_zhihu_search_queries(
             query = " ".join(str(value).split())
             if query and query not in queries:
                 queries.append(query)
-        if not 2 <= len(queries) <= 3:
-            raise ValueError(f"话题 {topic_index} 必须返回 2 至 3 个不同检索词")
+        if not _ZHIHU_QUERY_MIN_COUNT <= len(queries) <= _ZHIHU_QUERY_MAX_COUNT:
+            raise ValueError(
+                f"话题 {topic_index} 必须返回 {_ZHIHU_QUERY_MIN_COUNT} 至 "
+                f"{_ZHIHU_QUERY_MAX_COUNT} 个不同检索词"
+            )
         queries_by_index[topic_index] = queries
     if set(queries_by_index) != expected_indices:
         missing = sorted(expected_indices - set(queries_by_index))
@@ -448,9 +461,6 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
         "title": str(topic.get("title") or ""),
         "label": str(topic.get("label") or ""),
         "relation": str(topic.get("event_relation") or "new"),
-        "hotlist": {
-            "force_share": bool(topic.get("force_share")),
-        },
         "evidence": compact_items(topic.get("evidence")),
     }
     candidate_keywords = list(topic.get("candidate_interest_keywords") or [])
@@ -466,6 +476,20 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
     return payload
 
 
+def _share_generation_prompt(topic: Mapping[str, Any]) -> str:
+    # 热度保底已达到分享门槛时，即使两项模型评分不足，也需要生成分享文案。
+    score_condition = (
+        " "
+        if topic.get("hotlist_floor_score", 0) >= topic.get("share_min_score", 3)
+        else KNOWLEDGE_CARD_SHARE_SCORE_CONDITION.format(
+            min_score=f"{topic.get('share_min_score', 3):g}"
+        )
+    )
+    return KNOWLEDGE_CARD_SHARE_POLICY_PROMPT.format(
+        score_condition=score_condition
+    ).strip()
+
+
 def _knowledge_card_prompt(topic: Mapping[str, Any]) -> str:
     payload = json.dumps(
         _model_topic_payload(topic, research=False),
@@ -474,10 +498,12 @@ def _knowledge_card_prompt(topic: Mapping[str, Any]) -> str:
     )
     evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     label_prompt = KNOWLEDGE_CARD_LABEL_PROMPTS[_normalize_label(topic.get("label"))]
+    instruction = KNOWLEDGE_CARD_PROMPT.format(history_days=ACTIVE_DAYS).strip()
     return (
-        f"{KNOWLEDGE_CARD_PROMPT.strip()}\n\n"
+        f"{instruction}\n\n"
         f"{label_prompt.strip()}\n\n"
         f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
+        f"{_share_generation_prompt(topic)}\n\n"
         f"当前评估时间：{evaluated_at}\n"
         f"待生成知识卡的证据（JSON）：\n{payload}"
     )
@@ -491,10 +517,15 @@ def _knowledge_card_research_prompt(topic: Mapping[str, Any]) -> str:
     )
     evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
     label_prompt = KNOWLEDGE_CARD_LABEL_PROMPTS[_normalize_label(topic.get("label"))]
+    instruction = KNOWLEDGE_CARD_RESEARCH_PROMPT.format(
+        history_days=ACTIVE_DAYS,
+        research_item_limit=_RESEARCH_ITEM_LIMIT,
+    ).strip()
     return (
-        f"{KNOWLEDGE_CARD_RESEARCH_PROMPT.strip()}\n\n"
+        f"{instruction}\n\n"
         f"{label_prompt.strip()}\n\n"
         f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
+        f"{_share_generation_prompt(topic)}\n\n"
         f"当前评估时间：{evaluated_at}\n"
         f"待补搜材料（JSON）：\n{payload}"
     )
@@ -557,14 +588,14 @@ def _validated_interest_topics(
             *list(topic.get("evidence") or []),
             *list(topic.get("research_evidence") or []),
         ]
-        topic["force_share"] = (
-            int(topic.get("hotlist_title_count") or 1)
-            >= force_share_title_count
-            and any(
+        topic["hotlist_floor_score"] = hotlist_floor_score(
+            int(topic.get("hotlist_title_count") or 1), force_share_title_count
+        ) if (
+            topic.get("event_relation", "new") == "new" and any(
                 isinstance(source, Mapping) and _http_url(source.get("url"))
                 for source in sources
             )
-        )
+        ) else 0
         validated.append(topic)
     return validated
 
@@ -580,6 +611,8 @@ def _generate_topic_cards(
     minimum_evidence_count: int = 1,
 ) -> tuple[list[KnowledgeCard], dict[str, Any]]:
     topics = _validated_interest_topics(topics, settings)
+    for topic in topics:
+        topic["share_min_score"] = settings.sharing.policy.minimum_score
     cards_by_id: dict[int, KnowledgeCard] = {}
     failures: list[dict[str, Any]] = []
     model_topics = topics
@@ -618,10 +651,7 @@ def _generate_topic_cards(
         make_configured_request(
             prompt,
             settings,
-            json_schema=card_response_schema(
-                research=research,
-                force_share=bool(topic.get("force_share")),
-            ),
+            json_schema=card_response_schema(research=research),
             max_tokens=max_tokens,
             timeout=timeout,
             effort=effort,
@@ -726,7 +756,7 @@ def _recheck_immediate_history_matches(
         and (card := cards_by_id.get(topic["topic_id"])) is not None
         and card.status == "complete"
         and card.share is not None
-        and card.general_share_score >= immediate_score
+        and max(card.general_share_score, card.hotlist_share_score) >= immediate_score
     ]
     if not triggered_topics:
         return cards, dict(evidence), dict(selection), {}
@@ -1252,7 +1282,10 @@ def supplement_hotlist_knowledge_cards(
     """Actively collect platform evidence for failed topics and save one batch."""
     from agentscroll.config import load_settings
 
+    settings = load_settings(config_path)
     topics = _prompt_payload(evidence)
+    for topic in topics:
+        topic["share_min_score"] = settings.sharing.policy.minimum_score
     initial_cards = _validate_cards(initial_result.get("cards"), topics)
     initial_by_id = {card.topic_id: card for card in initial_cards}
     research_topics = []
@@ -1279,7 +1312,6 @@ def supplement_hotlist_knowledge_cards(
         result["supplemented_count"] = 0
         return result
 
-    settings = load_settings(config_path)
     days, as_of = _research_date_window(evidence)
     search_results, active_search_diagnostics = _collect_active_search_evidence(
         research_topics,

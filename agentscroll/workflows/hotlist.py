@@ -84,7 +84,12 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
 def _first_pass_prompt(
     candidates: list[dict[str, Any]],
     interest_keywords: tuple[str, ...],
+    force_share_title_count: int,
 ) -> str:
+    instruction = HOTLIST_FIRST_PASS_PROMPT.format(
+        force_share_title_count=force_share_title_count,
+        max_topics=_FIRST_PASS_MAX_TOPICS,
+    ).strip()
     payload = json.dumps(
         {
             "interest": {"keywords": list(interest_keywords)},
@@ -94,7 +99,7 @@ def _first_pass_prompt(
         separators=(",", ":"),
     )
     return (
-        f"{HOTLIST_FIRST_PASS_PROMPT.strip()}\n\n"
+        f"{instruction}\n\n"
         f"热榜条目总数：{len(candidates)}\n"
         f"待筛选条目及本地召回的历史标题（JSON）：\n{payload}"
     )
@@ -180,7 +185,11 @@ def select_hotlist_first_pass(
     )
     candidate_payloads = order_candidates_by_similarity(candidate_payloads)
     request = make_configured_request(
-        _first_pass_prompt(candidate_payloads, interest_keywords),
+        _first_pass_prompt(
+            candidate_payloads,
+            interest_keywords,
+            settings.hotlist.force_share_title_count,
+        ),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
         timeout=300,

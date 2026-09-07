@@ -82,6 +82,10 @@ SELECT
     jobs.share_trigger,
     json_extract(jobs.payload_json, '$.general_score') AS general_share_score,
     json_extract(jobs.payload_json, '$.interest_score') AS interest_share_score,
+    json_extract(jobs.payload_json, '$.hotlist_score') AS hotlist_share_score,
+    json_extract(jobs.payload_json, '$.share_rules') AS share_rules,
+    json_extract(jobs.payload_json, '$.delivery_mode') AS delivery_mode,
+    json_extract(jobs.payload_json, '$.delivery_reasons') AS delivery_reasons,
     json_extract(jobs.payload_json, '$.text') AS share_text,
     json_extract(jobs.payload_json, '$.url') AS source_url,
     json_extract(jobs.payload_json, '$.comment') AS comment,
@@ -95,7 +99,8 @@ SELECT
     jobs.share_group_id,
     jobs.job_id
 FROM share_jobs AS jobs
-WHERE jobs.status = 'sent';
+WHERE jobs.status = 'sent'
+ORDER BY shared_at DESC;
 """
 
 
@@ -143,7 +148,15 @@ def connect_database(path: str | Path | None = None) -> sqlite3.Connection:
         str(row[1])
         for row in connection.execute("PRAGMA table_info(shared_content_review)")
     }
-    if review_columns and "share_trigger" not in review_columns:
+    review_definition = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?",
+        ("shared_content_review",),
+    ).fetchone()
+    if review_columns and (
+        "share_trigger" not in review_columns
+        or "share_rules" not in review_columns
+        or "ORDER BY shared_at DESC" not in review_definition[0]
+    ):
         connection.execute("DROP VIEW shared_content_review")
     connection.executescript(_SCHEMA)
     if version < SCHEMA_VERSION:

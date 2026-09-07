@@ -24,6 +24,7 @@ _LONG_TEXT_URL = "https://m.weibo.cn/statuses/extend?id={feed_id}"
 _COMMENTS_URL = "https://m.weibo.cn/comments/hotflow"
 _CONTENT_SOURCE = "mcp-server-weibo-feed-detail"
 _HOT_TOPIC_SEARCH_CANDIDATE_LIMIT = 15
+_EXCLUDED_COMMENT_USER_IDS = {"5606716867"}
 _COMMENT_IMAGE_ALT_RE = re.compile(
     r'''<img\b[^>]*\balt=(["'])(.*?)\1[^>]*>''',
     re.IGNORECASE,
@@ -478,6 +479,8 @@ async def _enrich_post_comments(
             )
             parsed = []
             for data in raw_comments:
+                if str((data.get("user") or {}).get("id")) in _EXCLUDED_COMMENT_USER_IDS:
+                    continue
                 value = comments.entry(
                     data.get("id"),
                     _comment_text(data.get("text")),

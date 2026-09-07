@@ -8,10 +8,12 @@ import pytest
 
 
 @pytest.mark.parametrize("include_empty_fields", [True, False])
+@pytest.mark.parametrize("title_threshold", [2, 5])
 def test_first_pass_propagates_semantic_interest_keywords(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     include_empty_fields: bool,
+    title_threshold: int,
 ) -> None:
     from agentscroll import config
     from agentscroll.workflows.hotlist import select_hotlist_first_pass
@@ -68,6 +70,7 @@ def test_first_pass_propagates_semantic_interest_keywords(
     settings = SimpleNamespace(
         storage=SimpleNamespace(database_path=tmp_path / "state.sqlite3"),
         interest=SimpleNamespace(keywords=("MCP", "机器人")),
+        hotlist=config.HotlistSettings(force_share_title_count=title_threshold),
     )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
     monkeypatch.setattr(config, "make_configured_request", make_request)
@@ -92,9 +95,17 @@ def test_first_pass_propagates_semantic_interest_keywords(
     assert result["seen_topics"] == []
     assert "exact_interest_keywords" not in result["topics"][0]
     payload = json.loads(requests[0].prompt.rsplit("\n", 1)[-1])
+    assert len(requests) == 1
+    assert f"至少 {title_threshold} 个标题" in requests[0].prompt
+    assert "{force_share_title_count}" not in requests[0].prompt
+    assert set(payload) == {"interest", "candidates"}
+    (tmp_path / "first-pass-prompt.txt").write_text(requests[0].prompt, encoding="utf-8")
     assert payload["interest"] == {"keywords": ["MCP", "机器人"]}
     assert "exact_interest_keywords" not in payload["candidates"][0]
     schema = requests[0].json_schema
+    max_topics = schema["properties"]["topics"]["maxItems"]
+    assert f"最多 {max_topics} 个" in requests[0].prompt
+    assert "{max_topics}" not in requests[0].prompt
     topic_schema = schema["properties"]["topics"]["items"]
     seen_schema = schema["properties"]["seen"]["items"]
     assert set(topic_schema["required"]) == set(topic_schema["properties"])
@@ -172,6 +183,7 @@ def test_invalid_local_history_is_downgraded_without_failing_batch(
     settings = SimpleNamespace(
         storage=SimpleNamespace(database_path=tmp_path / "state.sqlite3"),
         interest=SimpleNamespace(keywords=()),
+        hotlist=config.HotlistSettings(),
     )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
     monkeypatch.setattr(

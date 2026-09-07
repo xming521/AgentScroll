@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import pytest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,6 +67,7 @@ def _share(
     *,
     general_score: float | None = None,
     hotlist_title_count: int | None = None,
+    hotlist_score: float = 0,
 ) -> dict[str, object]:
     share: dict[str, object] = {
         "topic_id": f"topic-{index}",
@@ -79,6 +82,8 @@ def _share(
         share["general_score"] = general_score
     if hotlist_title_count is not None:
         share["hotlist_title_count"] = hotlist_title_count
+    if hotlist_score:
+        share.update(hotlist_score=hotlist_score, relation="new")
     return share
 
 
@@ -202,7 +207,7 @@ def test_share_jobs_record_why_each_share_was_selected(tmp_path: Path) -> None:
         [
             _share(3.5, 0),
             _share(4.0, 1),
-            _share(4.0, 2, hotlist_title_count=3),
+            _share(4.0, 2, hotlist_title_count=3, hotlist_score=4),
         ],
     )
 
@@ -228,6 +233,48 @@ def test_share_jobs_record_why_each_share_was_selected(tmp_path: Path) -> None:
         job["share_index"]: review[job["job_id"]]["share_trigger"]
         for job in _jobs(database)
     } == {0: "normal", 1: "llm_major", 2: "hotlist_title_count"}
+    assert json.loads(review[_jobs(database)[2]["job_id"]]["share_rules"]) == [
+        "general_score", "hotlist_title_count"
+    ]
+
+
+@pytest.mark.parametrize("mode", ["window", "score_only"])
+@pytest.mark.parametrize("immediate_score", [None, 3.5, 4])
+@pytest.mark.parametrize("floor", [3, 3.5, 4])
+def test_hotlist_delivery_uses_applied_floor_not_title_count(
+    tmp_path: Path, mode: str, immediate_score: float | None, floor: float,
+) -> None:
+    now = [datetime(2026, 9, 6, tzinfo=timezone.utc)]
+    policy = SharePolicySettings.model_validate({
+        "mode": mode,
+        mode: {"min_score": 3},
+        "delivery": {"immediate_score": immediate_score},
+    })
+    dispatcher, _, database, _ = _dispatcher(tmp_path, now, policy=policy)
+    dispatcher.submit_shares("batch", now[0], [
+        _share(floor, 0, general_score=2.8, hotlist_title_count=3, hotlist_score=floor),
+        _share(3, 1, general_score=3, hotlist_title_count=5),
+    ])
+    jobs = _jobs(database)
+    immediate = immediate_score is not None and floor >= immediate_score
+    assert jobs[0]["bypass"] == int(immediate)
+    assert jobs[1]["bypass"] == 0
+    assert jobs[1]["share_trigger"] == "normal"
+    payload = json.loads(jobs[0]["payload_json"])
+    assert payload["general_score"] == 2.8
+    assert payload["share_rules"] == ["hotlist_title_count"]
+    assert payload["hotlist_score"] == floor
+    assert payload["delivery_reasons"] == (["hotlist_title_count"] if immediate else [])
+
+
+@pytest.mark.parametrize("floor", [3, 3.5, 4])
+def test_dispatcher_rejects_hotlist_floor_on_update(tmp_path: Path, floor: float) -> None:
+    now = [datetime(2026, 9, 6, tzinfo=timezone.utc)]
+    dispatcher, _, _, _ = _dispatcher(tmp_path, now)
+    share = _share(floor, 0, general_score=2.8, hotlist_score=floor)
+    share["relation"] = "update"
+    with pytest.raises(ValueError, match="即时分享批次字段错误"):
+        dispatcher.submit_shares("batch", now[0], [share])
 
 
 def test_v1_database_migrates_share_trigger_column(tmp_path: Path) -> None:
@@ -594,6 +641,10 @@ def test_dispatcher_sends_frozen_payload_and_records_quota(tmp_path: Path) -> No
         "share_trigger": "normal",
         "general_share_score": 3.9,
         "interest_share_score": None,
+        "hotlist_share_score": None,
+        "share_rules": '["general_score"]',
+        "delivery_mode": "normal",
+        "delivery_reasons": "[]",
         "share_text": "message-0",
         "source_url": "https://example.com/0",
         "comment": "comment-0",

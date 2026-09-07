@@ -41,7 +41,7 @@
   },
 
   "hotlist": {
-    // 本轮同一事件达到这个热榜标题数时，强制按 4 分进入即时分享。
+    // 标题数达标优先入选采集，并设定新事件热度保底的 4 分档门槛；较低档见 docs/design.md。
     "force_share_title_count": 3
   },
 
@@ -54,6 +54,7 @@
       "delivery": {
         // 正文与评论整组串行；相邻分享含 immediate 时按秒级间隔。
         "min_interval_minutes": 10,
+        // 非 null 时不得低于当前 mode 的 min_score；null 关闭即时待遇。
         "immediate_score": 4.0,
         "immediate_interval_seconds": 3
       },

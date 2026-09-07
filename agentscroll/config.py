@@ -145,6 +145,24 @@ class SharePolicySettings(BaseModel):
         default_factory=ScoreOnlySharePolicySettings
     )
 
+    @property
+    def minimum_score(self) -> float:
+        return (
+            self.score_only.min_score
+            if self.mode == "score_only"
+            else self.window.min_score
+        )
+
+    @model_validator(mode="after")
+    def validate_immediate_threshold(self) -> SharePolicySettings:
+        threshold = self.delivery.immediate_score
+        if threshold is not None and threshold < self.minimum_score:
+            raise ValueError(
+                "policy.delivery.immediate_score 不能低于 "
+                f"policy.{self.mode}.min_score"
+            )
+        return self
+
 
 class ShareDestinationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
