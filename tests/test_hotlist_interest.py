@@ -9,11 +9,13 @@ import pytest
 
 @pytest.mark.parametrize("include_empty_fields", [True, False])
 @pytest.mark.parametrize("title_threshold", [2, 5])
+@pytest.mark.parametrize("blocked_keywords", [(), ("体育赛事", "电竞赛事", "赛车")])
 def test_first_pass_propagates_semantic_interest_keywords(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     include_empty_fields: bool,
     title_threshold: int,
+    blocked_keywords: tuple[str, ...],
 ) -> None:
     from agentscroll import config
     from agentscroll.workflows.hotlist import select_hotlist_first_pass
@@ -69,7 +71,9 @@ def test_first_pass_propagates_semantic_interest_keywords(
 
     settings = SimpleNamespace(
         storage=SimpleNamespace(database_path=tmp_path / "state.sqlite3"),
-        interest=SimpleNamespace(keywords=("MCP", "机器人")),
+        interest=config.InterestSettings(
+            keywords=("MCP", "机器人"), blocked_keywords=blocked_keywords,
+        ),
         hotlist=config.HotlistSettings(force_share_title_count=title_threshold),
     )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
@@ -100,7 +104,10 @@ def test_first_pass_propagates_semantic_interest_keywords(
     assert "{force_share_title_count}" not in requests[0].prompt
     assert set(payload) == {"interest", "candidates"}
     (tmp_path / "first-pass-prompt.txt").write_text(requests[0].prompt, encoding="utf-8")
-    assert payload["interest"] == {"keywords": ["MCP", "机器人"]}
+    assert payload["interest"] == {
+        "keywords": ["MCP", "机器人"],
+        "blocked_keywords": list(blocked_keywords),
+    }
     assert "exact_interest_keywords" not in payload["candidates"][0]
     schema = requests[0].json_schema
     max_topics = schema["properties"]["topics"]["maxItems"]
@@ -182,7 +189,7 @@ def test_invalid_local_history_is_downgraded_without_failing_batch(
 
     settings = SimpleNamespace(
         storage=SimpleNamespace(database_path=tmp_path / "state.sqlite3"),
-        interest=SimpleNamespace(keywords=()),
+        interest=config.InterestSettings(),
         hotlist=config.HotlistSettings(),
     )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)

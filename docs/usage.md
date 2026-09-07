@@ -25,15 +25,16 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 可通过 `AGENTSCROLL_CONFIG` 指向其他配置文件，也可在子命令前使用 `--config-path`，例如 `agentscroll --config-path custom.jsonc hotlist learn ...`。不得把 API Key、Cookie 或 Token 写入配置模板、文档、日志或测试证据。
 
-`interest.keywords` 配置兴趣关键词，可以是具体词、人物、产品或领域：
+`interest.keywords` 配置兴趣关键词，`interest.blocked_keywords` 配置不喜欢的关键词；都可以是具体词、人物、产品或领域：
 
 ```jsonc
 "interest": {
-  "keywords": ["AI Agent", "MCP", "机器人"]
+  "keywords": ["AI Agent", "MCP", "机器人"],
+  "blocked_keywords": ["体育赛事", "电竞赛事", "赛车"]
 }
 ```
 
-缺失或使用空数组时不启用兴趣偏好。程序会去除首尾空白，并按 Unicode 兼容字符、大小写和连续空白规范化去重；用户原始写法保留在模型输入和 review 产物中。模型根据标题判断与兴趣关键词的直接语义相关性，不需要另配 ID、描述或权重。修改配置只影响后续未命中标题缓存的条目，近 7 天内已经分析过的相同标题不会自动重筛。
+两项均默认空数组，分别表示不启用兴趣偏好、不启用排除。程序会去除首尾空白，并按 Unicode 兼容字符、大小写和连续空白规范化去重；模型输入保留关键词写法，命中的候选兴趣词也保留在 review 产物中。模型根据标题判断直接语义相关性，不需要另配 ID、描述或权重。黑名单范围与优先级见[第一轮筛选](design.md#第一轮筛选)。修改配置只影响后续未命中标题缓存的条目，近 7 天内已经分析过的相同标题不会自动重筛。
 
 `hotlist.force_share_title_count` 同时配置第一轮热度入选和后续新事件热度保底最高档（4 分）的标题数门槛，默认是 `3`，必须为正整数。第一轮通过提示词占位符填入该值，不增加 JSON 输入字段；热度入选仍遵守话题容量和 seen 去重。较低档分数、计数范围与适用条件见[热度保底与最终分](design.md#热度保底与最终分)。
 

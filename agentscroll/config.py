@@ -7,7 +7,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import pyjson5
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from .inference import (
     CodexExecClient,
@@ -81,22 +81,23 @@ class InterestSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     keywords: tuple[str, ...] = ()
+    blocked_keywords: tuple[str, ...] = ()
 
-    @field_validator("keywords", mode="before")
+    @field_validator("keywords", "blocked_keywords", mode="before")
     @classmethod
-    def normalize_keywords(cls, value: Any) -> tuple[str, ...]:
+    def normalize_keywords(cls, value: Any, info: ValidationInfo) -> tuple[str, ...]:
         if value is None:
             return ()
         if isinstance(value, str) or not isinstance(value, (list, tuple)):
-            raise ValueError("interest.keywords 必须是字符串数组")
+            raise ValueError(f"interest.{info.field_name} 必须是字符串数组")
         normalized: list[str] = []
         seen: set[str] = set()
         for raw_keyword in value:
             if not isinstance(raw_keyword, str):
-                raise ValueError("interest.keywords 只能包含字符串")
+                raise ValueError(f"interest.{info.field_name} 只能包含字符串")
             keyword = " ".join(raw_keyword.split())
             if not keyword:
-                raise ValueError("interest.keywords 不能包含空字符串")
+                raise ValueError(f"interest.{info.field_name} 不能包含空字符串")
             key = unicodedata.normalize("NFKC", keyword).casefold()
             if key in seen:
                 continue

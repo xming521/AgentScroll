@@ -85,6 +85,7 @@ def _first_pass_prompt(
     candidates: list[dict[str, Any]],
     interest_keywords: tuple[str, ...],
     force_share_title_count: int,
+    blocked_keywords: tuple[str, ...] = (),
 ) -> str:
     instruction = HOTLIST_FIRST_PASS_PROMPT.format(
         force_share_title_count=force_share_title_count,
@@ -92,7 +93,10 @@ def _first_pass_prompt(
     ).strip()
     payload = json.dumps(
         {
-            "interest": {"keywords": list(interest_keywords)},
+            "interest": {
+                "keywords": list(interest_keywords),
+                "blocked_keywords": list(blocked_keywords),
+            },
             "candidates": candidates,
         },
         ensure_ascii=False,
@@ -189,6 +193,7 @@ def select_hotlist_first_pass(
             candidate_payloads,
             interest_keywords,
             settings.hotlist.force_share_title_count,
+            blocked_keywords=settings.interest.blocked_keywords,
         ),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
