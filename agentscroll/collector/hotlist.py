@@ -349,7 +349,7 @@ def collect_selected_hotlist_evidence(
     """Collect compact evidence and diagnostics for first-pass selected topics.
 
     The representative entry names the topic but does not have to be collected
-    first. The configured cap is the target number of readable entries; failed
+    first. The configured cap is the target number of readable posts; failed
     candidates are replaced from the remaining related entries when possible.
     Collector failures remain in ``attempts`` for saved diagnostics.
     """
@@ -419,10 +419,15 @@ def collect_selected_hotlist_evidence(
             list[tuple[int | None, str, Mapping[str, Any]]]
         ] = []
         flat_entries: list[tuple[str, Mapping[str, Any]]] = []
+        posts_per_search = posts_per_entry
         for topic_index, topic_candidates in enumerate(candidate_specs):
-            missing = max_entries_per_topic - readable_counts[topic_index]
+            missing = max(0, max_entries_per_topic - readable_counts[topic_index])
             start = next_candidate[topic_index]
             selected = topic_candidates[start : start + missing]
+            if selected:
+                posts_per_search = max(
+                    posts_per_search, (missing + len(selected) - 1) // len(selected)
+                )
             next_candidate[topic_index] += len(selected)
             batch_candidates.append(selected)
             flat_entries.extend((source_id, item) for _, source_id, item in selected)
@@ -431,7 +436,7 @@ def collect_selected_hotlist_evidence(
 
         flat_details, batch_unsupported = _collect_hotlist_details(
             flat_entries,
-            posts_per_topic=posts_per_entry,
+            posts_per_topic=posts_per_search,
             from_date=from_date,
             to_date=to_date,
         )
@@ -452,7 +457,12 @@ def collect_selected_hotlist_evidence(
                     (entry_id, source_id, item, detail, readable)
                 )
                 if readable:
-                    readable_counts[topic_index] += 1
+                    readable_counts[topic_index] += len(
+                        build_knowledge_document({
+                            "topic": "",
+                            "sources": _knowledge_sources([(source_id, item)], [detail]),
+                        })["items"]
+                    )
 
     topics: list[dict[str, Any]] = []
     for raw_topic, topic_attempts in zip(raw_topics, attempted):
@@ -502,7 +512,7 @@ def collect_selected_hotlist_evidence(
                 if entries[entry_id - 1].get("source_id") != "zhihu"
             ],
             "attempts": attempts,
-            "evidence": compact["items"],
+            "evidence": compact["items"][:max_entries_per_topic],
         }
         candidate_keywords = list(
             raw_topic.get("candidate_interest_keywords") or []

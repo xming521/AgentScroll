@@ -177,7 +177,7 @@ def hotlist_fetch(
     type=click.IntRange(min=1),
     default=3,
     show_default=True,
-    help="每个话题期望保留的可读采集入口数。",
+    help="每个话题期望保留的去重可读帖子数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
 @click.option("--share-output-dir", type=_PATH, help="分享 review 产物目录。")
@@ -233,7 +233,7 @@ def hotlist_learn(
     type=click.IntRange(min=1),
     default=3,
     show_default=True,
-    help="每个话题期望保留的可读采集入口数。",
+    help="每个话题期望保留的去重可读帖子数。",
 )
 @click.option("--output-dir", type=_PATH, help="知识卡目录。")
 @click.option("--share-output-dir", type=_PATH, help="分享 review 产物目录。")

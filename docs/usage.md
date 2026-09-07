@@ -40,7 +40,7 @@ export AGENTSCROLL_LLM_API_KEY='your-api-key'
 
 `storage.database_path` 指定跨轮次状态数据库，默认是 `outputs/agentscroll.sqlite3`。数据库只包含三张业务表：
 
-- `hotlist_topics`：热点稳定 ID 和当前有效知识；常用的类别、状态、时间、标题、知识、聊天语境、最新进展和分享评分是独立字段，标题链和更新链放在 `payload_json`。
+- `hotlist_topics`：热点稳定 ID 和当前有效知识；常用的类别、状态、时间、标题、知识、聊天语境、最新进展和分享评分是独立字段，大众分 `general_share_score`、兴趣分 `interest_share_score`、热度保底分 `hotlist_share_score` 也独立保存。标题链和更新链放在 `payload_json`，成功更新记录同时保存这三项分数。旧数据库自动迁移，未记录的历史分项为 NULL。
 - `hotlist_title_cache`：第一轮成功判断过的全部标题缓存，包括入选、未入选、`seen` 和精确命中的标题；按规范化标题去重并刷新最近出现时间，只用于 7 天窗口内避免重复分析。
 - `share_jobs`：每个分享目标的等待、发送中和最终任务状态，以及 `normal`、`llm_major`、`hotlist_title_count` 三类 `share_trigger` 和冻结的发送 `payload_json`，用于限流和重启恢复。
 

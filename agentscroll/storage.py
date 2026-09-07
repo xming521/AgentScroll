@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_DATABASE_PATH = Path.cwd() / "outputs" / "agentscroll.sqlite3"
 
 _SCHEMA = """
@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS hotlist_topics (
     chat_context TEXT NOT NULL,
     latest_update TEXT,
     share_score REAL NOT NULL CHECK (share_score >= 0 AND share_score <= 4),
+    general_share_score REAL CHECK (general_share_score BETWEEN 0 AND 4),
+    interest_share_score REAL CHECK (interest_share_score BETWEEN 0 AND 3.9),
+    hotlist_share_score REAL CHECK (hotlist_share_score IN (0, 3, 3.5, 4)),
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
 );
 
@@ -117,7 +120,7 @@ def connect_database(path: str | Path | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA busy_timeout = 10000")
     connection.execute("PRAGMA journal_mode = WAL")
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version not in {0, 1, SCHEMA_VERSION}:
+    if version not in {0, 1, 2, SCHEMA_VERSION}:
         connection.close()
         raise ValueError(
             f"Unsupported AgentScroll database schema version: {version}"
@@ -160,6 +163,20 @@ def connect_database(path: str | Path | None = None) -> sqlite3.Connection:
         connection.execute("DROP VIEW shared_content_review")
     connection.executescript(_SCHEMA)
     if version < SCHEMA_VERSION:
+        topic_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(hotlist_topics)")
+        }
+        for name, constraint in (
+            ("general_share_score", "BETWEEN 0 AND 4"),
+            ("interest_share_score", "BETWEEN 0 AND 3.9"),
+            ("hotlist_share_score", "IN (0, 3, 3.5, 4)"),
+        ):
+            if name not in topic_columns:
+                connection.execute(
+                    f"ALTER TABLE hotlist_topics ADD COLUMN {name} REAL "
+                    f"CHECK ({name} {constraint})"
+                )
         connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.commit()
     return connection

@@ -324,7 +324,7 @@ def test_v1_database_migrates_share_trigger_column(tmp_path: Path) -> None:
     finally:
         migrated.close()
 
-    assert version == 2
+    assert version == 3
     assert [(row["job_id"], row["share_trigger"]) for row in rows] == [
         ("major", "llm_major"),
         ("ordinary", "normal"),

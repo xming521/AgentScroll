@@ -74,6 +74,9 @@ def load_history(path: str | Path) -> dict[str, Any]:
         connection.close()
 
 
+_SCORE_COMPONENTS = ("general_share_score", "interest_share_score", "hotlist_share_score")
+
+
 def _topic_row(row: Mapping[str, Any]) -> dict[str, Any]:
     try:
         payload = json.loads(str(row["payload_json"]))
@@ -98,6 +101,7 @@ def _topic_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "chat_context": str(row["chat_context"]),
         "latest_update": row["latest_update"],
         "share_score": float(row["share_score"]),
+        **{name: row[name] for name in _SCORE_COMPONENTS},
         "titles": [dict(item) for item in titles if isinstance(item, Mapping)],
         "updates": [dict(item) for item in updates if isinstance(item, Mapping)],
     }
@@ -776,6 +780,7 @@ def record_final_batch(
                         "knowledge": str(card.get("knowledge") or ""),
                         "chat_context": str(card.get("chat_context") or ""),
                         "share_score": float(card.get("share_score") or 0),
+                        **{name: card.get(name) for name in _SCORE_COMPONENTS},
                     }
                 )
                 if relation == "new":
@@ -798,6 +803,7 @@ def record_final_batch(
                         "knowledge": knowledge,
                         "latest_update": latest_update,
                         "share_score": card.get("share_score"),
+                        **{name: card.get(name) for name in _SCORE_COMPONENTS},
                     }
                 )
 
@@ -818,6 +824,7 @@ def record_final_batch(
                 str(event["chat_context"]),
                 event.get("latest_update"),
                 float(event["share_score"]),
+                *(event[name] for name in _SCORE_COMPONENTS),
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             )
             connection.execute(
@@ -825,8 +832,9 @@ def record_final_batch(
                 INSERT INTO hotlist_topics(
                     topic_id, label, status, last_result_status,
                     first_seen_at, last_seen_at, updated_at, title,
-                    knowledge, chat_context, latest_update, share_score, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    knowledge, chat_context, latest_update, share_score,
+                    general_share_score, interest_share_score, hotlist_share_score, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
                     label = excluded.label,
                     status = excluded.status,
@@ -838,6 +846,9 @@ def record_final_batch(
                     chat_context = excluded.chat_context,
                     latest_update = excluded.latest_update,
                     share_score = excluded.share_score,
+                    general_share_score = excluded.general_share_score,
+                    interest_share_score = excluded.interest_share_score,
+                    hotlist_share_score = excluded.hotlist_share_score,
                     payload_json = excluded.payload_json
                 """,
                 values,

@@ -721,9 +721,11 @@ def test_selected_save_records_state_and_rewrites_share_topic_id(
     assert load_history(database)["events"][0]["event_id"] == stored_topic_id
 
 
+@pytest.mark.parametrize("interest_keywords", [(), ("AI",)])
 def test_supplement_workflow_keeps_dict_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    interest_keywords: tuple[str, ...],
 ) -> None:
     from agentscroll import config
     from agentscroll.workflows import knowledge_card as workflow
@@ -761,10 +763,18 @@ def test_supplement_workflow_keeps_dict_contract(
         topics: list[dict[str, object]],
         **_kwargs: object,
     ) -> tuple[list[object], dict[str, object]]:
+        prompt = workflow._knowledge_card_research_prompt(topics[0])
+        payload = json.loads(prompt.rsplit("\n", 1)[1])
+        assert payload.get("interest") == (
+            {"candidate_keywords": list(interest_keywords)}
+            if interest_keywords else None
+        )
+        (tmp_path / "research-prompt.txt").write_text(prompt, encoding="utf-8")
         cards = validate_research_cards(
             [
                 _raw_card(
                     general_share_score=0,
+                    interest_share_score=2.8 if interest_keywords else 0,
                     share=None,
                     research_sources=["r1"],
                 )
@@ -776,7 +786,7 @@ def test_supplement_workflow_keeps_dict_contract(
     monkeypatch.setattr(workflow, "_generate_topic_cards", generate_research_cards)
     initial_card = KnowledgeCard.needs_research(1).to_dict()
     result = workflow.supplement_hotlist_knowledge_cards(
-        {"topics": [_topic()]},
+        {"topics": [_topic(candidate_interest_keywords=interest_keywords)]},
         {"cards": [initial_card], "inference": {"request_count": 1}},
         output_dir=tmp_path / "knowledge",
         share_output_dir=tmp_path / "shares",
@@ -784,6 +794,8 @@ def test_supplement_workflow_keeps_dict_contract(
 
     assert result["supplemented_count"] == 1
     assert isinstance(result["cards"][0], dict)
+    assert result["cards"][0].get("candidate_interest_keywords", []) == list(interest_keywords)
+    assert result["cards"][0]["interest_share_score"] == (2.8 if interest_keywords else 0)
     assert result["cards"][0]["research_sources"] == [
         {"title": "补搜标题", "url": "https://example.com/post/2"}
     ]

@@ -1303,6 +1303,9 @@ def supplement_hotlist_knowledge_cards(
                 "previous_card": topic["previous_card"],
                 "timeline": topic["timeline"],
                 "hotlist_title_count": topic["hotlist_title_count"],
+                "candidate_interest_keywords": list(
+                    topic.get("candidate_interest_keywords") or []
+                ),
                 "evidence": topic["evidence"],
             }
         )

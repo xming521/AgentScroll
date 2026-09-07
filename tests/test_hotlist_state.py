@@ -70,6 +70,9 @@ def _card(**overrides: object) -> dict[str, object]:
         "chat_context": "聊到近期灾害时可以提起。",
         "latest_update": None,
         "share_score": 3.0,
+        "general_share_score": 2.5,
+        "interest_share_score": 3.0,
+        "hotlist_share_score": 0.0,
         "rejection_reason": "",
         "share": None,
         "research_sources": [],
@@ -108,12 +111,16 @@ def test_complete_update_replaces_current_card_and_appends_timeline(
                 chat_context="聊到灾情新数字时可以提起。",
                 latest_update="死亡人数升至974人，仍有4247人失联。",
                 share_score=4.0,
+                general_share_score=4.0,
+                interest_share_score=3.6,
+                hotlist_share_score=0.0,
             )
         ],
         at=datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
     )
 
     event = load_history(database)["events"][0]
+    assert (event["general_share_score"], event["interest_share_score"], event["hotlist_share_score"]) == (4.0, 3.6, 0.0)
     assert event["knowledge"] == "灾情数字已由903人更新为974人。"
     assert event["latest_update"] == "死亡人数升至974人，仍有4247人失联。"
     assert event["updates"] == [
@@ -126,6 +133,9 @@ def test_complete_update_replaces_current_card_and_appends_timeline(
             "knowledge": "灾情数字已由903人更新为974人。",
             "latest_update": "死亡人数升至974人，仍有4247人失联。",
             "share_score": 4.0,
+            "general_share_score": 4.0,
+            "interest_share_score": 3.6,
+            "hotlist_share_score": 0.0,
         }
     ]
     connection = connect_database(database)
@@ -166,6 +176,7 @@ def test_non_complete_update_keeps_current_card(tmp_path: Path) -> None:
     assert event["status"] == "complete"
     assert event["last_result_status"] == "needs_research"
     assert event["knowledge"] == "尼泊尔发生严重泥石流，已有人员伤亡和失联。"
+    assert (event["general_share_score"], event["interest_share_score"], event["hotlist_share_score"]) == (2.5, 3.0, 0.0)
     assert event["updates"] == []
 
 
@@ -567,3 +578,33 @@ def test_selected_save_records_share_and_used_source_titles(
     assert titles["最终分享文案"] == "share"
     assert titles["实际使用的来源标题"] == "evidence"
     assert "没有使用的来源标题" not in titles
+
+
+def test_v2_topic_scores_migrate_without_inventing_components(tmp_path: Path) -> None:
+    database = tmp_path / "agentscroll.sqlite3"
+    topic_id = _seed_topic(database)
+    connection = connect_database(database)
+    for name in ("general_share_score", "interest_share_score", "hotlist_share_score"):
+        connection.execute(f"ALTER TABLE hotlist_topics DROP COLUMN {name}")
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    connection.close()
+
+    for _ in range(2):
+        event = load_history(database)["events"][0]
+        assert event["event_id"] == topic_id
+        assert event["share_score"] == 3.0
+        assert event["general_share_score"] is None
+        assert event["interest_share_score"] is None
+        assert event["hotlist_share_score"] is None
+
+    record_final_batch(
+        database,
+        _update_selection(topic_id),
+        [_card(latest_update="新增进展", general_share_score=2.6, interest_share_score=3.7, share_score=3.7)],
+        at=datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
+    )
+    event = load_history(database)["events"][0]
+    assert event["general_share_score"] == 2.6
+    assert event["interest_share_score"] == 3.7
+    assert event["hotlist_share_score"] == 0.0
