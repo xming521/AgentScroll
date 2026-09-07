@@ -994,6 +994,9 @@ def _save_selected_cards(
                 "chat_context": card.chat_context,
                 "latest_update": card.latest_update,
                 "share_score": card.share_score,
+                "general_share_score": card.general_share_score,
+                "interest_share_score": card.interest_share_score,
+                "hotlist_share_score": card.hotlist_share_score,
                 "share": (
                     card.share.model_dump(mode="json")
                     if card.share is not None

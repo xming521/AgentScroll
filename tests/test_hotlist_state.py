@@ -549,6 +549,9 @@ def test_selected_save_records_share_and_used_source_titles(
         chat_context="聊天时可以提起。",
         latest_update=None,
         share_score=4,
+        general_share_score=2.8,
+        interest_share_score=3.6,
+        hotlist_share_score=4,
         share=KnowledgeShare(
             text="最终分享文案",
             source_id="e1",
@@ -570,6 +573,9 @@ def test_selected_save_records_share_and_used_source_titles(
         at=datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
         record_history=True,
     )
+
+    event = load_history(database)["events"][0]
+    assert (event["general_share_score"], event["interest_share_score"], event["hotlist_share_score"]) == (2.8, 3.6, 4.0)
 
     titles = {
         item["text"]: item["origin"]
