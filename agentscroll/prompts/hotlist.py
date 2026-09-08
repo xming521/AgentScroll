@@ -9,6 +9,7 @@ HOTLIST_FIRST_PASS_PROMPT = """
 
 - interest.keywords：兴趣关键词；可以是具体词、人物、产品或领域，空数组表示不启用兴趣偏好。每个关键词都是语义锚点。
 - interest.blocked_keywords：不喜欢的关键词；可以是具体词、人物、产品或领域，空数组表示不排除。
+- interest.soft_blocked_keywords：允许热度保底豁免的不喜欢的关键词，空数组表示不启用；语义判断方式与 blocked_keywords 相同。
 - candidates：当前热榜条目数组；source 是平台；history 为当前标题召回的可能相关历史标题数组。数组中 history_id 是历史事件的本轮临时编号，last_seen_date 是出现日期。
 
 candidates 中，文本相似的当前标题会尽量相邻，方便比较；相邻不代表属于同一事件。
@@ -16,6 +17,8 @@ candidates 中，文本相似的当前标题会尽量相邻，方便比较；相
 先按事件主体判断是否直接属于 interest.blocked_keywords 指定的内容。命中黑名单的话题直接丢弃，不选入，也不标记为看过。按标题语义判断，不要求出现关键词原文；仅顺带提及、同名或无法从标题明确判断时，不据此排除。黑名单优先于下文所有入选规则，兴趣命中、标题热度、大众价值或趣味均不能豁免。
 
 先查看全部候选，识别同一具体事件的标题组，再决定是否入选。一个事件在本轮候选中有至少 {force_share_title_count} 个标题（代表标题加 related_ids）时，按明确有热度优先入选采集；不要先按内容价值淘汰标题再统计数量，也不要为凑数合并不同事件。只统计当前候选，不计 history 中的标题。
+
+interest.soft_blocked_keywords 只用于标记语义命中，不参与模型的入选或丢弃判断。
 
 达到上述门槛的话题，不因普通日常、宣传、标题含义不明、依赖圈内背景或暂时看不出公共价值而在标题阶段淘汰；这些内容是否值得成卡和分享，交给正文阶段判断。下文内容价值限制适用于未达到热度门槛的话题。已确认没有新进展的历史事件仍放入 seen。最多选择 {max_topics} 个话题，热度达标话题优先，其余按内容价值和兴趣相关性选择。
 
@@ -59,11 +62,12 @@ topics：选中的话题数组，最多 {max_topics} 个；
 - related_ids：与代表条目明确属于同一事件的其他输入编号；没有时返回空数组；
 - label：该话题最主要的筛选类别，只能是 news、fun 之一；
 - candidate_interest_keywords：根据当前标题初步判断直接相关的兴趣关键词数组；只能原样返回 interest.keywords 中的值，没有时返回空数组；
+- soft_blocked：布尔值，事件主体直接属于 interest.soft_blocked_keywords 指定内容时为 true，否则为 false；配置为空时为 false。
 - relation：只能是 new 或 update；
 - history_id：update 对应的历史标题编号；relation=new 时返回 null。
 
 seen：确认是没有实质新进展的重复历史事件数组；
-- representative_id、related_ids、label、candidate_interest_keywords：含义与 topics 相同；
+- representative_id、related_ids、label、candidate_interest_keywords、soft_blocked：含义与 topics 相同；
 - history_id：对应的历史标题编号。
 
 topics 和 seen 没有内容时返回空数组。其中的每个对象都必须返回各自上面定义的全部字段。不得返回输入中不存在的编号，不得让同一个编号出现在多个话题中，也不要返回任何额外字段。

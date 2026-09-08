@@ -82,8 +82,9 @@ class InterestSettings(BaseModel):
 
     keywords: tuple[str, ...] = ()
     blocked_keywords: tuple[str, ...] = ()
+    soft_blocked_keywords: tuple[str, ...] = ()
 
-    @field_validator("keywords", "blocked_keywords", mode="before")
+    @field_validator("keywords", "blocked_keywords", "soft_blocked_keywords", mode="before")
     @classmethod
     def normalize_keywords(cls, value: Any, info: ValidationInfo) -> tuple[str, ...]:
         if value is None:

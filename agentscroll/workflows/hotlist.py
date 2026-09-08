@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agentscroll.prompts.hotlist import HOTLIST_FIRST_PASS_PROMPT
+from agentscroll.sharing.policy import hotlist_floor_score
 
 _FIRST_PASS_LABELS = {"news", "fun"}
 _FIRST_PASS_MAX_TOPICS = 15
@@ -28,6 +29,7 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "integer"},
                     },
                     "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
+                    "soft_blocked": {"type": "boolean"},
                     "candidate_interest_keywords": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -42,6 +44,7 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                     "related_ids",
                     "label",
                     "candidate_interest_keywords",
+                    "soft_blocked",
                     "relation",
                     "history_id",
                 ],
@@ -59,6 +62,7 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                         "items": {"type": "integer"},
                     },
                     "label": {"type": "string", "enum": sorted(_FIRST_PASS_LABELS)},
+                    "soft_blocked": {"type": "boolean"},
                     "candidate_interest_keywords": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -70,6 +74,7 @@ _HOTLIST_FIRST_PASS_SCHEMA: dict[str, Any] = {
                     "related_ids",
                     "label",
                     "candidate_interest_keywords",
+                    "soft_blocked",
                     "history_id",
                 ],
                 "additionalProperties": False,
@@ -86,6 +91,7 @@ def _first_pass_prompt(
     interest_keywords: tuple[str, ...],
     force_share_title_count: int,
     blocked_keywords: tuple[str, ...] = (),
+    soft_blocked_keywords: tuple[str, ...] = (),
 ) -> str:
     instruction = HOTLIST_FIRST_PASS_PROMPT.format(
         force_share_title_count=force_share_title_count,
@@ -96,6 +102,7 @@ def _first_pass_prompt(
             "interest": {
                 "keywords": list(interest_keywords),
                 "blocked_keywords": list(blocked_keywords),
+                "soft_blocked_keywords": list(soft_blocked_keywords),
             },
             "candidates": candidates,
         },
@@ -194,6 +201,7 @@ def select_hotlist_first_pass(
             interest_keywords,
             settings.hotlist.force_share_title_count,
             blocked_keywords=settings.interest.blocked_keywords,
+            soft_blocked_keywords=settings.interest.soft_blocked_keywords,
         ),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
@@ -224,6 +232,7 @@ def select_hotlist_first_pass(
         candidate["id"]: candidate for candidate in candidate_payloads
     }
     configured_interest_keywords = set(interest_keywords)
+    soft_blocked_ids: set[int] = set()
     selected_ids: set[int] = set()
     matched_event_ids: set[str] = set()
     topics: list[dict[str, Any]] = []
@@ -278,6 +287,13 @@ def select_hotlist_first_pass(
                 "模型返回了无效的 candidate_interest_keywords："
                 f"{candidate_interest_keywords!r}"
             )
+        soft_blocked = raw_topic.get(
+            "soft_blocked", False if not settings.interest.soft_blocked_keywords else None
+        )
+        if not isinstance(soft_blocked, bool):
+            raise ValueError(f"模型返回了无效的 soft_blocked：{soft_blocked!r}")
+        if settings.interest.soft_blocked_keywords and soft_blocked:
+            soft_blocked_ids.add(representative_id)
         selected_ids.update(topic_ids)
         return (
             representative_id,
@@ -465,6 +481,18 @@ def select_hotlist_first_pass(
                 matched=matched,
             )
         )
+
+    topics = [
+        topic for topic in topics
+        if topic["representative_id"] not in soft_blocked_ids
+        or (
+            topic["event_relation"] == "new"
+            and hotlist_floor_score(
+                1 + len(topic["related_ids"]),
+                settings.hotlist.force_share_title_count,
+            ) > 0
+        )
+    ]
 
     record_first_pass(
         state_path,

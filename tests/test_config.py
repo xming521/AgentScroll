@@ -5,14 +5,14 @@ import pytest
 from agentscroll.config import HotlistSettings, InterestSettings, SharePolicySettings
 
 
-@pytest.mark.parametrize("field", ["keywords", "blocked_keywords"])
+@pytest.mark.parametrize("field", ["keywords", "blocked_keywords", "soft_blocked_keywords"])
 def test_interest_keywords_are_trimmed_and_normalized_for_deduplication(field: str) -> None:
     settings = InterestSettings.model_validate({field: ["  MCP  ", "ｍｃｐ", "机器人"]})
 
     assert getattr(settings, field) == ("MCP", "机器人")
 
 
-@pytest.mark.parametrize("field", ["keywords", "blocked_keywords"])
+@pytest.mark.parametrize("field", ["keywords", "blocked_keywords", "soft_blocked_keywords"])
 @pytest.mark.parametrize("value", ["MCP", [1], [" "]])
 def test_interest_keywords_reject_invalid_values(field: str, value: object) -> None:
     with pytest.raises(ValueError, match=f"interest.{field}"):
@@ -22,6 +22,7 @@ def test_interest_keywords_reject_invalid_values(field: str, value: object) -> N
 def test_blocked_keywords_default_to_empty_without_changing_interests() -> None:
     settings = InterestSettings(keywords=["AI"])
     assert settings.blocked_keywords == ()
+    assert settings.soft_blocked_keywords == ()
     assert settings.keywords == ("AI",)
 
 
