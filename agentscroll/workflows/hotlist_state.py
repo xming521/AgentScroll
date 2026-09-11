@@ -449,7 +449,7 @@ def match_new_topics_from_evidence(
     *,
     at: datetime,
 ) -> dict[int, dict[str, Any]]:
-    """Find high-confidence history matches using already collected evidence."""
+    """Find history matches and ambiguous candidates from collected evidence."""
     event_documents: list[dict[str, Any]] = []
     for event in history.get("events") or []:
         if (
@@ -558,7 +558,6 @@ def match_new_topics_from_evidence(
             or best["term_count"] < _EVIDENCE_MATCH_MIN_TERM_COUNT
             or best["weighted_term_count"]
             < _EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT
-            or margin < _EVIDENCE_MATCH_MIN_MARGIN
         ):
             continue
         matches[topic_id] = {
@@ -566,6 +565,12 @@ def match_new_topics_from_evidence(
             "coverage": round(best["coverage"], 3),
             "runner_up_coverage": round(runner_up_coverage, 3),
             "margin": round(margin, 3),
+            "candidates": [
+                dict(item) for item in ranked[:MATCHES_PER_TITLE]
+                if best["coverage"] - item["coverage"] < _EVIDENCE_MATCH_MIN_MARGIN
+                and item["term_count"] >= _EVIDENCE_MATCH_MIN_TERM_COUNT
+                and item["weighted_term_count"] >= _EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT
+            ] if margin < _EVIDENCE_MATCH_MIN_MARGIN else [],
         }
     return matches
 

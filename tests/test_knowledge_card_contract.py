@@ -109,6 +109,98 @@ def test_card_prompt_uses_workflow_limits(
 
 
 @pytest.mark.parametrize("research", [False, True])
+@pytest.mark.parametrize("label", ["news", "fun"])
+@pytest.mark.parametrize("interest_score,title_count,expected_score", [
+    (2.5, 1, 2.5), (3.6, 1, 3.6), (0, 3, 4),
+])
+def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
+    tmp_path, monkeypatch, research, label, interest_score, title_count, expected_score,
+) -> None:
+    from agentscroll import config
+    from agentscroll.workflows import knowledge_card as workflow
+
+    settings = SimpleNamespace(
+        sharing=SimpleNamespace(policy=SharePolicySettings()),
+        interest=config.InterestSettings(keywords=["AI"]),
+        hotlist=config.HotlistSettings(builtin_content_enabled=False),
+        max_workers=10,
+    )
+    topic = _topic(candidate_interest_keywords=("AI",) if interest_score else ())
+    topic.update(label=label, hotlist_title_count=title_count)
+    raw = _raw_card(general_share_score=0, interest_share_score=interest_score)
+    if expected_score < 3:
+        raw["share"] = None
+    if research:
+        raw["research_sources"] = ["r1"]
+
+    class Client:
+        def generate_batch(self, requests):
+            assert len(requests) == 1
+            prompt = requests[0].prompt
+            assert "本轮关闭内置 news/fun 的大众分享评分" in prompt
+            payload = json.loads(prompt.rsplit("\n", 1)[-1])
+            if interest_score:
+                assert payload["interest"]["candidate_keywords"] == ["AI"]
+            (tmp_path / "card-prompt.txt").write_text(prompt, encoding="utf-8")
+            return [SimpleNamespace(
+                ok=True, parsed_json={"cards": [raw]}, provider="fake",
+                model="fake", metadata={},
+            )]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(config, "build_configured_client", lambda _: Client())
+    monkeypatch.setattr(
+        config, "make_configured_request",
+        lambda prompt, _settings, **kwargs: SimpleNamespace(prompt=prompt, **kwargs),
+    )
+    cards, inference = workflow._generate_topic_cards(
+        [topic], settings=settings, research=research,
+        max_tokens=4000, timeout=60, effort="low",
+    )
+    card = cards[0]
+    assert card.status == "complete"
+    assert card.general_share_score == 0
+    assert card.interest_share_score == interest_score
+    assert card.share_score == expected_score
+    assert (card.share is not None) == (expected_score >= 3)
+
+    database = tmp_path / "state.sqlite3"
+    files = workflow._save_selected_cards(
+        cards, evidence={"topics": [topic]},
+        selection={"database_path": str(database), "topics": [{
+            "representative_id": 1, "representative": {"title": topic["title"]},
+            "related": [], "label": label, "event_relation": "new",
+        }]},
+        inference=inference, output_dir=tmp_path / "knowledge",
+        share_output_dir=tmp_path / "shares",
+        at=datetime(2026, 9, 10, tzinfo=timezone.utc), record_history=True,
+    )
+    event = load_history(database)["events"][0]
+    assert event["general_share_score"] == 0
+    assert event["interest_share_score"] == interest_score
+    assert event["share_score"] == expected_score
+    shares = json.loads(Path(files["share_review_file"]).read_text())["shares"]
+    assert len(shares) == int(expected_score >= 3)
+    if shares:
+        assert shares[0]["general_score"] == 0
+        assert shares[0]["score"] == expected_score
+
+
+@pytest.mark.parametrize("research", [False, True])
+def test_disabled_builtin_content_rejects_nonzero_general_score(research) -> None:
+    topic = _topic(candidate_interest_keywords=("AI",))
+    topic["builtin_content_enabled"] = False
+    raw = _raw_card(general_share_score=4, interest_share_score=3.6)
+    if research:
+        raw["research_sources"] = []
+    validator = validate_research_cards if research else validate_cards
+    with pytest.raises(ValueError, match="general_share_score 必须为 0"):
+        validator([raw], [topic])
+
+
+@pytest.mark.parametrize("research", [False, True])
 @pytest.mark.parametrize("mode,min_score", [("window", 3.3), ("score_only", 3.7)])
 @pytest.mark.parametrize("score,floor", [(3.1, 0), (3.3, 0), (3.7, 0), (2.8, 3), (2.8, 4)])
 def test_generation_uses_active_policy_min_score(
@@ -800,3 +892,35 @@ def test_supplement_workflow_keeps_dict_contract(
         {"title": "补搜标题", "url": "https://example.com/post/2"}
     ]
     assert Path(result["batch_json_file"]).is_file()
+
+
+@pytest.mark.parametrize("research", [False, True])
+@pytest.mark.parametrize("converted", ["", "😭😭😭官方涨 结果渠道商自己撑不住了🐶🐶"])
+def test_platform_comment_conversion_reaches_message(research: bool, converted: str) -> None:
+    from agentscroll.sharing.message import render_share_messages
+
+    original = "[泪奔][泪奔][泪奔]官方涨 结果渠道商自己撑不住了[doge][doge]"
+    topic = _topic()
+    source = topic["research_evidence" if research else "evidence"][0]
+    source["comments"] = [{"comment_id": "r1c1" if research else "e1c1", "text": original}]
+    raw = _raw_card()
+    raw["share"].update(comment_id=source["comments"][0]["comment_id"], converted_comment=converted)
+    if research:
+        raw["research_sources"] = ["r1"]
+    validate = validate_research_cards if research else validate_cards
+    card = validate([raw], [topic])[0]
+    share = card.to_dict()["share"]
+    assert share["comment_type"] == "platform"
+    assert share["comment_id"] == source["comments"][0]["comment_id"]
+    assert render_share_messages(share)[1] == (converted or original)
+    assert source["comments"][0]["text"] == original
+
+
+def test_converted_comment_requires_valid_comment_id() -> None:
+    raw = _raw_card()
+    raw["share"].update(comment_id="missing", converted_comment="😭")
+    with pytest.raises(ValueError, match="未知 comment_id"):
+        validate_cards([raw], [_topic()])
+    raw["share"].update(comment_id="", generated_comment="😭")
+    with pytest.raises(ValueError, match="converted_comment 必须对应真实评论"):
+        validate_cards([raw], [_topic()])

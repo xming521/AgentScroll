@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from agentscroll.prompts.knowledge_card import (
+    KNOWLEDGE_CARD_HISTORY_MATCH_PROMPT,
+    KNOWLEDGE_CARD_BUILTIN_CONTENT_DISABLED_PROMPT,
     KNOWLEDGE_CARD_LABEL_PROMPTS,
     KNOWLEDGE_CARD_INTEREST_PROMPT,
     KNOWLEDGE_CARD_PROMPT,
@@ -469,6 +471,8 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
     if payload["relation"] == "update":
         payload["previous_card"] = dict(topic.get("previous_card") or {})
         payload["timeline"] = list(topic.get("timeline") or [])
+    if topic.get("related_history"):
+        payload["related_history"] = topic["related_history"]
     if research:
         payload["research_evidence"] = compact_items(
             topic.get("research_evidence")
@@ -485,9 +489,12 @@ def _share_generation_prompt(topic: Mapping[str, Any]) -> str:
             min_score=f"{topic.get('share_min_score', 3):g}"
         )
     )
-    return KNOWLEDGE_CARD_SHARE_POLICY_PROMPT.format(
+    prompt = KNOWLEDGE_CARD_SHARE_POLICY_PROMPT.format(
         score_condition=score_condition
     ).strip()
+    if not topic.get("builtin_content_enabled", True):
+        prompt += "\n\n" + KNOWLEDGE_CARD_BUILTIN_CONTENT_DISABLED_PROMPT.strip()
+    return prompt
 
 
 def _knowledge_card_prompt(topic: Mapping[str, Any]) -> str:
@@ -571,6 +578,7 @@ def _validated_interest_topics(
     validated: list[dict[str, Any]] = []
     for raw_topic in topics:
         topic = dict(raw_topic)
+        topic["builtin_content_enabled"] = getattr(hotlist, "builtin_content_enabled", True)
         candidate_keywords = list(
             topic.get("candidate_interest_keywords") or []
         )
@@ -711,14 +719,85 @@ def _generate_topic_cards(
     return [cards_by_id[topic["topic_id"]] for topic in topics], inference
 
 
-def _recheck_immediate_history_matches(
+def _resolve_ambiguous_history_matches(
+    matches: dict[int, dict[str, Any]],
+    cards_by_id: Mapping[int, KnowledgeCard],
+    history: Mapping[str, Any],
+    *,
+    settings: Any,
+    effort: str,
+) -> tuple[dict[int, dict[str, Any]], list[int], dict[str, Any]]:
+    from agentscroll.config import build_configured_client, make_configured_request
+
+    ambiguous = {key: match for key, match in matches.items() if match.get("candidates")}
+    if not ambiguous:
+        return matches, [], {}
+    events = {event["event_id"]: event for event in history["events"]}
+    requests = []
+    for topic_id, match in ambiguous.items():
+        card = cards_by_id[topic_id]
+        payload = {
+            "current": {
+                "title": match.get("current_title", ""),
+                "knowledge": card.knowledge,
+                "share_text": card.share.text,
+            },
+            "history": [
+                {key: events[item["event_id"]].get(key) for key in
+                 ("event_id", "title", "knowledge", "latest_update")}
+                for item in match["candidates"]
+            ],
+        }
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"event_ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": [item["event_id"] for item in match["candidates"]]},
+            }},
+            "required": ["event_ids"],
+        }
+        requests.append(make_configured_request(
+            KNOWLEDGE_CARD_HISTORY_MATCH_PROMPT.strip() + "\n\n" + json.dumps(payload, ensure_ascii=False),
+            settings, json_schema=schema, max_tokens=8_000, timeout=900, effort=effort,
+        ))
+    client = build_configured_client(settings)
+    try:
+        responses = client.generate_batch(requests)
+    finally:
+        client.close()
+    if len(responses) != len(requests):
+        raise RuntimeError("历史事件复核返回数量异常")
+    resolved = dict(matches)
+    failures = []
+    decisions = []
+    for (topic_id, match), response in zip(ambiguous.items(), responses, strict=True):
+        allowed = {item["event_id"] for item in match["candidates"]}
+        ids = response.parsed_json.get("event_ids") if isinstance(response.parsed_json, Mapping) else None
+        if (not response.ok or not isinstance(ids, list)
+                or any(not isinstance(value, str) or value not in allowed for value in ids)
+                or len(ids) != len(set(ids))):
+            failures.append(topic_id)
+            resolved.pop(topic_id)
+            continue
+        selected = [item for item in match["candidates"] if item["event_id"] in ids]
+        decisions.append({"topic_id": topic_id, "event_ids": [item["event_id"] for item in selected]})
+        if selected:
+            resolved[topic_id] = {**match, **selected[0], "related_event_ids": [item["event_id"] for item in selected[1:]]}
+        else:
+            resolved.pop(topic_id)
+    return resolved, failures, {
+        "request_count": len(requests), "usage": _sum_response_usage(responses),
+        "decisions": decisions, "failed_topic_ids": failures,
+    }
+
+
+def _recheck_share_history_matches(
     cards: list[KnowledgeCard],
     *,
     evidence: Mapping[str, Any],
     selection: Mapping[str, Any],
     settings: Any,
     at: datetime,
-    immediate_score: float,
     effort: str,
 ) -> tuple[
     list[KnowledgeCard],
@@ -726,7 +805,7 @@ def _recheck_immediate_history_matches(
     dict[str, Any],
     dict[str, Any],
 ]:
-    """Re-evaluate provisional immediate shares that match recent history."""
+    """Re-evaluate provisional new shares that match recent history."""
     from .hotlist_state import load_history, match_new_topics_from_evidence
 
     def attach_research_evidence(
@@ -756,7 +835,6 @@ def _recheck_immediate_history_matches(
         and (card := cards_by_id.get(topic["topic_id"])) is not None
         and card.status == "complete"
         and card.share is not None
-        and max(card.general_share_score, card.hotlist_share_score) >= immediate_score
     ]
     if not triggered_topics:
         return cards, dict(evidence), dict(selection), {}
@@ -770,8 +848,19 @@ def _recheck_immediate_history_matches(
         history,
         at=at,
     )
+    for topic in triggered_topics:
+        if topic["topic_id"] in matches:
+            matches[topic["topic_id"]]["current_title"] = topic["title"]
+    matches, failed_ids, resolution = _resolve_ambiguous_history_matches(
+        matches, cards_by_id, history, settings=settings, effort=effort,
+    )
+    if failed_ids:
+        failed_topics = {topic["topic_id"]: topic for topic in triggered_topics}
+        cards = [
+            _needs_research_card(failed_topics[card.topic_id], research=True)
+            if card.topic_id in failed_ids else card for card in cards
+        ]
     diagnostics: dict[str, Any] = {
-        "immediate_score": immediate_score,
         "triggered_topic_count": len(triggered_topics),
         "history_match_count": len(matches),
         "matches": [
@@ -781,6 +870,10 @@ def _recheck_immediate_history_matches(
         "request_count": 0,
         "usage": {},
     }
+    if resolution:
+        diagnostics["history_resolution"] = resolution
+        diagnostics["request_count"] = resolution["request_count"]
+        diagnostics["usage"] = dict(resolution["usage"])
     if not matches:
         return cards, dict(evidence), dict(selection), diagnostics
 
@@ -814,6 +907,12 @@ def _recheck_immediate_history_matches(
             revised_evidence,
         )
     }
+    events_by_id = {event["event_id"]: event for event in history["events"]}
+    for topic_id, match in matches.items():
+        revised_topics_by_id[topic_id]["related_history"] = [
+            {key: events_by_id[event_id].get(key) for key in ("title", "knowledge", "latest_update")}
+            for event_id in match.get("related_event_ids", [])
+        ]
     recheck_topics = [
         revised_topics_by_id[topic_id] for topic_id in matches
     ]
@@ -827,6 +926,11 @@ def _recheck_immediate_history_matches(
     )
     rechecked_by_id = {card.topic_id: card for card in rechecked_cards}
     diagnostics.update(recheck_inference)
+    if resolution:
+        diagnostics["request_count"] += resolution["request_count"]
+        diagnostics["usage"] = dict(diagnostics["usage"])
+        for key, value in resolution["usage"].items():
+            diagnostics["usage"][key] = diagnostics["usage"].get(key, 0) + value
     return (
         [rechecked_by_id.get(card.topic_id, card) for card in cards],
         revised_evidence,
@@ -1221,24 +1325,18 @@ def generate_selected_hotlist_knowledge_cards(
     from agentscroll.config import load_settings
 
     settings = load_settings(config_path)
-    immediate_score = (
-        settings.sharing.policy.delivery.immediate_score
-        if settings.sharing.enabled
-        else None
-    )
-    if immediate_score is not None:
+    if settings.sharing.enabled:
         (
             rechecked_cards,
             saving_evidence,
             enriched_selection,
             recheck_inference,
-        ) = _recheck_immediate_history_matches(
+        ) = _recheck_share_history_matches(
             final_result["cards"],
             evidence=saving_evidence,
             selection=enriched_selection,
             settings=settings,
             at=reference_time(hotlist),
-            immediate_score=immediate_score,
             effort=supplement_effort,
         )
         if recheck_inference:
@@ -1254,7 +1352,7 @@ def generate_selected_hotlist_knowledge_cards(
                 card.status == "rejected" for card in rechecked_cards
             )
             inference = dict(final_result.get("inference") or {})
-            inference["immediate_history_recheck"] = recheck_inference
+            inference["share_history_recheck"] = recheck_inference
             final_result["inference"] = inference
     files = _save_selected_cards(
         final_result["cards"],

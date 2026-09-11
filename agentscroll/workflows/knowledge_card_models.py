@@ -89,12 +89,14 @@ class ShareDraft(BaseModel):
     source_id: Text40
     comment_id: Text60
     generated_comment: Text80
+    converted_comment: str
 
     @field_validator(
         "text",
         "source_id",
         "comment_id",
         "generated_comment",
+        "converted_comment",
         mode="before",
     )
     @classmethod
@@ -326,6 +328,7 @@ def _share_draft(raw_share: Any) -> ShareDraft | None:
             "source_id": raw_share.get("source_id"),
             "comment_id": raw_share.get("comment_id"),
             "generated_comment": generated_comment,
+            "converted_comment": raw_share.get("converted_comment"),
         }
     )
 
@@ -389,6 +392,9 @@ def _validate_share(
     if bool(share.comment_id) == bool(share.generated_comment):
         raise ValueError(f"可分享话题 {topic_id} 必须且只能选择真实评论或自拟评论之一")
 
+    if share.converted_comment and not share.comment_id:
+        raise ValueError(f"话题 {topic_id} 的 converted_comment 必须对应真实评论")
+
     source = next(
         (
             item
@@ -419,6 +425,7 @@ def _validate_share(
             raise ValueError(
                 f"话题 {topic_id} 返回了未知 comment_id：{share.comment_id!r}"
             )
+        comment = share.converted_comment or comment
         comment_type = "platform"
     else:
         comment = share.generated_comment
@@ -528,6 +535,8 @@ def _validate_draft(
         field="general_share_score",
         maximum=4,
     )
+    if not topic.get("builtin_content_enabled", True) and general_share_score != 0:
+        raise ValueError(f"话题 {topic_id} 已关闭内置内容，general_share_score 必须为 0")
     interest_share_score = _validated_score(
         draft.interest_share_score,
         topic_id=topic_id,

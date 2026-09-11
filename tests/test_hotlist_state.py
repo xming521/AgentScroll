@@ -22,7 +22,7 @@ from agentscroll.workflows.knowledge_card_models import KnowledgeCard, Knowledge
 from agentscroll.workflows.knowledge_card import (
     _model_topic_payload,
     _prompt_payload,
-    _recheck_immediate_history_matches,
+    _recheck_share_history_matches,
     _save_selected_cards,
     _selection_with_update_contexts,
 )
@@ -340,14 +340,29 @@ def test_evidence_match_recalls_history_missing_from_hotlist_title() -> None:
     assert matches[10]["coverage"] >= 0.65
 
 
-@pytest.mark.parametrize("hotlist_score", [0, 4])
-def test_immediate_new_card_is_rerun_once_as_update(
+@pytest.mark.parametrize("duplicate_history", [False, True])
+@pytest.mark.parametrize("hotlist_score,interest_score", [(0, 0), (4, 0), (0, 3.8)])
+def test_new_share_is_rerun_once_as_update(
     tmp_path: Path,
     monkeypatch,
     hotlist_score: int,
+    interest_score: float,
+    duplicate_history: bool,
 ) -> None:
     database = tmp_path / "agentscroll.sqlite3"
     event_id = _seed_topic(database)
+    if duplicate_history:
+        history = load_history(database)
+        original = next(event for event in history["events"] if event["event_id"] == event_id)
+        history["events"].append({**original, "event_id": "duplicate", "knowledge": "其他历史已经报道救援机械到场。"})
+        monkeypatch.setattr("agentscroll.workflows.hotlist_state.load_history", lambda _: history)
+        monkeypatch.setattr("agentscroll.workflows.hotlist_state.match_new_topics_from_evidence", lambda *args, **kwargs: {
+            1: {"event_id": event_id, "candidates": [{"event_id": event_id}, {"event_id": "duplicate"}]}
+        })
+        monkeypatch.setattr("agentscroll.workflows.knowledge_card._resolve_ambiguous_history_matches", lambda *args, **kwargs: (
+            {1: {"event_id": event_id, "related_event_ids": ["duplicate"]}}, [],
+            {"request_count": 1, "usage": {"input_tokens": 20}},
+        ))
     selection = {
         "database_path": str(database),
         "topics": [
@@ -398,8 +413,9 @@ def test_immediate_new_card_is_rerun_once_as_update(
         knowledge="尼泊尔泥石流救援仍在继续。",
         chat_context="可以聊现场救援。",
         latest_update=None,
-        share_score=4,
-        general_share_score=2.8 if hotlist_score else 4,
+        share_score=interest_score or 4,
+        general_share_score=0 if interest_score else (2.8 if hotlist_score else 4),
+        interest_share_score=interest_score,
         hotlist_share_score=hotlist_score,
         share=KnowledgeShare(
             text="尼泊尔泥石流救援现场",
@@ -434,13 +450,12 @@ def test_immediate_new_card_is_rerun_once_as_update(
         fake_generate,
     )
     cards, revised_evidence, revised_selection, diagnostics = (
-        _recheck_immediate_history_matches(
+        _recheck_share_history_matches(
             [provisional],
             evidence=evidence,
             selection=selection,
             settings=SimpleNamespace(max_workers=1),
             at=datetime(2026, 9, 1, 4, 0, tzinfo=timezone.utc),
-            immediate_score=4.0,
             effort="xhigh",
         )
     )
@@ -457,10 +472,13 @@ def test_immediate_new_card_is_rerun_once_as_update(
     assert revised_evidence["topics"][0]["event_relation"] == "update"
     assert revised_selection["topics"][0]["matched_event_id"] == event_id
     assert diagnostics["history_match_count"] == 1
-    assert diagnostics["request_count"] == 1
+    assert diagnostics["request_count"] == (2 if duplicate_history else 1)
+    if duplicate_history:
+        assert _model_topic_payload(rerun_topic, research=True)["related_history"][0]["knowledge"] == "其他历史已经报道救援机械到场。"
+        assert diagnostics["usage"]["input_tokens"] == 120
 
 
-def test_interest_only_score_does_not_trigger_immediate_history_recheck() -> None:
+def test_interest_only_score_triggers_share_history_recheck() -> None:
     card = KnowledgeCard(
         status="complete",
         rejection_reason="",
@@ -495,19 +513,19 @@ def test_interest_only_score_does_not_trigger_immediate_history_recheck() -> Non
     }
 
     cards, _evidence, _selection, diagnostics = (
-        _recheck_immediate_history_matches(
+        _recheck_share_history_matches(
             [card],
             evidence=evidence,
             selection={"topics": []},
             settings=SimpleNamespace(),
             at=datetime(2026, 9, 2, 8, 0, tzinfo=timezone.utc),
-            immediate_score=3.5,
             effort="xhigh",
         )
     )
 
     assert cards == [card]
-    assert diagnostics == {}
+    assert diagnostics["triggered_topic_count"] == 1
+    assert diagnostics["history_match_count"] == 0
 
 
 def test_selected_save_records_share_and_used_source_titles(
@@ -614,3 +632,48 @@ def test_v2_topic_scores_migrate_without_inventing_components(tmp_path: Path) ->
     assert event["general_share_score"] == 2.6
     assert event["interest_share_score"] == 3.7
     assert event["hotlist_share_score"] == 0.0
+
+
+def test_close_history_candidates_are_returned_for_semantic_resolution() -> None:
+    text = "尼泊尔山洪泥石流波及西藏吉隆口岸，失联人员深埋巨石和淤泥，陆上通道仍在抢通。"
+    events = [{
+        "event_id": event_id, "label": "news", "status": "complete",
+        "title": text, "knowledge": text, "latest_update": None,
+        "titles": [{"text": text, "last_seen_at": "2026-09-01T12:00:00+00:00"}],
+    } for event_id in ("a", "b")]
+    matches = match_new_topics_from_evidence([{
+        "topic_id": 1, "title": text, "label": "news", "event_relation": "new",
+        "evidence": [{"content": text}],
+    }], {"events": events}, at=datetime(2026, 9, 1, 13, tzinfo=timezone.utc))
+    assert matches[1]["margin"] == 0
+    assert [item["event_id"] for item in matches[1]["candidates"]] == ["a", "b"]
+
+
+@pytest.mark.parametrize("ids,ok,expected,failed", [
+    (["a", "b"], True, "a", []),
+    (["b"], True, "b", []),
+    ([], True, None, []),
+    (["unknown"], True, None, [1]),
+    (None, False, None, [1]),
+])
+def test_ambiguous_history_resolution(monkeypatch, ids, ok, expected, failed) -> None:
+    from agentscroll.workflows.knowledge_card import _resolve_ambiguous_history_matches
+    captured = []
+    class Client:
+        def generate_batch(self, requests):
+            captured.extend(requests)
+            return [SimpleNamespace(ok=ok, parsed_json={"event_ids": ids}, metadata={"usage": {"input_tokens": 10}})]
+        def close(self):
+            pass
+    monkeypatch.setattr("agentscroll.config.build_configured_client", lambda _: Client())
+    monkeypatch.setattr("agentscroll.config.make_configured_request", lambda prompt, settings, **kwargs: prompt)
+    matches = {1: {"event_id": "a", "candidates": [{"event_id": "a"}, {"event_id": "b"}]}}
+    cards = {1: SimpleNamespace(knowledge="当前知识", share=SimpleNamespace(text="当前分享"))}
+    history = {"events": [{"event_id": value, "title": value, "knowledge": "历史知识"} for value in ("a", "b")]}
+    resolved, failures, diagnostics = _resolve_ambiguous_history_matches(matches, cards, history, settings=None, effort="low")
+    assert failures == failed
+    assert (resolved.get(1) or {}).get("event_id") == expected
+    if ids == ["a", "b"]:
+        assert resolved[1]["related_event_ids"] == ["b"]
+    assert "当前分享" in captured[0] and "历史知识" in captured[0]
+    assert diagnostics["usage"]["input_tokens"] == 10

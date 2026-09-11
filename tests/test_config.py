@@ -31,6 +31,13 @@ def test_force_share_title_count_must_be_positive() -> None:
         HotlistSettings(force_share_title_count=0)
 
 
+def test_builtin_content_switch_defaults_on_and_can_be_disabled() -> None:
+    assert HotlistSettings().builtin_content_enabled is True
+    settings = HotlistSettings.model_validate({"builtin_content_enabled": False})
+    assert settings.builtin_content_enabled is False
+    assert settings.force_share_title_count == 3
+
+
 @pytest.mark.parametrize("mode", ["window", "score_only"])
 def test_immediate_threshold_cannot_be_below_active_minimum(mode: str) -> None:
     with pytest.raises(ValueError, match=f"policy.{mode}.min_score"):

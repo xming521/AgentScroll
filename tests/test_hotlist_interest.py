@@ -8,6 +8,7 @@ import pytest
 
 
 @pytest.mark.parametrize("include_empty_fields", [True, False])
+@pytest.mark.parametrize("builtin_content_enabled", [True, False])
 @pytest.mark.parametrize("title_threshold", [1, 3, 5])
 @pytest.mark.parametrize("soft_blocked_keywords", [(), ("社会负面", "民生纠纷")])
 @pytest.mark.parametrize("blocked_keywords", [(), ("体育赛事", "电竞赛事", "赛车")])
@@ -15,6 +16,7 @@ def test_first_pass_propagates_semantic_interest_keywords(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     include_empty_fields: bool,
+    builtin_content_enabled: bool,
     title_threshold: int,
     blocked_keywords: tuple[str, ...],
     soft_blocked_keywords: tuple[str, ...],
@@ -79,7 +81,10 @@ def test_first_pass_propagates_semantic_interest_keywords(
             keywords=("MCP", "机器人"), blocked_keywords=blocked_keywords,
             soft_blocked_keywords=soft_blocked_keywords,
         ),
-        hotlist=config.HotlistSettings(force_share_title_count=title_threshold),
+        hotlist=config.HotlistSettings(
+            force_share_title_count=title_threshold,
+            builtin_content_enabled=builtin_content_enabled,
+        ),
     )
     monkeypatch.setattr(config, "load_settings", lambda _path=None: settings)
     monkeypatch.setattr(config, "make_configured_request", make_request)
@@ -100,7 +105,11 @@ def test_first_pass_propagates_semantic_interest_keywords(
     )
 
     assert result["topics"][0]["candidate_interest_keywords"] == ["MCP"]
-    assert "candidate_interest_keywords" not in result["topics"][1]
+    expected_ids = [1, 2] if builtin_content_enabled or title_threshold == 1 else [1]
+    assert [topic["representative_id"] for topic in result["topics"]] == expected_ids
+    if len(result["topics"]) == 2:
+        assert "candidate_interest_keywords" not in result["topics"][1]
+    assert ("本轮关闭内置 news/fun 通用推荐" in requests[0].prompt) is not builtin_content_enabled
     assert result["seen_topics"] == []
     assert "exact_interest_keywords" not in result["topics"][0]
     payload = json.loads(requests[0].prompt.rsplit("\n", 1)[-1])

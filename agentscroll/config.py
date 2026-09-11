@@ -110,6 +110,7 @@ class InterestSettings(BaseModel):
 class HotlistSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    builtin_content_enabled: bool = True
     force_share_title_count: int = Field(default=3, ge=1)
 
 

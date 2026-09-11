@@ -45,6 +45,8 @@
   },
 
   "hotlist": {
+    // 关闭后仅按兴趣或原有热度规则入选，大众分享分为 0。
+    "builtin_content_enabled": true,
     // 标题数达标优先入选采集，并设定新事件热度保底的 4 分档门槛；较低档见 docs/design.md。
     "force_share_title_count": 3
   },

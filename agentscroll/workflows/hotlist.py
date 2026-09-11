@@ -8,7 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agentscroll.prompts.hotlist import HOTLIST_FIRST_PASS_PROMPT
+from agentscroll.prompts.hotlist import (
+    HOTLIST_BUILTIN_CONTENT_DISABLED_PROMPT,
+    HOTLIST_FIRST_PASS_PROMPT,
+)
 from agentscroll.sharing.policy import hotlist_floor_score
 
 _FIRST_PASS_LABELS = {"news", "fun"}
@@ -92,11 +95,14 @@ def _first_pass_prompt(
     force_share_title_count: int,
     blocked_keywords: tuple[str, ...] = (),
     soft_blocked_keywords: tuple[str, ...] = (),
+    builtin_content_enabled: bool = True,
 ) -> str:
     instruction = HOTLIST_FIRST_PASS_PROMPT.format(
         force_share_title_count=force_share_title_count,
         max_topics=_FIRST_PASS_MAX_TOPICS,
     ).strip()
+    if not builtin_content_enabled:
+        instruction += "\n\n" + HOTLIST_BUILTIN_CONTENT_DISABLED_PROMPT.strip()
     payload = json.dumps(
         {
             "interest": {
@@ -202,6 +208,7 @@ def select_hotlist_first_pass(
             settings.hotlist.force_share_title_count,
             blocked_keywords=settings.interest.blocked_keywords,
             soft_blocked_keywords=settings.interest.soft_blocked_keywords,
+            builtin_content_enabled=settings.hotlist.builtin_content_enabled,
         ),
         settings,
         json_schema=_HOTLIST_FIRST_PASS_SCHEMA,
@@ -481,6 +488,15 @@ def select_hotlist_first_pass(
                 matched=matched,
             )
         )
+
+    if not settings.hotlist.builtin_content_enabled:
+        def allowed_topic(topic: Mapping[str, Any]) -> bool:
+            return bool(topic.get("candidate_interest_keywords")) or (
+                1 + len(topic["related_ids"]) >= settings.hotlist.force_share_title_count
+            )
+
+        topics = [topic for topic in topics if allowed_topic(topic)]
+        seen_topics = [topic for topic in seen_topics if allowed_topic(topic)]
 
     topics = [
         topic for topic in topics
