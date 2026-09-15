@@ -110,6 +110,10 @@ def test_first_pass_propagates_semantic_interest_keywords(
     if len(result["topics"]) == 2:
         assert "candidate_interest_keywords" not in result["topics"][1]
     assert ("本轮关闭内置 news/fun 通用推荐" in requests[0].prompt) is not builtin_content_enabled
+    assert ("重大 news 和高趣味 fun 不需要与兴趣关键词相关" in requests[0].prompt) is builtin_content_enabled
+    assert ("笑点应让不了解相关游戏" in requests[0].prompt) is builtin_content_enabled
+    assert "{recommendation_rules}" not in requests[0].prompt
+    assert "{news_definition}" not in requests[0].prompt
     assert result["seen_topics"] == []
     assert "exact_interest_keywords" not in result["topics"][0]
     payload = json.loads(requests[0].prompt.rsplit("\n", 1)[-1])

@@ -13,8 +13,11 @@ from typing import Any
 
 from agentscroll.prompts.knowledge_card import (
     KNOWLEDGE_CARD_HISTORY_MATCH_PROMPT,
-    KNOWLEDGE_CARD_BUILTIN_CONTENT_DISABLED_PROMPT,
     KNOWLEDGE_CARD_LABEL_PROMPTS,
+    KNOWLEDGE_CARD_GENERAL_SCORE_PROMPTS,
+    KNOWLEDGE_CARD_GENERAL_UPDATE_PROMPT,
+    KNOWLEDGE_CARD_GENERAL_READABILITY_PROMPT,
+    KNOWLEDGE_CARD_GENERAL_SCORE_FIELDS,
     KNOWLEDGE_CARD_INTEREST_PROMPT,
     KNOWLEDGE_CARD_PROMPT,
     KNOWLEDGE_CARD_SHARE_POLICY_PROMPT,
@@ -337,10 +340,35 @@ def _prompt_payload(evidence: Mapping[str, Any]) -> list[dict[str, Any]]:
         }
         if candidate_interest_keywords:
             topic["candidate_interest_keywords"] = candidate_interest_keywords
+        if raw_topic.get("related_history"):
+            topic["related_history"] = [
+                dict(item) for item in raw_topic["related_history"]
+            ]
         topics.append(topic)
     if not topics:
         raise ValueError("evidence 中没有 news 或 fun 话题")
     return topics
+
+
+def _attach_related_history(
+    topics: list[dict[str, Any]], history: Mapping[str, Any], *, at: datetime,
+) -> None:
+    """Recall other history for comparison within the existing update request."""
+    from .hotlist_state import match_topics_from_evidence
+
+    updates = [topic for topic in topics if topic.get("event_relation") == "update"]
+    if not updates:
+        return
+    matches = match_topics_from_evidence(updates, history, at=at)
+    events = {event["event_id"]: event for event in history["events"]}
+    for topic in updates:
+        match = matches.get(topic["topic_id"])
+        candidates = (match.get("candidates") or [match]) if match else []
+        topic["related_history"] = [
+            {key: events[item["event_id"]].get(key)
+             for key in ("title", "knowledge", "latest_update")}
+            for item in candidates
+        ]
 
 
 def _selection_with_update_contexts(
@@ -426,8 +454,12 @@ def _selection_with_update_contexts(
         )
         enriched_topics.append(topic)
 
+    _attach_related_history(enriched_topics, history, at=at)
     enriched = dict(evidence)
     enriched["topics"] = enriched_topics
+    if update_topics:
+        enriched["database_path"] = str(selection["database_path"])
+        enriched["collected_at"] = at.isoformat(timespec="seconds")
     return enriched
 
 
@@ -481,19 +513,34 @@ def _model_topic_payload(topic: Mapping[str, Any], *, research: bool) -> dict[st
 
 
 def _share_generation_prompt(topic: Mapping[str, Any]) -> str:
+    builtin_content_enabled = topic.get("builtin_content_enabled", True)
     # 热度保底已达到分享门槛时，即使两项模型评分不足，也需要生成分享文案。
     score_condition = (
         " "
         if topic.get("hotlist_floor_score", 0) >= topic.get("share_min_score", 3)
         else KNOWLEDGE_CARD_SHARE_SCORE_CONDITION.format(
+            score_value="两项评分的最大值" if builtin_content_enabled else "interest_share_score ",
             min_score=f"{topic.get('share_min_score', 3):g}"
         )
     )
     prompt = KNOWLEDGE_CARD_SHARE_POLICY_PROMPT.format(
-        score_condition=score_condition
+        score_condition=score_condition,
+        score_fields=(
+            "general_share_score 和 interest_share_score 都"
+            if builtin_content_enabled else "interest_share_score "
+        ),
     ).strip()
-    if not topic.get("builtin_content_enabled", True):
-        prompt += "\n\n" + KNOWLEDGE_CARD_BUILTIN_CONTENT_DISABLED_PROMPT.strip()
+    if builtin_content_enabled:
+        prompt += "\n\n" + KNOWLEDGE_CARD_GENERAL_READABILITY_PROMPT.strip()
+    return prompt
+
+
+def _label_prompt(topic: Mapping[str, Any]) -> str:
+    label = _normalize_label(topic.get("label"))
+    prompt = KNOWLEDGE_CARD_LABEL_PROMPTS[label].strip()
+    if topic.get("builtin_content_enabled", True):
+        prompt += "\n\n" + KNOWLEDGE_CARD_GENERAL_SCORE_PROMPTS[label].strip()
+        prompt += "\n\n" + KNOWLEDGE_CARD_GENERAL_UPDATE_PROMPT.strip()
     return prompt
 
 
@@ -504,11 +551,15 @@ def _knowledge_card_prompt(topic: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     )
     evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    label_prompt = KNOWLEDGE_CARD_LABEL_PROMPTS[_normalize_label(topic.get("label"))]
-    instruction = KNOWLEDGE_CARD_PROMPT.format(history_days=ACTIVE_DAYS).strip()
+    instruction = KNOWLEDGE_CARD_PROMPT.format(
+        history_days=ACTIVE_DAYS,
+        general_score_field=KNOWLEDGE_CARD_GENERAL_SCORE_FIELDS[
+            topic.get("builtin_content_enabled", True)
+        ],
+    ).strip()
     return (
         f"{instruction}\n\n"
-        f"{label_prompt.strip()}\n\n"
+        f"{_label_prompt(topic)}\n\n"
         f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
         f"{_share_generation_prompt(topic)}\n\n"
         f"当前评估时间：{evaluated_at}\n"
@@ -523,14 +574,16 @@ def _knowledge_card_research_prompt(topic: Mapping[str, Any]) -> str:
         separators=(",", ":"),
     )
     evaluated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    label_prompt = KNOWLEDGE_CARD_LABEL_PROMPTS[_normalize_label(topic.get("label"))]
     instruction = KNOWLEDGE_CARD_RESEARCH_PROMPT.format(
         history_days=ACTIVE_DAYS,
         research_item_limit=_RESEARCH_ITEM_LIMIT,
+        general_score_field=KNOWLEDGE_CARD_GENERAL_SCORE_FIELDS[
+            topic.get("builtin_content_enabled", True)
+        ],
     ).strip()
     return (
         f"{instruction}\n\n"
-        f"{label_prompt.strip()}\n\n"
+        f"{_label_prompt(topic)}\n\n"
         f"{KNOWLEDGE_CARD_INTEREST_PROMPT.strip()}\n\n"
         f"{_share_generation_prompt(topic)}\n\n"
         f"当前评估时间：{evaluated_at}\n"
@@ -659,7 +712,10 @@ def _generate_topic_cards(
         make_configured_request(
             prompt,
             settings,
-            json_schema=card_response_schema(research=research),
+            json_schema=card_response_schema(
+                research=research,
+                builtin_content_enabled=topic.get("builtin_content_enabled", True),
+            ),
             max_tokens=max_tokens,
             timeout=timeout,
             effort=effort,
@@ -740,6 +796,7 @@ def _resolve_ambiguous_history_matches(
             "current": {
                 "title": match.get("current_title", ""),
                 "knowledge": card.knowledge,
+                "latest_update": card.latest_update,
                 "share_text": card.share.text,
             },
             "history": [
@@ -805,8 +862,8 @@ def _recheck_share_history_matches(
     dict[str, Any],
     dict[str, Any],
 ]:
-    """Re-evaluate provisional new shares that match recent history."""
-    from .hotlist_state import load_history, match_new_topics_from_evidence
+    """Re-evaluate provisional new shares covered by recent history."""
+    from .hotlist_state import load_history, match_topics_from_evidence
 
     def attach_research_evidence(
         prompt_topics: list[dict[str, Any]],
@@ -843,7 +900,7 @@ def _recheck_share_history_matches(
     history: Mapping[str, Any] = {"events": []}
     if database_path:
         history = load_history(database_path)
-    matches = match_new_topics_from_evidence(
+    matches = match_topics_from_evidence(
         triggered_topics,
         history,
         at=at,
@@ -1403,6 +1460,7 @@ def supplement_hotlist_knowledge_cards(
                 "matched_event_id": topic["matched_event_id"],
                 "previous_card": topic["previous_card"],
                 "timeline": topic["timeline"],
+                "related_history": topic.get("related_history", []),
                 "hotlist_title_count": topic["hotlist_title_count"],
                 "candidate_interest_keywords": list(
                     topic.get("candidate_interest_keywords") or []
@@ -1425,6 +1483,14 @@ def supplement_hotlist_knowledge_cards(
     )
     for topic in research_topics:
         topic["research_evidence"] = search_results.get(topic["topic_id"], [])
+
+    if evidence.get("database_path"):
+        from .hotlist_state import load_history, reference_time
+
+        _attach_related_history(
+            research_topics, load_history(evidence["database_path"]),
+            at=reference_time(evidence),
+        )
 
     model_research_topics = [
         topic

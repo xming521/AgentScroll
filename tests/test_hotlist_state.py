@@ -13,7 +13,7 @@ from agentscroll.storage import connect_database
 from agentscroll.workflows.hotlist_state import (
     active_exact_title_keys,
     load_history,
-    match_new_topics_from_evidence,
+    match_topics_from_evidence,
     recent_update_timeline,
     record_final_batch,
     record_first_pass,
@@ -333,7 +333,7 @@ def test_evidence_match_recalls_history_missing_from_hotlist_title() -> None:
         },
     ]
 
-    matches = match_new_topics_from_evidence(topics, history, at=at)
+    matches = match_topics_from_evidence(topics, history, at=at)
 
     assert set(matches) == {10}
     assert matches[10]["event_id"] == "jilong-event"
@@ -356,7 +356,7 @@ def test_new_share_is_rerun_once_as_update(
         original = next(event for event in history["events"] if event["event_id"] == event_id)
         history["events"].append({**original, "event_id": "duplicate", "knowledge": "其他历史已经报道救援机械到场。"})
         monkeypatch.setattr("agentscroll.workflows.hotlist_state.load_history", lambda _: history)
-        monkeypatch.setattr("agentscroll.workflows.hotlist_state.match_new_topics_from_evidence", lambda *args, **kwargs: {
+        monkeypatch.setattr("agentscroll.workflows.hotlist_state.match_topics_from_evidence", lambda *args, **kwargs: {
             1: {"event_id": event_id, "candidates": [{"event_id": event_id}, {"event_id": "duplicate"}]}
         })
         monkeypatch.setattr("agentscroll.workflows.knowledge_card._resolve_ambiguous_history_matches", lambda *args, **kwargs: (
@@ -528,6 +528,101 @@ def test_interest_only_score_triggers_share_history_recheck() -> None:
     assert diagnostics["history_match_count"] == 0
 
 
+@pytest.mark.parametrize("other_history", [False, True])
+@pytest.mark.parametrize("outcome", ["rejected", "complete"])
+@pytest.mark.parametrize("phase", ["initial", "supplement"])
+def test_update_compares_other_history_in_original_request(
+    tmp_path: Path, monkeypatch, other_history: bool, outcome: str, phase: str,
+) -> None:
+    database = tmp_path / "agentscroll.sqlite3"
+    at = datetime(2026, 9, 13, 15, tzinfo=timezone.utc)
+    original_title = "Anthropic 呼吁放缓 AI 模型迭代，马斯克响应"
+    ipo_title = "OpenAI不在2026年进行IPO"
+    primary_id = record_final_batch(database, {"topics": [{
+        "representative_id": 1, "representative": {"title": original_title},
+        "label": "news", "event_relation": "new", "related": [],
+    }]}, [_card(title=original_title, knowledge=original_title)], at=at)[1]
+    if other_history:
+        ipo_id = record_final_batch(database, {"topics": [{
+            "representative_id": 2, "representative": {"title": ipo_title},
+            "label": "news", "event_relation": "new", "related": [],
+        }]}, [_card(topic_id=2, title=ipo_title, knowledge=(
+            "阿尔特曼称 OpenAI 不会在2026年进行IPO，认为当前AI安全问题使上市时机不合适，"
+            "公司暂无上市压力。投资者、估值、融资、股权、资本市场都是背景。"
+        ))], at=at)[2]
+    selection = {"database_path": str(database), "topics": [{
+        "representative_id": 1, "representative": {"title": "马斯克呼吁减缓AI发展"},
+        "label": "news", "event_relation": "update", "matched_event_id": primary_id,
+    }]}
+    ipo_content = "OpenAI 将在业务和公司准备就绪时再进行IPO，奥特曼称2026年不会上市。"
+    evidence = _selection_with_update_contexts({"topics": [{
+        "topic_id": 1, "title": "马斯克呼吁减缓AI发展", "label": "news",
+        "evidence": [{"platform": "weibo", "url": "https://example.com/ai",
+            "content": original_title + (ipo_content if phase == "initial" else "")}],
+    }]}, selection, at=at)
+    provisional = KnowledgeCard(
+        topic_id=1, status="complete", rejection_reason="", knowledge=original_title,
+        chat_context="AI 公司发展", latest_update="OpenAI 2026年不会上市",
+        share_score=3.5, general_share_score=0, interest_share_score=3.5,
+        share=KnowledgeShare(text="马斯克呼吁减缓AI发展，OpenAI今年不会上市",
+            source_id="e1", url="https://example.com/ai", comment_id="",
+            comment_type="generated", comment="看看后续"),
+    )
+    from agentscroll.workflows import knowledge_card as workflow
+    generated = []
+
+    def unexpected_recheck(*args, **kwargs):
+        pytest.fail("update must not trigger an extra history model request")
+
+    def generate(topics, **kwargs):
+        generated.extend(topics)
+        payload = _model_topic_payload(topics[0], research=phase == "supplement")
+        assert payload["previous_card"]["knowledge"] == original_title
+        assert topics[0]["matched_event_id"] == primary_id
+        if other_history:
+            assert payload["related_history"][0]["title"] == ipo_title
+            assert len(payload["related_history"]) == 1
+        else:
+            assert "related_history" not in payload
+        if phase == "supplement":
+            assert payload["research_evidence"][0]["content"] == ipo_content
+        return [provisional.model_copy(update={
+            "status": outcome,
+            "share": provisional.share if outcome == "complete" else None,
+        })], {"request_count": 1, "usage": {}}
+
+    monkeypatch.setattr("agentscroll.config.load_settings", lambda _: SimpleNamespace(
+        max_workers=1, sharing=SimpleNamespace(policy=SimpleNamespace(minimum_score=3)),
+    ))
+    monkeypatch.setattr(workflow, "_generate_topic_cards", generate)
+    monkeypatch.setattr(workflow, "_resolve_ambiguous_history_matches", unexpected_recheck)
+    if phase == "supplement":
+        assert not evidence["topics"][0]["related_history"]
+        monkeypatch.setattr(workflow, "_collect_active_search_evidence", lambda *args, **kwargs: (
+            {1: [{"source_id": "r1", "platform": "weibo", "content": ipo_content,
+                  "url": "https://example.com/ipo", "comments": []}]}, {},
+        ))
+        result = workflow.supplement_hotlist_knowledge_cards(
+            evidence, {"cards": [KnowledgeCard.needs_research(1).to_dict()], "inference": {}},
+            _save_result=False,
+        )
+        assert result["inference"]["supplement"]["request_count"] == 1
+    else:
+        result = workflow._generate_hotlist_knowledge_cards(evidence)
+        assert result["inference"]["request_count"] == 1
+    assert len(generated) == 1
+    monkeypatch.setattr(workflow, "_generate_topic_cards", unexpected_recheck)
+    cards, revised_evidence, revised_selection, diagnostics = _recheck_share_history_matches(
+        result["cards"], evidence=evidence, selection=selection, settings=SimpleNamespace(),
+        at=at, effort="xhigh",
+    )
+    assert revised_selection["topics"][0]["matched_event_id"] == primary_id
+    assert revised_evidence["topics"][0]["previous_card"] == evidence["topics"][0]["previous_card"]
+    assert cards[0].status == outcome
+    assert (cards[0].share is not None) == (outcome == "complete")
+    assert diagnostics == {}
+
+
 def test_selected_save_records_share_and_used_source_titles(
     tmp_path: Path,
 ) -> None:
@@ -641,7 +736,7 @@ def test_close_history_candidates_are_returned_for_semantic_resolution() -> None
         "title": text, "knowledge": text, "latest_update": None,
         "titles": [{"text": text, "last_seen_at": "2026-09-01T12:00:00+00:00"}],
     } for event_id in ("a", "b")]
-    matches = match_new_topics_from_evidence([{
+    matches = match_topics_from_evidence([{
         "topic_id": 1, "title": text, "label": "news", "event_relation": "new",
         "evidence": [{"content": text}],
     }], {"events": events}, at=datetime(2026, 9, 1, 13, tzinfo=timezone.utc))
@@ -668,7 +763,7 @@ def test_ambiguous_history_resolution(monkeypatch, ids, ok, expected, failed) ->
     monkeypatch.setattr("agentscroll.config.build_configured_client", lambda _: Client())
     monkeypatch.setattr("agentscroll.config.make_configured_request", lambda prompt, settings, **kwargs: prompt)
     matches = {1: {"event_id": "a", "candidates": [{"event_id": "a"}, {"event_id": "b"}]}}
-    cards = {1: SimpleNamespace(knowledge="当前知识", share=SimpleNamespace(text="当前分享"))}
+    cards = {1: SimpleNamespace(knowledge="当前知识", latest_update=None, share=SimpleNamespace(text="当前分享"))}
     history = {"events": [{"event_id": value, "title": value, "knowledge": "历史知识"} for value in ("a", "b")]}
     resolved, failures, diagnostics = _resolve_ambiguous_history_matches(matches, cards, history, settings=None, effort="low")
     assert failures == failed

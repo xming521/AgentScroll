@@ -10,7 +10,9 @@ from typing import Any
 
 from agentscroll.prompts.hotlist import (
     HOTLIST_BUILTIN_CONTENT_DISABLED_PROMPT,
+    HOTLIST_BUILTIN_CONTENT_PROMPT,
     HOTLIST_FIRST_PASS_PROMPT,
+    HOTLIST_NEWS_DEFINITIONS,
 )
 from agentscroll.sharing.policy import hotlist_floor_score
 
@@ -100,9 +102,12 @@ def _first_pass_prompt(
     instruction = HOTLIST_FIRST_PASS_PROMPT.format(
         force_share_title_count=force_share_title_count,
         max_topics=_FIRST_PASS_MAX_TOPICS,
+        news_definition=HOTLIST_NEWS_DEFINITIONS[builtin_content_enabled],
+        recommendation_rules=(
+            HOTLIST_BUILTIN_CONTENT_PROMPT
+            if builtin_content_enabled else HOTLIST_BUILTIN_CONTENT_DISABLED_PROMPT
+        ).format(max_topics=_FIRST_PASS_MAX_TOPICS).strip(),
     ).strip()
-    if not builtin_content_enabled:
-        instruction += "\n\n" + HOTLIST_BUILTIN_CONTENT_DISABLED_PROMPT.strip()
     payload = json.dumps(
         {
             "interest": {

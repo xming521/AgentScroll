@@ -110,11 +110,62 @@ def test_card_prompt_uses_workflow_limits(
 
 @pytest.mark.parametrize("research", [False, True])
 @pytest.mark.parametrize("label", ["news", "fun"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_card_prompt_only_includes_enabled_general_rules(tmp_path, research, label, enabled):
+    from agentscroll.prompts.knowledge_card import (
+        KNOWLEDGE_CARD_GENERAL_SCORE_PROMPTS,
+        KNOWLEDGE_CARD_GENERAL_UPDATE_PROMPT,
+        KNOWLEDGE_CARD_GENERAL_READABILITY_PROMPT,
+        KNOWLEDGE_CARD_INTEREST_PROMPT,
+    )
+    from agentscroll.workflows import knowledge_card as workflow
+
+    topic = _topic(relation="update", candidate_interest_keywords=("AI",))
+    topic.update(label=label, builtin_content_enabled=enabled)
+    builder = workflow._knowledge_card_research_prompt if research else workflow._knowledge_card_prompt
+    prompt = builder(topic)
+    instruction = prompt.rsplit("\n", 1)[0]
+    for block in (KNOWLEDGE_CARD_GENERAL_SCORE_PROMPTS[label],
+                  KNOWLEDGE_CARD_GENERAL_UPDATE_PROMPT,
+                  KNOWLEDGE_CARD_GENERAL_READABILITY_PROMPT):
+        assert (block.strip() in instruction) is enabled
+    assert KNOWLEDGE_CARD_INTEREST_PROMPT.strip() in instruction
+    assert ("general_share_score 和 interest_share_score 都只评价" in instruction) is enabled
+    assert "分享评分默认最高为 2.9" in instruction
+    assert instruction.count(
+        "只有新增材料足以明显改变对事件核心状态、结果或影响的理解，"
+        "并且值得再次主动告诉已经知道该事件的人时，才可达到 3 分"
+    ) == 1
+    assert f"当前话题类别为 {label}" in instruction
+    assert "share.text 直接使用原标题" in instruction if label == "fun" else "先判断原标题能否直接作为分享文案" in instruction
+    assert "related_history" in instruction
+    assert "{general_score_field}" not in instruction
+    assert "{score_fields}" not in instruction
+    schema = workflow.card_response_schema(research=research, builtin_content_enabled=enabled)
+    card_schema = schema["properties"]["cards"]["items"]
+    assert ("general_share_score" in card_schema["properties"]) is enabled
+    assert ("general_share_score" in card_schema["required"]) is enabled
+    assert "interest_share_score" in card_schema["required"]
+    assert card_schema["additionalProperties"] is False
+    if not enabled:
+        assert "general_share_score" not in instruction
+        assert "两项" not in instruction
+        assert "interest_share_score 只评价" in instruction
+        assert "重大转折或产生广泛影响" not in instruction
+        assert "不执行上述" not in instruction
+        assert "可能影响较多人" not in instruction
+    (tmp_path / "card-prompt.txt").write_text(prompt, encoding="utf-8")
+    (tmp_path / "card-schema.json").write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@pytest.mark.parametrize("research", [False, True])
+@pytest.mark.parametrize("label", ["news", "fun"])
+@pytest.mark.parametrize("legacy_general_score", [False, True])
 @pytest.mark.parametrize("interest_score,title_count,expected_score", [
     (2.5, 1, 2.5), (3.6, 1, 3.6), (0, 3, 4),
 ])
 def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
-    tmp_path, monkeypatch, research, label, interest_score, title_count, expected_score,
+    tmp_path, monkeypatch, research, label, legacy_general_score, interest_score, title_count, expected_score,
 ) -> None:
     from agentscroll import config
     from agentscroll.workflows import knowledge_card as workflow
@@ -128,6 +179,8 @@ def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
     topic = _topic(candidate_interest_keywords=("AI",) if interest_score else ())
     topic.update(label=label, hotlist_title_count=title_count)
     raw = _raw_card(general_share_score=0, interest_share_score=interest_score)
+    if not legacy_general_score:
+        del raw["general_share_score"]
     if expected_score < 3:
         raw["share"] = None
     if research:
@@ -137,11 +190,21 @@ def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
         def generate_batch(self, requests):
             assert len(requests) == 1
             prompt = requests[0].prompt
-            assert "本轮关闭内置 news/fun 的大众分享评分" in prompt
+            assert "general_share_score" not in prompt
+            assert "两项" not in prompt
+            schema = requests[0].json_schema
+            card_schema = schema["properties"]["cards"]["items"]
+            assert "general_share_score" not in card_schema["properties"]
+            assert "general_share_score" not in card_schema["required"]
+            if expected_score < 4:
+                assert "interest_share_score 达到 3 时填写 share" in prompt
+            else:
+                assert "status=complete 且有可用 source_id 时填写 share" in prompt
             payload = json.loads(prompt.rsplit("\n", 1)[-1])
             if interest_score:
                 assert payload["interest"]["candidate_keywords"] == ["AI"]
             (tmp_path / "card-prompt.txt").write_text(prompt, encoding="utf-8")
+            (tmp_path / "card-schema.json").write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
             return [SimpleNamespace(
                 ok=True, parsed_json={"cards": [raw]}, provider="fake",
                 model="fake", metadata={},
@@ -160,6 +223,7 @@ def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
         max_tokens=4000, timeout=60, effort="low",
     )
     card = cards[0]
+    assert inference["failed_topic_count"] == 0
     assert card.status == "complete"
     assert card.general_share_score == 0
     assert card.interest_share_score == interest_score
@@ -186,6 +250,18 @@ def test_disabled_builtin_content_keeps_interest_and_heat_through_save(
     if shares:
         assert shares[0]["general_score"] == 0
         assert shares[0]["score"] == expected_score
+
+
+@pytest.mark.parametrize("research", [False, True])
+def test_enabled_builtin_content_requires_general_score(research) -> None:
+    topic = _topic(candidate_interest_keywords=("AI",))
+    raw = _raw_card(interest_share_score=3.6)
+    del raw["general_share_score"]
+    if research:
+        raw["research_sources"] = []
+    validator = validate_research_cards if research else validate_cards
+    with pytest.raises(ValueError, match="general_share_score"):
+        validator([raw], [topic])
 
 
 @pytest.mark.parametrize("research", [False, True])

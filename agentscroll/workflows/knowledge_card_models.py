@@ -305,7 +305,9 @@ def _inline_schema_refs(value: Any, definitions: Mapping[str, Any]) -> Any:
     }
 
 
-def card_response_schema(*, research: bool) -> dict[str, Any]:
+def card_response_schema(
+    *, research: bool, builtin_content_enabled: bool = True,
+) -> dict[str, Any]:
     model = ResearchKnowledgeCardResponse if research else KnowledgeCardResponse
     schema = model.model_json_schema()
     definitions = schema.get("$defs") or {}
@@ -313,6 +315,10 @@ def card_response_schema(*, research: bool) -> dict[str, Any]:
     cards_schema = normalized["properties"]["cards"]
     cards_schema["minItems"] = 1
     cards_schema["maxItems"] = 1
+    if not builtin_content_enabled:
+        card_schema = cards_schema["items"]
+        del card_schema["properties"]["general_share_score"]
+        card_schema["required"].remove("general_share_score")
     return normalized
 
 
@@ -487,6 +493,7 @@ def _draft_from_mapping(
     *,
     topic_id: int,
     research: bool,
+    builtin_content_enabled: bool,
 ) -> KnowledgeCardDraft:
     uses_score_components = any(
         field in raw_card
@@ -502,7 +509,9 @@ def _draft_from_mapping(
         "chat_context": raw_card.get("chat_context"),
         "latest_update": raw_card.get("latest_update"),
         "general_share_score": (
-            raw_card.get("general_share_score")
+            raw_card.get("general_share_score", 0)
+            if not builtin_content_enabled
+            else raw_card.get("general_share_score")
             if uses_score_components
             else raw_card.get("share_score")
         ),
@@ -692,6 +701,7 @@ def _validate_cards(
             raw_card,
             topic_id=topic_id,
             research=research,
+            builtin_content_enabled=topic_by_id[topic_id].get("builtin_content_enabled", True),
         )
         card_by_id[topic_id] = _validate_draft(
             draft,

@@ -443,7 +443,7 @@ def attach_history_matches(
     }
 
 
-def match_new_topics_from_evidence(
+def match_topics_from_evidence(
     topics: list[Mapping[str, Any]],
     history: Mapping[str, Any],
     *,
@@ -484,6 +484,7 @@ def match_new_topics_from_evidence(
                 "label": str(event.get("label") or ""),
                 "title": str(event.get("title") or ""),
                 "terms": terms,
+                "title_terms": [_weighted_terms(title) for title in active_titles],
             }
         )
     if not event_documents:
@@ -492,7 +493,10 @@ def match_new_topics_from_evidence(
     term_idf = _idf([set(item["terms"]) for item in event_documents])
     matches: dict[int, dict[str, Any]] = {}
     for topic in topics:
-        if not isinstance(topic, Mapping) or topic.get("event_relation") != "new":
+        if (
+            not isinstance(topic, Mapping)
+            or topic.get("event_relation") not in {"new", "update"}
+        ):
             continue
         topic_id = topic.get("topic_id")
         if isinstance(topic_id, bool) or not isinstance(topic_id, int):
@@ -516,8 +520,14 @@ def match_new_topics_from_evidence(
                     )
                 )
         ranked: list[dict[str, Any]] = []
+        title_candidates: list[dict[str, Any]] = []
         for event in event_documents:
             if event["label"] != topic.get("label"):
+                continue
+            if (
+                topic.get("event_relation") == "update"
+                and event["event_id"] == topic.get("matched_event_id")
+            ):
                 continue
             event_terms = event["terms"]
             best_document = (0.0, 0, 0)
@@ -545,6 +555,23 @@ def match_new_topics_from_evidence(
                     "weighted_term_count": best_document[2],
                 }
             )
+            if topic.get("event_relation") == "update":
+                title_coverage = max(
+                    (
+                        _term_coverage(title_terms, current_terms, term_idf)
+                        for title_terms in event["title_terms"]
+                        for current_terms in current_documents
+                        if sum(
+                            weight >= 2 and current_terms.get(term, 0) >= 2
+                            for term, weight in title_terms.items()
+                        ) >= _EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT
+                    ),
+                    default=0.0,
+                )
+                if title_coverage >= _EVIDENCE_MATCH_COVERAGE_THRESHOLD:
+                    title_candidates.append(
+                        {**ranked[-1], "title_coverage": title_coverage}
+                    )
         if not ranked:
             continue
         ranked.sort(
@@ -559,6 +586,14 @@ def match_new_topics_from_evidence(
             or best["weighted_term_count"]
             < _EVIDENCE_MATCH_MIN_WEIGHTED_TERM_COUNT
         ):
+            if title_candidates:
+                title_candidates.sort(key=lambda item: (
+                    -item["title_coverage"], -item["coverage"], item["history_title"]
+                ))
+                matches[topic_id] = {
+                    **title_candidates[0],
+                    "candidates": title_candidates[:MATCHES_PER_TITLE],
+                }
             continue
         matches[topic_id] = {
             **best,
@@ -865,7 +900,7 @@ __all__ = [
     "active_exact_title_keys",
     "attach_history_matches",
     "load_history",
-    "match_new_topics_from_evidence",
+    "match_topics_from_evidence",
     "order_candidates_by_similarity",
     "recent_update_timeline",
     "record_final_batch",
