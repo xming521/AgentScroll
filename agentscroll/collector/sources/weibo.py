@@ -24,7 +24,7 @@ _LONG_TEXT_URL = "https://m.weibo.cn/statuses/extend?id={feed_id}"
 _COMMENTS_URL = "https://m.weibo.cn/comments/hotflow"
 _CONTENT_SOURCE = "mcp-server-weibo-feed-detail"
 _HOT_TOPIC_SEARCH_CANDIDATE_LIMIT = 15
-_EXCLUDED_COMMENT_USER_IDS = {"5606716867"}
+_EXCLUDED_COMMENT_USER_IDS = {"5606716867", "5762999670"}
 _COMMENT_IMAGE_ALT_RE = re.compile(
     r'''<img\b[^>]*\balt=(["'])(.*?)\1[^>]*>''',
     re.IGNORECASE,

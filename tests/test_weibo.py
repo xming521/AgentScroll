@@ -272,11 +272,12 @@ def test_hotflow_comments_keep_likes_and_reply_counts(monkeypatch) -> None:
     }
 
 
-def test_comments_exclude_specified_user_before_normalization(monkeypatch) -> None:
+@pytest.mark.parametrize("user_id", ["5606716867", "5762999670"])
+def test_comments_exclude_specified_user_before_normalization(monkeypatch, user_id) -> None:
     async def fake_hotflow_comments(_crawler, _feed_id, *, limit):
         return [
-            {"id": 1, "text": "排除整数 ID", "user": {"id": 5606716867}},
-            {"id": 2, "text": "排除字符串 ID", "user": {"id": "5606716867"}},
+            {"id": 1, "text": "排除整数 ID", "user": {"id": int(user_id)}},
+            {"id": 2, "text": "排除字符串 ID", "user": {"id": user_id}},
             {
                 "id": 3,
                 "text": "保留其他用户",
